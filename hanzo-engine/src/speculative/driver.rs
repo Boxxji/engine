@@ -192,6 +192,7 @@ where
         )
         .await?;
         let sampled_token = anchor.token;
+        seq.record_plain_decode_step();
         finish_or_add_toks_to_seq(target, prefix_cacher, seq, anchor, eos_tok, true).await?;
         if speculating(seq) {
             active_indices.push(idx);
@@ -263,6 +264,9 @@ where
         )
         .await?;
         let accepted_all = outcome.accepted_drafts == outcome.proposed_drafts;
+        let committed_tokens =
+            outcome.accepted_drafts + usize::from(outcome.continuation_token.is_some());
+        seq.record_speculative_round(committed_tokens);
         super::stats::record_verify(outcome.accepted_drafts, outcome.proposed_drafts);
         tracing::debug!(
             seq_id = *seq.id(),
@@ -414,6 +418,9 @@ where
     // varies per round. Reject only an empty or over-long draft.
     for (idx, proposal) in active_indices.iter().zip(proposal_batch.proposals) {
         if (1..=proposal_len).contains(&proposal.tokens.len()) {
+            if seqs[*idx].execution_trace().draft_block_sizes.is_empty() {
+                seqs[*idx].record_draft_block_size(proposal.tokens.len());
+            }
             seqs[*idx].set_staged_speculative(proposal.tokens, proposal.logits);
         } else {
             seqs[*idx].clear_staged_speculative_tokens();

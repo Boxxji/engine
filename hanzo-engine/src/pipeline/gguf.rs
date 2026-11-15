@@ -23,9 +23,9 @@ use crate::paged_attention::{
 use crate::pipeline::chat_template::{calculate_eos_tokens, BeginEndUnkPadTok, GenerationConfig};
 #[cfg(feature = "cuda")]
 use crate::pipeline::cuda_graph::{
-    cuda_decode_graphs_enabled, cuda_prefill_graphs_enabled, disable_event_tracking_for_capture,
-    end_cuda_capture_discard, restore_event_tracking_after_capture, CudaDecodeGraphKey,
-    CudaDecodeGraphMetadataBuffers, CudaGraphHandle, CUDA_DECODE_GRAPH_CACHE_CAPACITY,
+    capture_cuda_graph_with_output, cuda_decode_graphs_enabled, cuda_prefill_graphs_enabled,
+    CudaDecodeGraphKey, CudaDecodeGraphMetadataBuffers, CudaGraphHandle,
+    CUDA_DECODE_GRAPH_CACHE_CAPACITY,
 };
 use crate::pipeline::loaders::DeviceMappedModelLoader;
 #[cfg(feature = "rocm")]
@@ -160,6 +160,7 @@ pub struct GGUFPipeline {
     /// invalidated on a KV-cache capacity grow. See [`crate::perf_flags::vulkan_graphs_enabled`].
     #[cfg(feature = "vulkan")]
     vulkan_decode_graph: std::sync::Mutex<VulkanDecodeGraphState>,
+    forward_telemetry: crate::pipeline::AtomicForwardStepTelemetry,
 }
 
 #[cfg(feature = "rocm")]
@@ -1113,6 +1114,7 @@ impl Loader for GGUFLoader {
             cuda_prefill_graph: std::sync::Mutex::new(CudaPrefillGraphState::default()),
             #[cfg(feature = "vulkan")]
             vulkan_decode_graph: std::sync::Mutex::new(VulkanDecodeGraphState::default()),
+            forward_telemetry: crate::pipeline::AtomicForwardStepTelemetry::default(),
         })))
     }
 
@@ -1509,6 +1511,7 @@ impl GGUFPipeline {
             entry.input_ids.set(input_ids)?;
             entry.metadata_buffers.copy_from(metadata, seqlen_offsets)?;
             entry.graph.launch()?;
+            self.forward_telemetry.record_decode_replay();
             let logits = entry.logits.clone();
             state.entries.push(entry);
             return Ok(Some(logits));
@@ -1535,6 +1538,7 @@ impl GGUFPipeline {
         match self.capture_cuda_decode_graph(
             key,
             input_ids,
+            &warmup_logits,
             seqlen_offsets,
             context_lens,
             kv_cache,
@@ -1546,6 +1550,7 @@ impl GGUFPipeline {
                     state.entries.remove(0);
                 }
                 state.entries.push(entry);
+                self.forward_telemetry.record_decode_capture();
             }
             Err(err) => {
                 if !state.disabled {
@@ -1558,73 +1563,36 @@ impl GGUFPipeline {
         Ok(Some(warmup_logits))
     }
 
-    /// Captures the decode forward into a CUDA graph against stable metadata buffers.
+    /// Captures the decode forward into a CUDA graph against stable metadata and output buffers.
     /// Mirrors `NormalPipeline::capture_cuda_decode_graph` but dispatches the GGUF
     /// `run_decode_forward` (no position_ids/flash_meta) instead of the safetensors
-    /// `ModelForwardContext`. The CUDA backend has a graph-ordered allocator, so unlike
-    /// the ROCm path this needs no manual pool-reservation scope (the AUTO_FREE_ON_LAUNCH
-    /// instantiate flag handles per-launch temporaries).
+    /// `ModelForwardContext`.
     #[allow(clippy::too_many_arguments)]
     fn capture_cuda_decode_graph(
         &self,
         key: CudaDecodeGraphKey,
         input_ids: &Tensor,
+        warmup_logits: &Tensor,
         seqlen_offsets: &[usize],
         context_lens: &[(usize, usize)],
         kv_cache: &[(Tensor, Tensor)],
         metadata: &PagedAttentionInputMetadata,
         block_size: usize,
     ) -> Result<CudaDecodeGraphEntry, hanzo_ml::Error> {
-        use hanzo_ml::cuda_backend::cudarc::driver::sys;
-
         let input_ids_var = Var::from_tensor(input_ids)?;
         let (metadata_buffers, rebound_metadata) =
             CudaDecodeGraphMetadataBuffers::new(metadata, seqlen_offsets, block_size)?;
         let graph_input_ids = input_ids_var.as_detached_tensor();
-        let Device::Cuda(cuda_device) = graph_input_ids.device() else {
-            hanzo_ml::bail!("CUDA decode graph expected a CUDA device");
-        };
-        let stream = cuda_device.cuda_stream();
-        let restore_event_tracking = disable_event_tracking_for_capture(&stream);
-        let _htod_cache_guard = cuda_device.enable_cuda_graph_htod_cache();
 
-        if let Err(err) =
-            stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
-        {
-            restore_event_tracking_after_capture(&stream, restore_event_tracking);
-            return Err(
-                hanzo_ml::Error::msg(err.to_string()).context("CUDA graph begin capture failed")
-            );
-        }
-
-        let logits = match self.run_decode_forward(
-            &graph_input_ids,
-            seqlen_offsets,
-            context_lens.to_vec(),
-            Some((kv_cache.to_vec(), &rebound_metadata)),
-        ) {
-            Ok(logits) => logits,
-            Err(err) => {
-                end_cuda_capture_discard(&stream);
-                restore_event_tracking_after_capture(&stream, restore_event_tracking);
-                return Err(err);
-            }
-        };
-
-        let graph = match CudaGraphHandle::end_capture(&stream) {
-            Ok(Some(graph)) => graph,
-            Ok(None) => {
-                restore_event_tracking_after_capture(&stream, restore_event_tracking);
-                return Err(hanzo_ml::Error::msg("CUDA graph capture returned no graph"));
-            }
-            Err(err) => {
-                restore_event_tracking_after_capture(&stream, restore_event_tracking);
-                return Err(err);
-            }
-        };
-        restore_event_tracking_after_capture(&stream, restore_event_tracking);
-
-        graph.upload()?;
+        let (graph, logits) =
+            capture_cuda_graph_with_output(graph_input_ids.device(), warmup_logits, || {
+                self.run_decode_forward(
+                    &graph_input_ids,
+                    seqlen_offsets,
+                    context_lens.to_vec(),
+                    Some((kv_cache.to_vec(), &rebound_metadata)),
+                )
+            })?;
 
         Ok(CudaDecodeGraphEntry {
             key,
@@ -1754,6 +1722,7 @@ impl GGUFPipeline {
             entry.input_ids.set(input_ids)?;
             entry.metadata_buffers.copy_from(metadata, seqlen_offsets)?;
             entry.graph.launch()?;
+            self.forward_telemetry.record_prefill_replay();
             let logits = entry.logits.clone();
             state.entries.push(entry);
             return Ok(Some(logits));
@@ -1779,6 +1748,7 @@ impl GGUFPipeline {
         match self.capture_cuda_prefill_graph(
             key.clone(),
             input_ids,
+            &warmup_logits,
             seqlen_offsets,
             context_lens,
             kv_cache,
@@ -1801,6 +1771,7 @@ impl GGUFPipeline {
                             state.entries.remove(0);
                         }
                         state.entries.push(entry);
+                        self.forward_telemetry.record_prefill_capture();
                     }
                     Ok(div) => {
                         warn!(
@@ -1849,6 +1820,7 @@ impl GGUFPipeline {
         &self,
         key: CudaDecodeGraphKey,
         input_ids: &Tensor,
+        warmup_logits: &Tensor,
         seqlen_offsets: &[usize],
         context_lens: &[(usize, usize)],
         kv_cache: &[(Tensor, Tensor)],
@@ -1856,58 +1828,21 @@ impl GGUFPipeline {
         flash_params: &FlashParams,
         block_size: usize,
     ) -> Result<CudaPrefillGraphEntry, hanzo_ml::Error> {
-        use hanzo_ml::cuda_backend::cudarc::driver::sys;
-
         let input_ids_var = Var::from_tensor(input_ids)?;
         let (metadata_buffers, rebound_metadata) =
             CudaDecodeGraphMetadataBuffers::new(metadata, seqlen_offsets, block_size)?;
         let graph_input_ids = input_ids_var.as_detached_tensor();
-        let Device::Cuda(cuda_device) = graph_input_ids.device() else {
-            hanzo_ml::bail!("CUDA prefill graph expected a CUDA device");
-        };
-        let stream = cuda_device.cuda_stream();
-        let restore_event_tracking = disable_event_tracking_for_capture(&stream);
-        let _htod_cache_guard = cuda_device.enable_cuda_graph_htod_cache();
 
-        if let Err(err) =
-            stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
-        {
-            restore_event_tracking_after_capture(&stream, restore_event_tracking);
-            return Err(hanzo_ml::Error::msg(err.to_string())
-                .context("CUDA prefill graph begin capture failed"));
-        }
-
-        let logits = match self.run_prefill_forward(
-            &graph_input_ids,
-            seqlen_offsets,
-            context_lens.to_vec(),
-            flash_params,
-            Some((kv_cache.to_vec(), &rebound_metadata)),
-        ) {
-            Ok(logits) => logits,
-            Err(err) => {
-                end_cuda_capture_discard(&stream);
-                restore_event_tracking_after_capture(&stream, restore_event_tracking);
-                return Err(err);
-            }
-        };
-
-        let graph = match CudaGraphHandle::end_capture(&stream) {
-            Ok(Some(graph)) => graph,
-            Ok(None) => {
-                restore_event_tracking_after_capture(&stream, restore_event_tracking);
-                return Err(hanzo_ml::Error::msg(
-                    "CUDA prefill graph capture returned no graph",
-                ));
-            }
-            Err(err) => {
-                restore_event_tracking_after_capture(&stream, restore_event_tracking);
-                return Err(err);
-            }
-        };
-        restore_event_tracking_after_capture(&stream, restore_event_tracking);
-
-        graph.upload()?;
+        let (graph, logits) =
+            capture_cuda_graph_with_output(graph_input_ids.device(), warmup_logits, || {
+                self.run_prefill_forward(
+                    &graph_input_ids,
+                    seqlen_offsets,
+                    context_lens.to_vec(),
+                    flash_params,
+                    Some((kv_cache.to_vec(), &rebound_metadata)),
+                )
+            })?;
 
         Ok(CudaPrefillGraphEntry {
             key,
@@ -2769,6 +2704,10 @@ impl Pipeline for GGUFPipeline {
 
     fn drafter(&self) -> Option<crate::speculative::SpeculativeAttachInfo> {
         self.drafter.clone()
+    }
+
+    fn take_forward_step_telemetry(&self) -> crate::sequence::ForwardStepTelemetry {
+        self.forward_telemetry.take()
     }
 
     fn indexer_budget(&self) -> Option<usize> {

@@ -5,8 +5,9 @@ use hanzo_ml::{DType, Device, DeviceLocation, Tensor, Var};
 
 use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
 
-const CUDA_GRAPH_INSTANTIATE_FLAGS: u64 =
-    sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH as u64;
+// Captured forwards copy outputs into pre-allocated `Var`s and drop capture-local buffers
+// before `cuStreamEndCapture`, so no unfreed graph allocations remain for auto-free on launch.
+const CUDA_GRAPH_INSTANTIATE_FLAGS: u64 = 0;
 pub(crate) const CUDA_DECODE_GRAPH_CACHE_CAPACITY: usize = 32;
 
 pub(crate) struct CudaGraphHandle {
@@ -519,7 +520,7 @@ pub(crate) fn cuda_prefill_graphs_enabled() -> bool {
     crate::perf_flags::cuda_prefill_graphs_enabled()
 }
 
-pub(crate) fn disable_event_tracking_for_capture(stream: &Arc<CudaStream>) -> bool {
+fn disable_event_tracking_for_capture(stream: &Arc<CudaStream>) -> bool {
     let restore = stream.context().is_event_tracking();
     if restore {
         unsafe { stream.context().disable_event_tracking() };
@@ -527,19 +528,78 @@ pub(crate) fn disable_event_tracking_for_capture(stream: &Arc<CudaStream>) -> bo
     restore
 }
 
-pub(crate) fn restore_event_tracking_after_capture(stream: &Arc<CudaStream>, restore: bool) {
+fn restore_event_tracking_after_capture(stream: &Arc<CudaStream>, restore: bool) {
     if restore {
         unsafe { stream.context().enable_event_tracking() };
     }
 }
 
-pub(crate) fn end_cuda_capture_discard(stream: &Arc<CudaStream>) {
+fn end_cuda_capture_discard(stream: &Arc<CudaStream>) {
     if matches!(
         stream.capture_status(),
         Ok(status) if status != sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE
     ) {
         let _ = CudaGraphHandle::end_capture(stream);
     }
+}
+
+/// Captures `forward` into a CUDA graph while copying its output into a pre-allocated persistent
+/// buffer before `cuStreamEndCapture`, ensuring every capture-allocated tensor is freed inside
+/// the graph rather than aliasing virtual addresses across nodes on replay.
+pub(crate) fn capture_cuda_graph_with_output(
+    device: &Device,
+    output_template: &Tensor,
+    forward: impl FnOnce() -> hanzo_ml::Result<Tensor>,
+) -> hanzo_ml::Result<(CudaGraphHandle, Tensor)> {
+    let Device::Cuda(cuda_device) = device else {
+        hanzo_ml::bail!("CUDA graph expected a CUDA device");
+    };
+    let output_var = Var::from_tensor(output_template)?;
+    let stream = cuda_device.cuda_stream();
+    let restore_event_tracking = disable_event_tracking_for_capture(&stream);
+    let _htod_cache_guard = cuda_device.enable_cuda_graph_htod_cache();
+
+    if let Err(err) = stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+    {
+        restore_event_tracking_after_capture(&stream, restore_event_tracking);
+        return Err(
+            hanzo_ml::Error::msg(err.to_string()).context("CUDA graph begin capture failed")
+        );
+    }
+
+    match forward() {
+        Ok(captured_output) => {
+            if let Err(err) = output_var.set(&captured_output) {
+                drop(captured_output);
+                end_cuda_capture_discard(&stream);
+                restore_event_tracking_after_capture(&stream, restore_event_tracking);
+                return Err(err);
+            }
+            drop(captured_output);
+        }
+        Err(err) => {
+            end_cuda_capture_discard(&stream);
+            restore_event_tracking_after_capture(&stream, restore_event_tracking);
+            return Err(err);
+        }
+    }
+
+    let graph = match CudaGraphHandle::end_capture(&stream) {
+        Ok(Some(graph)) => graph,
+        Ok(None) => {
+            restore_event_tracking_after_capture(&stream, restore_event_tracking);
+            return Err(hanzo_ml::Error::msg("CUDA graph capture returned no graph"));
+        }
+        Err(err) => {
+            restore_event_tracking_after_capture(&stream, restore_event_tracking);
+            return Err(err);
+        }
+    };
+    restore_event_tracking_after_capture(&stream, restore_event_tracking);
+
+    graph.upload()?;
+
+    Ok((graph, output_var.as_detached_tensor()))
 }
 
 fn device_location_sort_key(location: &DeviceLocation) -> (u8, usize) {
@@ -670,4 +730,96 @@ fn copy_rope_positions(dst: &CudaGraphVarMap, seqlen_offsets: &[usize]) -> hanzo
         dst.set(&positions)?;
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    use super::capture_cuda_graph_with_output;
+    use hanzo_ml::{DType, Device, Tensor, Var};
+
+    #[test]
+    fn capture_with_output_replays_independently_into_distinct_buffers() -> hanzo_ml::Result<()> {
+        let test_name = concat!(
+            module_path!(),
+            "::capture_with_output_replays_independently_into_distinct_buffers"
+        );
+        let exact = std::env::args().any(|arg| arg == test_name);
+        if !exact && std::env::var_os("HANZO_CUDA_CAPTURE_ISOLATED").is_none() {
+            let exe = std::env::current_exe().map_err(hanzo_ml::Error::wrap)?;
+            let out = std::process::Command::new(exe)
+                .arg("--exact")
+                .arg(test_name)
+                .env("HANZO_CUDA_CAPTURE_ISOLATED", "1")
+                .output()
+                .map_err(hanzo_ml::Error::wrap)?;
+            if !out.status.success() {
+                hanzo_ml::bail!(
+                    "isolated CUDA graph replay test failed ({}):\n{}\n{}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            return Ok(());
+        }
+
+        let Ok(dev) = Device::new_cuda_with_stream(0) else {
+            return Ok(());
+        };
+        if let Device::Cuda(cuda) = &dev {
+            unsafe { cuda.disable_event_tracking() };
+        }
+
+        let in_a = Var::new(&[1.0f32, 2.0, 3.0, 4.0], &dev)?;
+        let scale_a = Tensor::new(&[2.0f32, 2.0, 2.0, 2.0], &dev)?;
+        let warmup_a = (in_a.as_detached_tensor() * &scale_a)?;
+        dev.synchronize()?;
+        let (graph_a, out_a) = capture_cuda_graph_with_output(&dev, &warmup_a, || {
+            (in_a.as_detached_tensor() * &scale_a)? + 1.0
+        })?;
+
+        let in_b = Var::new(&[10.0f32, 20.0, 30.0, 40.0], &dev)?;
+        let bias_b = Tensor::new(&[5.0f32, 6.0, 7.0, 8.0], &dev)?;
+        let warmup_b = (in_b.as_detached_tensor() + &bias_b)?;
+        dev.synchronize()?;
+        let (graph_b, out_b) = capture_cuda_graph_with_output(&dev, &warmup_b, || {
+            let t = (in_b.as_detached_tensor() + &bias_b)?;
+            t.to_dtype(DType::F32)
+        })?;
+
+        for step in 1..=3 {
+            let s = step as f32;
+            in_a.set(&Tensor::new(&[s, s + 1.0, s + 2.0, s + 3.0], &dev)?)?;
+            in_b.set(&Tensor::new(
+                &[10.0 * s, 10.0 * s, 10.0 * s, 10.0 * s],
+                &dev,
+            )?)?;
+            graph_a.launch()?;
+            graph_b.launch()?;
+            dev.synchronize()?;
+
+            let got_a = out_a.to_vec1::<f32>()?;
+            let got_b = out_b.to_vec1::<f32>()?;
+            assert_eq!(
+                got_a,
+                vec![
+                    2.0 * s + 1.0,
+                    2.0 * (s + 1.0) + 1.0,
+                    2.0 * (s + 2.0) + 1.0,
+                    2.0 * (s + 3.0) + 1.0
+                ]
+            );
+            assert_eq!(
+                got_b,
+                vec![
+                    10.0 * s + 5.0,
+                    10.0 * s + 6.0,
+                    10.0 * s + 7.0,
+                    10.0 * s + 8.0
+                ]
+            );
+        }
+
+        Ok(())
+    }
 }

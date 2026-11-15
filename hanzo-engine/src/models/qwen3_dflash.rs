@@ -2137,6 +2137,7 @@ struct SeqAdaptiveState {
     active_bs: usize,
     phase: AdaptivePhase,
     last_step: Option<LastAdaptiveStep>,
+    stand_down_reason: Option<String>,
 }
 
 impl SeqAdaptiveState {
@@ -2148,6 +2149,7 @@ impl SeqAdaptiveState {
                 commits: Vec::with_capacity(ADAPTIVE_WARMUP_ROUNDS),
             },
             last_step: None,
+            stand_down_reason: None,
         }
     }
 }
@@ -2175,6 +2177,12 @@ impl AdaptiveDFlashGate {
         seq_id
             .and_then(|id| self.seqs.get(&id))
             .is_some_and(|st| matches!(st.phase, AdaptivePhase::StoodDown))
+    }
+
+    fn stand_down_reason(&self, seq_id: usize) -> Option<&str> {
+        self.seqs
+            .get(&seq_id)
+            .and_then(|st| st.stand_down_reason.as_deref())
     }
 
     fn retain_seqs(&mut self, live: &[usize]) {
@@ -2270,9 +2278,13 @@ impl AdaptiveDFlashGate {
                 let spec_ms_per_tok = kept_ms / (kept_tok.max(1) as f64);
 
                 if mean_commit < 2.2 {
+                    let reason = format!(
+                        "warmup_low_commit(mean_commit={mean_commit:.2},spec={spec_ms_per_tok:.2}ms/tok)"
+                    );
                     tracing::info!(
                         "dflash2 adaptive: seq {seq_id} standing down after warmup (mean_commit={mean_commit:.2}, spec={spec_ms_per_tok:.2}ms/tok)"
                     );
+                    state.stand_down_reason = Some(reason);
                     state.phase = AdaptivePhase::StoodDown;
                 } else if mean_commit >= 4.2 {
                     if state.active_bs < max_bs && mean_commit >= (state.active_bs as f64 - 1.5) {
@@ -2307,9 +2319,14 @@ impl AdaptiveDFlashGate {
                 {
                     state.active_bs = max_bs;
                 } else if *total_rounds >= 10 && *ema_commit < 2.0 {
+                    let reason = format!(
+                        "low_ema_commit(ema_commit={ema_commit:.2},rounds={})",
+                        *total_rounds
+                    );
                     tracing::info!(
                         "dflash2 adaptive: seq {seq_id} standing down (ema_commit={ema_commit:.2} < 2.00)"
                     );
+                    state.stand_down_reason = Some(reason);
                     state.phase = AdaptivePhase::StoodDown;
                 }
             }
@@ -2341,12 +2358,17 @@ impl AdaptiveDFlashGate {
                         total_rounds: ADAPTIVE_WARMUP_ROUNDS,
                     };
                 } else {
+                    let reason = format!(
+                        "slower_than_plain_probe(spec={:.2}ms/tok>=est_plain={:.2}ms/tok,mean_commit={:.2})",
+                        *spec_ms_per_tok, est_plain_ms, *mean_commit
+                    );
                     tracing::info!(
                         "dflash2 adaptive: seq {seq_id} standing down for CUDA-graph decode (spec={:.2}ms/tok >= est_plain={:.2}ms/tok, mean_commit={:.2})",
                         *spec_ms_per_tok,
                         est_plain_ms,
                         *mean_commit
                     );
+                    state.stand_down_reason = Some(reason);
                     state.phase = AdaptivePhase::StoodDown;
                 }
             }
@@ -2472,6 +2494,12 @@ impl SpeculativeProposer for DFlash2Proposer {
         }
         let seq_id = ctx.seq_ids.first().copied().unwrap_or(0);
         if self.adaptive.is_paused_for_seq(Some(seq_id)) {
+            if let (Some(seq), Some(reason)) = (
+                ctx.sequences.first(),
+                self.adaptive.stand_down_reason(seq_id),
+            ) {
+                seq.record_speculative_stand_down(reason);
+            }
             return stand_down();
         }
         let Some(hiddens) = ctx.target_hidden_layers.as_ref() else {
@@ -2488,8 +2516,22 @@ impl SpeculativeProposer for DFlash2Proposer {
         }
 
         let active_bs = match self.adaptive.on_step(seq_id, anchor_pos, Instant::now()) {
-            AdaptiveDecision::Draft(bs) => bs,
-            AdaptiveDecision::ProbePlain | AdaptiveDecision::Paused => return stand_down(),
+            AdaptiveDecision::Draft(bs) => {
+                if let Some(seq) = ctx.sequences.first() {
+                    seq.record_draft_block_size(bs);
+                }
+                bs
+            }
+            AdaptiveDecision::ProbePlain => return stand_down(),
+            AdaptiveDecision::Paused => {
+                if let (Some(seq), Some(reason)) = (
+                    ctx.sequences.first(),
+                    self.adaptive.stand_down_reason(seq_id),
+                ) {
+                    seq.record_speculative_stand_down(reason);
+                }
+                return stand_down();
+            }
         };
 
         let embed_fn = Arc::clone(&self.heads.embed);
@@ -3239,6 +3281,9 @@ mod tests {
         }
         assert_eq!(gate.on_step(1, pos, now), AdaptiveDecision::Paused);
         assert!(gate.is_paused_for_seq(Some(1)));
+        assert!(gate
+            .stand_down_reason(1)
+            .is_some_and(|r| r.starts_with("slower_than_plain_probe(")));
 
         // Seq 2: same 3.25 commit/round at 90ms/round (~27.7 ms/tok),
         // plain m=1 probe takes 125ms (est = 106.25 ms/tok) -> stays active.
@@ -3255,6 +3300,7 @@ mod tests {
         }
         assert_eq!(gate.on_step(2, pos, now), AdaptiveDecision::Draft(8));
         assert!(!gate.is_paused_for_seq(Some(2)));
+        assert_eq!(gate.stand_down_reason(2), None);
         assert!(gate.is_paused_for_seq(Some(1)));
     }
 
@@ -3272,5 +3318,8 @@ mod tests {
         }
         assert_eq!(gate.on_step(7, pos, now), AdaptiveDecision::Paused);
         assert!(gate.is_paused_for_seq(Some(7)));
+        assert!(gate
+            .stand_down_reason(7)
+            .is_some_and(|r| r.starts_with("warmup_low_commit(")));
     }
 }

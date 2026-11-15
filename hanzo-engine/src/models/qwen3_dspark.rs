@@ -667,8 +667,8 @@ mod tests {
     }
 
     /// End-to-end proposer over the real checkpoint IF present (skips gracefully otherwise):
-    /// 5 random `[12, hidden]` target hiddens + anchor -> a `1..=block` token proposal whose
-    /// logits are `[1, keep, vocab]`. No GPU, no model download.
+    /// 5 random `[12, hidden]` target hiddens + anchor -> a `1..=block` token argmax proposal
+    /// (`logits: None`). No GPU, no model download.
     #[test]
     fn dspark_proposer_produces_block() -> Result<()> {
         use crate::speculative::SpeculativeKvCache;
@@ -729,11 +729,10 @@ mod tests {
             "proposal len {} out of 1..={block}",
             p.tokens.len()
         );
-        let logits = p
-            .logits
-            .as_ref()
-            .expect("DSpark proposal must carry logits");
-        assert_eq!(logits.dims(), &[1, p.tokens.len(), vocab]);
+        assert!(
+            p.logits.is_none(),
+            "DSpark proposal uses argmax tokens without draft logits"
+        );
         assert!(
             p.tokens.iter().all(|&t| (t as usize) < vocab),
             "draft token out of vocab range"

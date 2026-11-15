@@ -21,9 +21,8 @@ use crate::pipeline::chat_template::{
 };
 #[cfg(feature = "cuda")]
 use crate::pipeline::cuda_graph::{
-    cuda_decode_graphs_enabled, disable_event_tracking_for_capture, end_cuda_capture_discard,
-    restore_event_tracking_after_capture, CudaDecodeGraphKey, CudaDecodeGraphMetadataBuffers,
-    CudaGraphHandle, CUDA_DECODE_GRAPH_CACHE_CAPACITY,
+    capture_cuda_graph_with_output, cuda_decode_graphs_enabled, CudaDecodeGraphKey,
+    CudaDecodeGraphMetadataBuffers, CudaGraphHandle, CUDA_DECODE_GRAPH_CACHE_CAPACITY,
 };
 use crate::pipeline::llg::build_llg_factory;
 use crate::pipeline::loaders::auto_device_map;
@@ -102,6 +101,7 @@ pub struct MultimodalPipeline {
     imatrix: Option<PathBuf>,
     /// The speculative proposer attached at load.
     drafter: Option<crate::speculative::SpeculativeAttachInfo>,
+    forward_telemetry: crate::pipeline::AtomicForwardStepTelemetry,
 }
 
 #[cfg(feature = "cuda")]
@@ -990,6 +990,7 @@ impl Loader for MultimodalLoader {
             mapper: pipeline_mapper,
             imatrix: self.config.imatrix.clone(),
             drafter: None,
+            forward_telemetry: crate::pipeline::AtomicForwardStepTelemetry::default(),
         })))
     }
 
@@ -1236,6 +1237,7 @@ impl MultimodalPipeline {
                 .graph
                 .launch()
                 .map_err(|err| err.context("CUDA graph replay launch failed"))?;
+            self.forward_telemetry.record_decode_replay();
             let logits = entry.logits.clone();
             state.entries.push(entry);
             return Ok(Some(logits));
@@ -1264,6 +1266,7 @@ impl MultimodalPipeline {
         let entry = self.capture_cuda_decode_graph(
             key,
             input_ids,
+            &warmup_logits,
             seqlen_offsets,
             context_lens,
             position_ids,
@@ -1276,6 +1279,7 @@ impl MultimodalPipeline {
             state.entries.remove(0);
         }
         state.entries.push(entry);
+        self.forward_telemetry.record_decode_capture();
         Ok(Some(warmup_logits))
     }
 
@@ -1284,6 +1288,7 @@ impl MultimodalPipeline {
         &self,
         key: CudaDecodeGraphKey,
         input_ids: &Tensor,
+        warmup_logits: &Tensor,
         seqlen_offsets: &[usize],
         context_lens: &[(usize, usize)],
         position_ids: &[usize],
@@ -1292,62 +1297,29 @@ impl MultimodalPipeline {
         flash_meta: &FlashParams,
         block_size: usize,
     ) -> hanzo_ml::Result<MultimodalCudaDecodeGraphEntry> {
-        use hanzo_ml::cuda_backend::cudarc::driver::sys;
-
         let input_ids = Var::from_tensor(input_ids)?;
         let (metadata_buffers, metadata) =
             CudaDecodeGraphMetadataBuffers::new(metadata, seqlen_offsets, block_size)?;
         let graph_input_ids = input_ids.as_detached_tensor();
-        let Device::Cuda(cuda_device) = graph_input_ids.device() else {
-            hanzo_ml::bail!("CUDA graph decode expected CUDA input ids");
-        };
-        let stream = cuda_device.cuda_stream();
-        let restore_event_tracking = disable_event_tracking_for_capture(&stream);
-        let _htod_cache_guard = cuda_device.enable_cuda_graph_htod_cache();
 
-        if let Err(err) =
-            stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
-        {
-            restore_event_tracking_after_capture(&stream, restore_event_tracking);
-            return Err(
-                hanzo_ml::Error::msg(err.to_string()).context("CUDA graph begin capture failed")
-            );
-        }
-        let mut ctx = ModelForwardContext::new(
-            seqlen_offsets,
-            context_lens,
-            position_ids,
-            Some((kv_cache.as_slice(), &metadata)),
-            flash_meta,
-        );
-        let logits = match self.model.forward(
-            &graph_input_ids,
-            None,
-            self.model.default_model_specific_args(&graph_input_ids),
-            &mut ctx,
-        ) {
-            Ok(logits) => logits,
-            Err(err) => {
-                end_cuda_capture_discard(&stream);
-                restore_event_tracking_after_capture(&stream, restore_event_tracking);
-                return Err(err.context("CUDA graph captured forward failed"));
-            }
-        };
-
-        let graph = match CudaGraphHandle::end_capture(&stream) {
-            Ok(Some(graph)) => graph,
-            Ok(None) => {
-                restore_event_tracking_after_capture(&stream, restore_event_tracking);
-                return Err(hanzo_ml::Error::msg("CUDA graph capture returned no graph"));
-            }
-            Err(err) => {
-                restore_event_tracking_after_capture(&stream, restore_event_tracking);
-                return Err(err);
-            }
-        };
-        restore_event_tracking_after_capture(&stream, restore_event_tracking);
-
-        graph.upload()?;
+        let (graph, logits) =
+            capture_cuda_graph_with_output(graph_input_ids.device(), warmup_logits, || {
+                let mut ctx = ModelForwardContext::new(
+                    seqlen_offsets,
+                    context_lens,
+                    position_ids,
+                    Some((kv_cache.as_slice(), &metadata)),
+                    flash_meta,
+                );
+                self.model
+                    .forward(
+                        &graph_input_ids,
+                        None,
+                        self.model.default_model_specific_args(&graph_input_ids),
+                        &mut ctx,
+                    )
+                    .map_err(|err| err.context("CUDA graph captured forward failed"))
+            })?;
 
         Ok(MultimodalCudaDecodeGraphEntry {
             key,
@@ -1460,6 +1432,10 @@ impl Pipeline for MultimodalPipeline {
 
     fn drafter(&self) -> Option<crate::speculative::SpeculativeAttachInfo> {
         self.drafter.clone()
+    }
+
+    fn take_forward_step_telemetry(&self) -> crate::sequence::ForwardStepTelemetry {
+        self.forward_telemetry.take()
     }
 
     #[allow(clippy::too_many_arguments)]

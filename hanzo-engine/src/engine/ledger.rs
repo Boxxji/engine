@@ -115,12 +115,89 @@ pub fn totals() -> Totals {
     COUNTERS.read()
 }
 
-/// A request finished: add it to the totals and log its ledger line. `drafter` names the
-/// speculative proposer attached to the pipeline; `structured` says the request decoded under a
-/// constraint.
-pub(crate) fn record(usage: &Usage, drafter: Option<&str>, structured: bool) {
+/// Logs the backwards-compatible `serve_api:` ledger line alongside a structured
+/// `serve_trace:` line separating speculative verify rounds from stood-down plain steps,
+/// active draft block sizes, LSA activation, adaptive stand-down reason, and CUDA graph hits.
+pub(crate) fn record_with_trace(
+    usage: &Usage,
+    drafter: Option<&str>,
+    structured: bool,
+    trace: &crate::sequence::RequestExecutionTrace,
+) {
     COUNTERS.add(usage, structured);
     tracing::info!("{}", line(usage, drafter));
+    tracing::info!("{}", trace_line(usage, drafter, trace));
+}
+
+pub(crate) fn trace_line(
+    usage: &Usage,
+    drafter: Option<&str>,
+    trace: &crate::sequence::RequestExecutionTrace,
+) -> String {
+    let used_spec = usage.draft_tokens > 0 || trace.speculative_rounds > 0;
+    let spec_label = if used_spec {
+        drafter.unwrap_or("spec")
+    } else {
+        "none"
+    };
+    let mode = if trace.stand_down_reason.is_some() && used_spec {
+        let from = if trace.lsa_active {
+            format!("{spec_label}+lsa")
+        } else {
+            spec_label.to_string()
+        };
+        let to = if trace.lsa_active { "lsa" } else { "dense" };
+        format!("{from}->{to}")
+    } else if used_spec && trace.lsa_active {
+        format!("{spec_label}+lsa")
+    } else if used_spec {
+        spec_label.to_string()
+    } else if trace.lsa_active {
+        "lsa".to_string()
+    } else {
+        "dense".to_string()
+    };
+
+    let bs = if trace.draft_block_sizes.is_empty() {
+        "none".to_string()
+    } else {
+        trace
+            .draft_block_sizes
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join("->")
+    };
+
+    let spec_accept_pct = if usage.draft_tokens > 0 {
+        100.0 * (usage.draft_accepted as f64) / (usage.draft_tokens as f64)
+    } else {
+        0.0
+    };
+    let spec_commit = if trace.speculative_rounds > 0 {
+        (trace.speculative_committed_tokens as f64) / (trace.speculative_rounds as f64)
+    } else {
+        0.0
+    };
+    let stand_down = trace.stand_down_reason.as_deref().unwrap_or("none");
+    let prefill_ms = f64::from(usage.total_prompt_time_sec) * 1000.0;
+    let decode_ms = f64::from(usage.total_completion_time_sec) * 1000.0;
+
+    format!(
+        "serve_trace: mode={mode} bs={bs} spec_rounds={} spec_committed={} plain_steps={} \
+         drafted={} accepted={} spec_accept={spec_accept_pct:.1}% spec_commit={spec_commit:.2}/round \
+         cuda_decode_graph=capture:{},replay:{} cuda_prefill_graph=capture:{},replay:{} \
+         prefill_ms={prefill_ms:.1} decode_ms={decode_ms:.1} stand_down={stand_down}",
+        trace.speculative_rounds,
+        trace.speculative_committed_tokens,
+        trace.plain_decode_steps,
+        usage.draft_tokens,
+        usage.draft_accepted,
+        trace.cuda_decode_graph_captures,
+        trace.cuda_decode_graph_replays,
+        trace.cuda_prefill_graph_captures,
+        trace.cuda_prefill_graph_replays,
+    )
 }
 
 /// The ledger line, in the shape `bench-serving.py`'s pattern reads:
@@ -295,5 +372,77 @@ mod tests {
                 structured: 1,
             }
         );
+    }
+
+    #[test]
+    fn serve_trace_separates_spec_rounds_stand_down_lsa_and_cuda_graphs() {
+        use crate::sequence::RequestExecutionTrace;
+
+        let u = Usage {
+            draft_tokens: 28,
+            draft_accepted: 5,
+            ..usage(30_000, 0, 96)
+        };
+        let trace = RequestExecutionTrace {
+            lsa_active: true,
+            speculative_rounds: 4,
+            speculative_committed_tokens: 9,
+            plain_decode_steps: 86,
+            draft_block_sizes: vec![8],
+            stand_down_reason: Some(
+                "slower_than_plain_probe(spec=83.58ms/tok>=est_plain=27.34ms/tok,mean_commit=2.25)"
+                    .to_string(),
+            ),
+            cuda_decode_graph_captures: 0,
+            cuda_decode_graph_replays: 0,
+            cuda_prefill_graph_captures: 0,
+            cuda_prefill_graph_replays: 0,
+        };
+        let s = super::trace_line(&u, Some("dflash"), &trace);
+        assert!(s.contains("mode=dflash+lsa->lsa "), "got: {s}");
+        assert!(s.contains("bs=8 "), "got: {s}");
+        assert!(
+            s.contains("spec_rounds=4 spec_committed=9 plain_steps=86 drafted=28 accepted=5 spec_accept=17.9% spec_commit=2.25/round"),
+            "got: {s}"
+        );
+        assert!(
+            s.contains(
+                "cuda_decode_graph=capture:0,replay:0 cuda_prefill_graph=capture:0,replay:0"
+            ),
+            "got: {s}"
+        );
+        assert!(
+            s.contains("stand_down=slower_than_plain_probe("),
+            "got: {s}"
+        );
+
+        let recovered = RequestExecutionTrace {
+            lsa_active: false,
+            speculative_rounds: 4,
+            speculative_committed_tokens: 6,
+            plain_decode_steps: 89,
+            draft_block_sizes: vec![8, 16],
+            stand_down_reason: Some(
+                "warmup_low_commit(mean_commit=1.50,spec=30.00ms/tok)".to_string(),
+            ),
+            cuda_decode_graph_captures: 1,
+            cuda_decode_graph_replays: 88,
+            cuda_prefill_graph_captures: 1,
+            cuda_prefill_graph_replays: 0,
+        };
+        let r = super::trace_line(&u, Some("dflash"), &recovered);
+        assert!(r.contains("mode=dflash->dense "), "got: {r}");
+        assert!(r.contains("bs=8->16 "), "got: {r}");
+        assert!(
+            r.contains("cuda_decode_graph=capture:1,replay:88 "),
+            "got: {r}"
+        );
+
+        let dense = super::trace_line(&usage(128, 0, 32), None, &RequestExecutionTrace::default());
+        assert!(
+            dense.contains("mode=dense bs=none spec_rounds=0 "),
+            "got: {dense}"
+        );
+        assert!(dense.ends_with("stand_down=none"), "got: {dense}");
     }
 }
