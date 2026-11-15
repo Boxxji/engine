@@ -64,14 +64,15 @@ pub trait Processor {
             self.template_action(),
             tools,
         )?;
-        let encoding = pipeline
-            .tokenizer()
-            .with_context(|| {
-                "Default `Processor::process` requires the model to have a tokenizer."
-            })?
-            .encode_fast(prompt.clone(), add_special_tokens)
-            .map_err(anyhow::Error::msg)?;
-        Ok((encoding.get_ids().to_vec(), prompt))
+        let tokenizer = pipeline.tokenizer().with_context(|| {
+            "Default `Processor::process` requires the model to have a tokenizer."
+        })?;
+        let ids = crate::utils::fast_tokenizer::encode_prompt_cached(
+            &tokenizer,
+            &prompt,
+            add_special_tokens,
+        )?;
+        Ok((ids, prompt))
     }
     fn inputs_processor(&self) -> Arc<dyn InputsProcessor>;
     fn get_special_tokens(&self) -> &[&'static str];

@@ -1,0 +1,24 @@
+# Copyright 2026 Hanzo AI, Inc.
+# SPDX-License-Identifier: MIT
+
+[package]
+name = "hanzo-kv-fabric"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Epoch-fenced KV cache block directory and framed TCP/RDMA-hooked KV transport for Hanzo Engine."
+
+[dependencies]
+bytes = { workspace = true }
+parking_lot = { workspace = true }
+rustc-hash = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+xxhash-rust = { workspace = true }

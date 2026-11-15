@@ -20,6 +20,8 @@ members = [
     "hanzo-code-exec",
     "hanzo-film",
     "hanzo-train",
+    "hanzo-tokenizer",
+    "hanzo-kv-fabric",
 ]
 resolver = "2"
 
@@ -112,6 +114,11 @@ cli-table = "0.5.0"
 dirs = "6.0.0"
 thiserror = "2.0.18"
 tokenizers = { version = "0.21.4", default-features = false }
+aho-corasick = "1.1"
+bytes = "1.12"
+unicode_categories = "0.1"
+unicode-normalization-alignments = "0.1"
+xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 tokio-tungstenite = "0.28.0"
 tqdm = "0.8.0"
 chrono = "0.4.43"
@@ -221,6 +228,8 @@ hanzo-macros = { version = "1.7.41", path = "hanzo-macros" }
 hanzo-sandbox = { version = "1.7.41", path = "hanzo-sandbox" }
 hanzo-code-exec = { version = "1.7.41", path = "hanzo-code-exec" }
 hanzo-train = { version = "1.7.51", path = "hanzo-train" }
+hanzo-tokenizer = { version = "1.7.41", path = "hanzo-tokenizer" }
+hanzo-kv-fabric = { version = "1.7.41", path = "hanzo-kv-fabric" }
 hanzo-zap = { version = "0.2.1" }
 
 # Hanzo native-ML extension crates (federated training, quantization, zen5 inference)

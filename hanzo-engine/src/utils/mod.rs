@@ -1,5 +1,6 @@
 pub(crate) mod cuda_mempool;
 pub(crate) mod debug;
+pub(crate) mod fast_tokenizer;
 pub(crate) mod gguf_metadata;
 pub(crate) mod memory_usage;
 pub(crate) mod model_config;

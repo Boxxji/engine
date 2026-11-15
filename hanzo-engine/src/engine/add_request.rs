@@ -286,11 +286,13 @@ impl Engine {
                         .tokenizer()
                         .ok_or_else(|| anyhow::Error::msg("a forced tool call needs a tokenizer"))
                         .and_then(|tokenizer| {
-                            tokenizer
-                                .encode_fast(prefill.as_str(), false)
-                                .map_err(anyhow::Error::msg)
+                            crate::utils::fast_tokenizer::encode_prompt_cached(
+                                &tokenizer,
+                                prefill.as_str(),
+                                false,
+                            )
                         });
-                    toks.extend_from_slice(handle_seq_error!(ids, request.response).get_ids());
+                    toks.extend_from_slice(&handle_seq_error!(ids, request.response));
                     text.push_str(prefill);
                 }
                 (toks, text)
@@ -307,15 +309,9 @@ impl Engine {
                         .unwrap_or_else(|_| warn!("Receiver disconnected"));
                     return;
                 };
-                let prompt = tokenizer
-                    .encode_fast(text.clone(), true)
-                    .map_err(anyhow::Error::msg);
-                (
-                    handle_seq_error!(prompt, request.response)
-                        .get_ids()
-                        .to_vec(),
-                    text,
-                )
+                let prompt =
+                    crate::utils::fast_tokenizer::encode_prompt_cached(tokenizer, &text, true);
+                (handle_seq_error!(prompt, request.response), text)
             }
             RequestMessage::ImageGeneration { prompt, .. }
             | RequestMessage::SpeechGeneration { prompt } => (vec![u32::MAX], prompt),
@@ -963,13 +959,17 @@ impl Engine {
                         return;
                     }
                 };
-                let toks = tokenizer.encode_fast(text, request.add_special_tokens);
+                let toks = crate::utils::fast_tokenizer::encode_prompt_cached(
+                    &tokenizer,
+                    &text,
+                    request.add_special_tokens,
+                );
                 let toks = match toks {
-                    Ok(tokenizer) => tokenizer,
+                    Ok(toks) => toks,
                     Err(e) => {
                         request
                             .response
-                            .send(Err(anyhow::Error::msg(e)))
+                            .send(Err(e))
                             .await
                             .unwrap_or_else(|_| warn!("Receiver disconnected"));
                         return;
@@ -977,7 +977,7 @@ impl Engine {
                 };
                 request
                     .response
-                    .send(Ok(toks.get_ids().to_vec()))
+                    .send(Ok(toks))
                     .await
                     .expect("Sender disconnected unexpectedly!");
             }

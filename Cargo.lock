@@ -3197,29 +3197,36 @@ dependencies = [
  "directories 6.0.0",
  "dirs 6.0.0",
  "either",
+ "fast_image_resize",
  "futures-util",
  "half",
  "hanzo",
  "hanzo-bench",
  "hanzo-engine",
  "hanzo-kernel",
+ "hanzo-kv-fabric",
  "hanzo-ml",
  "hanzo-nn",
  "hanzo-quant",
  "hanzo-sandbox",
  "hanzo-server-core",
+ "hanzo-tokenizer",
  "hanzo-train",
+ "hanzo-vision",
  "hostname",
  "image",
  "include_dir",
  "indexmap 2.14.0",
  "mdns-sd",
  "mime_guess",
+ "minijinja",
+ "minijinja-contrib",
  "qrcode",
  "regex",
  "rustyline",
  "serde",
  "serde_json",
+ "tokenizers 0.21.4",
  "tokio",
  "toml 0.9.12+spec-1.1.0",
  "tower-http",
@@ -3289,6 +3296,7 @@ dependencies = [
  "hanzo-paged-attn",
  "hanzo-quant",
  "hanzo-sandbox",
+ "hanzo-tokenizer",
  "hanzo-train",
  "hanzo-transformers",
  "hanzo-vision",
@@ -3457,6 +3465,21 @@ checksum = "f9cf7d651611deb2c01a0b0cbb260440fc322fed66fc25906a5dff4f5c032566"
 dependencies = [
  "glob",
  "hanzo-bindgen-cuda",
+]
+
+[[package]]
+name = "hanzo-kv-fabric"
+version = "1.7.107"
+dependencies = [
+ "bytes",
+ "parking_lot",
+ "rustc-hash 2.1.3",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tokio",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -3763,6 +3786,23 @@ dependencies = [
  "utoipa",
  "utoipa-swagger-ui",
  "uuid 1.24.0",
+]
+
+[[package]]
+name = "hanzo-tokenizer"
+version = "1.7.107"
+dependencies = [
+ "aho-corasick",
+ "parking_lot",
+ "rayon",
+ "regex",
+ "rustc-hash 2.1.3",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokenizers 0.21.4",
+ "unicode-normalization-alignments",
+ "unicode_categories",
 ]
 
 [[package]]
