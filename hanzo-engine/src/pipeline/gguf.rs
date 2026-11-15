@@ -1425,7 +1425,13 @@ impl GGUFPipeline {
         if !cuda_decode_graphs_enabled() || !self.model_supports_decode_graph() {
             return Ok(None);
         }
-        if self.draft_proposer.is_some() {
+        let spec_active = match self.model {
+            Model::Qwen35(ref model) => {
+                self.draft_proposer.is_some() && !model.spec_capture.is_forward_paused()
+            }
+            _ => self.draft_proposer.is_some(),
+        };
+        if spec_active {
             return Ok(None);
         }
         if let Some(ref lsa_cfg) = crate::attention::LsaConfig::global() {
@@ -2713,8 +2719,18 @@ impl Pipeline for GGUFPipeline {
     }
 
     fn note_forward_sequences(&self, seq_ids: &[usize]) {
+        let paused = match seq_ids {
+            [id] => self
+                .draft_proposer
+                .as_ref()
+                .is_some_and(|p| p.is_paused_for_seq(Some(*id))),
+            _ => false,
+        };
         match self.model {
-            Model::Qwen35(ref model) => model.spec_capture.note_forward(seq_ids),
+            Model::Qwen35(ref model) => {
+                model.spec_capture.note_forward(seq_ids);
+                model.spec_capture.set_forward_paused(paused);
+            }
             Model::Zen6(ref model) => model.note_forward(seq_ids),
             _ => {}
         }

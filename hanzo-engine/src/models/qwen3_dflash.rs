@@ -1402,6 +1402,7 @@ impl Qwen3DFlash2 {
             lm_head,
             temperature,
             true,
+            None,
         )?;
         let logits = maybe_logits.ok_or_else(|| {
             hanzo_ml::Error::msg("draft_block internal error: missing proposal logits")
@@ -1420,11 +1421,13 @@ impl Qwen3DFlash2 {
         lm_head: &TargetLmHead<'_>,
         temperature: f64,
         need_logits: bool,
+        block_size_override: Option<usize>,
     ) -> Result<(Vec<u32>, Option<Tensor>)> {
         let prof = std::env::var_os("HANZO_DFLASH_PROFILE").is_some();
         let t_total = Instant::now();
         let dev = &self.device;
-        let bs = self.cfg.block_size();
+        let max_bs = self.cfg.block_size();
+        let bs = block_size_override.map_or(max_bs, |v| v.clamp(2, max_bs));
 
         if target_hiddens.layers.len() != self.cfg.num_fused_layers() {
             return Err(hanzo_ml::Error::msg(format!(
@@ -2080,17 +2083,294 @@ pub fn dflash_varbuilder(
 ///
 /// Holds no per-sequence state — every block is drafted from the target's hidden
 /// prefix — so the default `retain_seqs` no-op is already correct.
+const ADAPTIVE_DEFAULT_INITIAL_BS: usize = 8;
+const ADAPTIVE_WARMUP_ROUNDS: usize = 4;
+const ADAPTIVE_PROBE_STEPS: usize = 3;
+const ADAPTIVE_CUDA_GRAPH_DISCOUNT: f64 = 0.85;
+
+fn dflash_adaptive_enabled() -> bool {
+    std::env::var("HANZO_DFLASH_ADAPTIVE").ok().as_deref() != Some("0")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdaptiveDecision {
+    Draft(usize),
+    ProbePlain,
+    Paused,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LastAdaptiveStep {
+    Speculative {
+        anchor_pos: usize,
+        draft_len: usize,
+        started_at: Instant,
+    },
+    PlainProbe {
+        anchor_pos: usize,
+        started_at: Instant,
+        warmup: bool,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum AdaptivePhase {
+    Warmup {
+        rounds_ms: Vec<f64>,
+        commits: Vec<usize>,
+    },
+    PlainProbe {
+        remaining: usize,
+        spec_ms_per_tok: f64,
+        mean_commit: f64,
+        probe_min_ms: f64,
+    },
+    Active {
+        ema_commit: f64,
+        total_rounds: usize,
+    },
+    StoodDown,
+}
+
+#[derive(Debug, Clone)]
+struct SeqAdaptiveState {
+    active_bs: usize,
+    phase: AdaptivePhase,
+    last_step: Option<LastAdaptiveStep>,
+}
+
+impl SeqAdaptiveState {
+    fn new(max_bs: usize) -> Self {
+        Self {
+            active_bs: max_bs.min(ADAPTIVE_DEFAULT_INITIAL_BS).max(2.min(max_bs)),
+            phase: AdaptivePhase::Warmup {
+                rounds_ms: Vec::with_capacity(ADAPTIVE_WARMUP_ROUNDS),
+                commits: Vec::with_capacity(ADAPTIVE_WARMUP_ROUNDS),
+            },
+            last_step: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AdaptiveDFlashGate {
+    enabled: bool,
+    max_bs: usize,
+    seqs: HashMap<usize, SeqAdaptiveState>,
+}
+
+impl AdaptiveDFlashGate {
+    fn new(max_bs: usize, enabled: bool) -> Self {
+        Self {
+            enabled,
+            max_bs,
+            seqs: HashMap::new(),
+        }
+    }
+
+    fn is_paused_for_seq(&self, seq_id: Option<usize>) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        seq_id
+            .and_then(|id| self.seqs.get(&id))
+            .is_some_and(|st| matches!(st.phase, AdaptivePhase::StoodDown))
+    }
+
+    fn retain_seqs(&mut self, live: &[usize]) {
+        self.seqs.retain(|id, _| live.contains(id));
+    }
+
+    fn on_step(&mut self, seq_id: usize, anchor_pos: usize, now: Instant) -> AdaptiveDecision {
+        if !self.enabled || self.max_bs < 2 {
+            return AdaptiveDecision::Draft(self.max_bs);
+        }
+        let max_bs = self.max_bs;
+        let state = self
+            .seqs
+            .entry(seq_id)
+            .or_insert_with(|| SeqAdaptiveState::new(max_bs));
+
+        if let Some(prev) = state.last_step.take() {
+            match prev {
+                LastAdaptiveStep::Speculative {
+                    anchor_pos: prev_pos,
+                    draft_len,
+                    started_at,
+                } if anchor_pos > prev_pos => {
+                    let commit = (anchor_pos - prev_pos).min(draft_len + 1);
+                    let elapsed_ms =
+                        now.saturating_duration_since(started_at).as_secs_f64() * 1000.0;
+                    Self::record_spec_observation(seq_id, state, max_bs, commit, elapsed_ms);
+                }
+                LastAdaptiveStep::PlainProbe {
+                    anchor_pos: prev_pos,
+                    started_at,
+                    warmup,
+                } if !warmup && anchor_pos > prev_pos => {
+                    let step_ms = now.saturating_duration_since(started_at).as_secs_f64() * 1000.0
+                        / ((anchor_pos - prev_pos) as f64);
+                    Self::record_probe_observation(seq_id, state, step_ms);
+                }
+                _ => {}
+            }
+        }
+
+        match &mut state.phase {
+            AdaptivePhase::Warmup { .. } | AdaptivePhase::Active { .. } => {
+                let bs = state.active_bs;
+                state.last_step = Some(LastAdaptiveStep::Speculative {
+                    anchor_pos,
+                    draft_len: bs.saturating_sub(1),
+                    started_at: now,
+                });
+                AdaptiveDecision::Draft(bs)
+            }
+            AdaptivePhase::PlainProbe { remaining, .. } => {
+                let is_warmup = *remaining == ADAPTIVE_PROBE_STEPS;
+                *remaining = remaining.saturating_sub(1);
+                state.last_step = Some(LastAdaptiveStep::PlainProbe {
+                    anchor_pos,
+                    started_at: now,
+                    warmup: is_warmup,
+                });
+                AdaptiveDecision::ProbePlain
+            }
+            AdaptivePhase::StoodDown => AdaptiveDecision::Paused,
+        }
+    }
+
+    fn record_spec_observation(
+        seq_id: usize,
+        state: &mut SeqAdaptiveState,
+        max_bs: usize,
+        commit: usize,
+        elapsed_ms: f64,
+    ) {
+        match &mut state.phase {
+            AdaptivePhase::Warmup { rounds_ms, commits } => {
+                rounds_ms.push(elapsed_ms);
+                commits.push(commit);
+                if commits.len() < ADAPTIVE_WARMUP_ROUNDS {
+                    return;
+                }
+                let total_commit: usize = commits.iter().sum();
+                let mean_commit = (total_commit as f64) / (commits.len() as f64);
+
+                // Drop the single slowest warmup round to stay resilient against transient GPU contention spikes.
+                let mut pairs: Vec<(f64, usize)> = rounds_ms
+                    .iter()
+                    .copied()
+                    .zip(commits.iter().copied())
+                    .collect();
+                pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let keep = (pairs.len() - 1).max(1);
+                let kept_ms: f64 = pairs[..keep].iter().map(|(ms, _)| *ms).sum();
+                let kept_tok: usize = pairs[..keep].iter().map(|(_, c)| *c).sum();
+                let spec_ms_per_tok = kept_ms / (kept_tok.max(1) as f64);
+
+                if mean_commit < 2.2 {
+                    tracing::info!(
+                        "dflash2 adaptive: seq {seq_id} standing down after warmup (mean_commit={mean_commit:.2}, spec={spec_ms_per_tok:.2}ms/tok)"
+                    );
+                    state.phase = AdaptivePhase::StoodDown;
+                } else if mean_commit >= 4.2 {
+                    if state.active_bs < max_bs && mean_commit >= (state.active_bs as f64 - 1.5) {
+                        state.active_bs = max_bs;
+                    }
+                    tracing::info!(
+                        "dflash2 adaptive: seq {seq_id} locked active at bs={} (mean_commit={mean_commit:.2}, spec={spec_ms_per_tok:.2}ms/tok)",
+                        state.active_bs
+                    );
+                    state.phase = AdaptivePhase::Active {
+                        ema_commit: mean_commit,
+                        total_rounds: commits.len(),
+                    };
+                } else {
+                    state.phase = AdaptivePhase::PlainProbe {
+                        remaining: ADAPTIVE_PROBE_STEPS,
+                        spec_ms_per_tok,
+                        mean_commit,
+                        probe_min_ms: f64::INFINITY,
+                    };
+                }
+            }
+            AdaptivePhase::Active {
+                ema_commit,
+                total_rounds,
+            } => {
+                *total_rounds += 1;
+                *ema_commit = 0.25 * (commit as f64) + 0.75 * *ema_commit;
+                if state.active_bs < max_bs
+                    && *total_rounds >= 3
+                    && *ema_commit >= (state.active_bs as f64 - 0.8)
+                {
+                    state.active_bs = max_bs;
+                } else if *total_rounds >= 10 && *ema_commit < 2.0 {
+                    tracing::info!(
+                        "dflash2 adaptive: seq {seq_id} standing down (ema_commit={ema_commit:.2} < 2.00)"
+                    );
+                    state.phase = AdaptivePhase::StoodDown;
+                }
+            }
+            AdaptivePhase::PlainProbe { .. } | AdaptivePhase::StoodDown => {}
+        }
+    }
+
+    fn record_probe_observation(seq_id: usize, state: &mut SeqAdaptiveState, step_ms: f64) {
+        if let AdaptivePhase::PlainProbe {
+            remaining,
+            spec_ms_per_tok,
+            mean_commit,
+            probe_min_ms,
+        } = &mut state.phase
+        {
+            *probe_min_ms = probe_min_ms.min(step_ms);
+            if *remaining == 0 {
+                let est_plain_ms = *probe_min_ms * ADAPTIVE_CUDA_GRAPH_DISCOUNT;
+                if *spec_ms_per_tok < est_plain_ms {
+                    let ema = *mean_commit;
+                    tracing::info!(
+                        "dflash2 adaptive: seq {seq_id} staying active at bs={} (spec={:.2}ms/tok < est_plain={:.2}ms/tok, mean_commit={ema:.2})",
+                        state.active_bs,
+                        *spec_ms_per_tok,
+                        est_plain_ms
+                    );
+                    state.phase = AdaptivePhase::Active {
+                        ema_commit: ema,
+                        total_rounds: ADAPTIVE_WARMUP_ROUNDS,
+                    };
+                } else {
+                    tracing::info!(
+                        "dflash2 adaptive: seq {seq_id} standing down for CUDA-graph decode (spec={:.2}ms/tok >= est_plain={:.2}ms/tok, mean_commit={:.2})",
+                        *spec_ms_per_tok,
+                        est_plain_ms,
+                        *mean_commit
+                    );
+                    state.phase = AdaptivePhase::StoodDown;
+                }
+            }
+        }
+    }
+}
+
 pub struct DFlash2Proposer {
     draft: Qwen3DFlash2,
     /// The target's embedding and output head. DFlash carries neither, and decoding
     /// through the target's own head is what puts the draft's logits on the verifier's
     /// scale. Held here because the pipelines call `propose` without an embedder.
     heads: SpeculativeSharedHeads,
+    adaptive: AdaptiveDFlashGate,
 }
 
 impl DFlash2Proposer {
     pub fn new(draft: Qwen3DFlash2, heads: SpeculativeSharedHeads) -> Self {
-        Self { draft, heads }
+        let max_bs = draft.config().block_size();
+        Self {
+            draft,
+            heads,
+            adaptive: AdaptiveDFlashGate::new(max_bs, dflash_adaptive_enabled()),
+        }
     }
 
     /// Load the draft at `path` — either a standalone `.gguf` archive (`general.architecture = "dflash"`)
@@ -2161,6 +2441,14 @@ impl SpeculativeProposer for DFlash2Proposer {
         self.draft.config().draft_len()
     }
 
+    fn retain_seqs(&mut self, live: &[usize]) {
+        self.adaptive.retain_seqs(live);
+    }
+
+    fn is_paused_for_seq(&self, seq_id: Option<usize>) -> bool {
+        self.adaptive.is_paused_for_seq(seq_id)
+    }
+
     fn propose(
         &mut self,
         ctx: SpeculativeProposeBatchCtx<'_>,
@@ -2182,6 +2470,10 @@ impl SpeculativeProposer for DFlash2Proposer {
         if batch != 1 {
             return stand_down();
         }
+        let seq_id = ctx.seq_ids.first().copied().unwrap_or(0);
+        if self.adaptive.is_paused_for_seq(Some(seq_id)) {
+            return stand_down();
+        }
         let Some(hiddens) = ctx.target_hidden_layers.as_ref() else {
             return stand_down();
         };
@@ -2194,6 +2486,11 @@ impl SpeculativeProposer for DFlash2Proposer {
         if hiddens.end()? < anchor_pos || hiddens.start >= anchor_pos {
             return stand_down();
         }
+
+        let active_bs = match self.adaptive.on_step(seq_id, anchor_pos, Instant::now()) {
+            AdaptiveDecision::Draft(bs) => bs,
+            AdaptiveDecision::ProbePlain | AdaptiveDecision::Paused => return stand_down(),
+        };
 
         let embed_fn = Arc::clone(&self.heads.embed);
         let embed = move |ids: &Tensor| embed_fn(ids);
@@ -2210,6 +2507,7 @@ impl SpeculativeProposer for DFlash2Proposer {
             &lm_head,
             0.0,
             false,
+            Some(active_bs),
         )?;
         Ok(SpeculativeProposalBatch::new(vec![
             SpeculativeProposal::new(tokens),
@@ -2892,5 +3190,87 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn dflash_adaptive_gate_expands_on_high_acceptance_and_retains_seqs() {
+        use std::time::Duration;
+        let mut gate = AdaptiveDFlashGate::new(16, true);
+        let t0 = Instant::now();
+        let mut pos = 100usize;
+
+        // First 4 warmup rounds start at bs=8; committing 7 tokens/round (out of 8 max)
+        // triggers expansion back to checkpoint max_bs=16.
+        for r in 0..ADAPTIVE_WARMUP_ROUNDS {
+            let dec = gate.on_step(1, pos, t0 + Duration::from_millis((r as u64) * 20));
+            assert_eq!(dec, AdaptiveDecision::Draft(8));
+            pos += 7;
+        }
+        let dec_after = gate.on_step(1, pos, t0 + Duration::from_millis(80));
+        assert_eq!(dec_after, AdaptiveDecision::Draft(16));
+        assert!(!gate.is_paused_for_seq(Some(1)));
+
+        // retain_seqs drops finished sequences cleanly.
+        gate.retain_seqs(&[2]);
+        assert!(!gate.seqs.contains_key(&1));
+    }
+
+    #[test]
+    fn dflash_adaptive_gate_probes_borderline_and_stands_down_when_slower() {
+        use std::time::Duration;
+        let mut gate = AdaptiveDFlashGate::new(16, true);
+        let t0 = Instant::now();
+        let mut now = t0;
+        let mut pos = 100usize;
+
+        // Seq 1: borderline 3.25 commit/round at 110ms/round (~33.8 ms/tok),
+        // plain m=1 probe takes 34ms (est CUDA-graph = 28.9 ms/tok) -> stands down.
+        let commits = [3, 4, 3, 3];
+        for c in commits {
+            assert_eq!(gate.on_step(1, pos, now), AdaptiveDecision::Draft(8));
+            pos += c;
+            now += Duration::from_millis(110);
+        }
+        for _ in 0..ADAPTIVE_PROBE_STEPS {
+            assert_eq!(gate.on_step(1, pos, now), AdaptiveDecision::ProbePlain);
+            assert!(!gate.is_paused_for_seq(Some(1)));
+            pos += 1;
+            now += Duration::from_millis(34);
+        }
+        assert_eq!(gate.on_step(1, pos, now), AdaptiveDecision::Paused);
+        assert!(gate.is_paused_for_seq(Some(1)));
+
+        // Seq 2: same 3.25 commit/round at 90ms/round (~27.7 ms/tok),
+        // plain m=1 probe takes 125ms (est = 106.25 ms/tok) -> stays active.
+        pos = 500;
+        for c in commits {
+            assert_eq!(gate.on_step(2, pos, now), AdaptiveDecision::Draft(8));
+            pos += c;
+            now += Duration::from_millis(90);
+        }
+        for _ in 0..ADAPTIVE_PROBE_STEPS {
+            assert_eq!(gate.on_step(2, pos, now), AdaptiveDecision::ProbePlain);
+            pos += 1;
+            now += Duration::from_millis(125);
+        }
+        assert_eq!(gate.on_step(2, pos, now), AdaptiveDecision::Draft(8));
+        assert!(!gate.is_paused_for_seq(Some(2)));
+        assert!(gate.is_paused_for_seq(Some(1)));
+    }
+
+    #[test]
+    fn dflash_adaptive_gate_immediately_stands_down_on_collapsing_acceptance() {
+        use std::time::Duration;
+        let mut gate = AdaptiveDFlashGate::new(16, true);
+        let mut now = Instant::now();
+        let mut pos = 50usize;
+
+        for _ in 0..ADAPTIVE_WARMUP_ROUNDS {
+            assert_eq!(gate.on_step(7, pos, now), AdaptiveDecision::Draft(8));
+            pos += 1; // 0 drafts accepted
+            now += Duration::from_millis(40);
+        }
+        assert_eq!(gate.on_step(7, pos, now), AdaptiveDecision::Paused);
+        assert!(gate.is_paused_for_seq(Some(7)));
     }
 }

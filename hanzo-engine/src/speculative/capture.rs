@@ -72,6 +72,7 @@ impl HiddenWindow {
 #[derive(Default)]
 pub struct HiddenPrefixCapture {
     enabled: AtomicBool,
+    forward_paused: AtomicBool,
     plan: Mutex<CaptureRequest>,
     state: Mutex<CaptureState>,
 }
@@ -138,12 +139,23 @@ impl HiddenPrefixCapture {
         }
     }
 
+    /// Marks whether hidden capture is temporarily paused for the current forward (because the
+    /// speculative proposer stood down for this sequence).
+    pub fn set_forward_paused(&self, paused: bool) {
+        self.forward_paused.store(paused, Ordering::Relaxed);
+    }
+
+    /// Returns true if hidden capture is currently paused for the active forward.
+    pub fn is_forward_paused(&self) -> bool {
+        self.forward_paused.load(Ordering::Relaxed)
+    }
+
     /// The layers to snapshot during a forward over `num_seqs` sequences: none while capture
-    /// is off, and none for a multi-sequence forward. After one of those the buffer describes
-    /// no sequence's confirmed prefix, so it is dropped and the proposer stands down for the
-    /// survivors rather than drafting from rows that stopped tracking them.
+    /// is off or paused, and none for a multi-sequence forward. After one of those the buffer
+    /// describes no sequence's confirmed prefix, so it is dropped and the proposer stands down
+    /// for the survivors rather than drafting from rows that stopped tracking them.
     pub fn layers_for(&self, num_seqs: usize) -> Vec<usize> {
-        if !self.enabled.load(Ordering::Relaxed) {
+        if !self.enabled.load(Ordering::Relaxed) || self.forward_paused.load(Ordering::Relaxed) {
             return Vec::new();
         }
         if num_seqs == 1 {

@@ -91,6 +91,105 @@ const DEFAULT_MAX_SEQ_LEN: u32 = 4096;
 const DEFAULT_PARTIAL_ROTARY_FACTOR: f64 = 0.25;
 const L2_NORM_EPS: f64 = 1e-6;
 
+mod prof {
+    use hanzo_ml::{Device, Result};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+
+    pub(super) static QPROJ_MLP_NS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static QPROJ_GDN_NS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static QPROJ_ATTN_NS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static GDN_RECURR_NS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static FULL_ATTN_NS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static HADAMARD_NS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static LM_HEAD_NS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static DECODE_STEPS: AtomicUsize = AtomicUsize::new(0);
+
+    #[inline]
+    pub(super) fn enabled() -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            hanzo_ml::quantized::cuda::cuda_profile_enabled()
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            false
+        }
+    }
+
+    #[inline]
+    pub(super) fn timed<T, F: FnOnce() -> Result<T>>(
+        dev: &Device,
+        acc: &AtomicU64,
+        f: F,
+    ) -> Result<T> {
+        if !enabled() {
+            return f();
+        }
+        dev.synchronize()?;
+        let t0 = std::time::Instant::now();
+        let out = f()?;
+        dev.synchronize()?;
+        acc.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+        Ok(out)
+    }
+
+    pub(super) fn reset() {
+        QPROJ_MLP_NS.store(0, Relaxed);
+        QPROJ_GDN_NS.store(0, Relaxed);
+        QPROJ_ATTN_NS.store(0, Relaxed);
+        GDN_RECURR_NS.store(0, Relaxed);
+        FULL_ATTN_NS.store(0, Relaxed);
+        HADAMARD_NS.store(0, Relaxed);
+        LM_HEAD_NS.store(0, Relaxed);
+        TOTAL_NS.store(0, Relaxed);
+        #[cfg(feature = "cuda")]
+        hanzo_ml::quantized::cuda::cuda_profile_reset();
+    }
+
+    pub(super) fn dump(kind: &str, seq_len: usize, steps: usize) {
+        let qproj_mlp = QPROJ_MLP_NS.load(Relaxed) as f64 / 1e6;
+        let qproj_gdn = QPROJ_GDN_NS.load(Relaxed) as f64 / 1e6;
+        let qproj_attn = QPROJ_ATTN_NS.load(Relaxed) as f64 / 1e6;
+        let gdn_recur = GDN_RECURR_NS.load(Relaxed) as f64 / 1e6;
+        let full_attn = FULL_ATTN_NS.load(Relaxed) as f64 / 1e6;
+        let had = HADAMARD_NS.load(Relaxed) as f64 / 1e6;
+        let lm_head = LM_HEAD_NS.load(Relaxed) as f64 / 1e6;
+        let total = TOTAL_NS.load(Relaxed) as f64 / 1e6;
+        let qproj_all = qproj_mlp + qproj_gdn + qproj_attn;
+        let accounted = qproj_all + gdn_recur + full_attn + had + lm_head;
+        let other = (total - accounted).max(0.0);
+        #[cfg(feature = "cuda")]
+        let c = hanzo_ml::quantized::cuda::cuda_profile_snapshot();
+        #[cfg(feature = "cuda")]
+        eprintln!(
+            "[27B_PROF {kind} seq={seq_len} steps={steps}] total={total:.2}ms \
+             qproj={qproj_all:.2}ms(mlp={qproj_mlp:.2},gdn={qproj_gdn:.2},attn={qproj_attn:.2}) \
+             gdn_recur={gdn_recur:.2}ms full_attn={full_attn:.2}ms had={had:.2}ms(fwht={:.2}ms/{}) \
+             lm_head={lm_head:.2}ms other={other:.2}ms | \
+             bf16_deq={:.2}ms({}) bf16_gemm={:.2}ms \
+             dp4a_dec={:.2}ms({}) dp4a_ver={:.2}ms({}) dp4a_ge64M={:.2}ms({}) \
+             mmq={:.2}ms(q={:.2},k={:.2},c={:.2}/{})",
+            c.fwht_ms,
+            c.fwht_calls,
+            c.bf16_dequant_ms,
+            c.bf16_dequant_calls,
+            c.bf16_gemm_ms,
+            c.dp4a_decode_ms,
+            c.dp4a_decode_calls,
+            c.dp4a_verify_ms,
+            c.dp4a_verify_calls,
+            c.dp4a_ge64m_ms,
+            c.dp4a_ge64m_calls,
+            c.mmq_quant_ms + c.mmq_kernel_ms + c.mmq_cast_ms,
+            c.mmq_quant_ms,
+            c.mmq_kernel_ms,
+            c.mmq_cast_ms,
+            c.mmq_calls,
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LayerType {
     FullAttention,
@@ -353,7 +452,9 @@ impl DeviceHadamard {
         };
         #[cfg(feature = "cuda")]
         if x.device().is_cuda() && self.block_size.is_power_of_two() && self.block_size <= 8192 {
-            return hanzo_ml::quantized::cuda::hadamard_fwht(x, signs, self.block_size, false);
+            return prof::timed(x.device(), &prof::HADAMARD_NS, || {
+                hanzo_ml::quantized::cuda::hadamard_fwht(x, signs, self.block_size, false)
+            });
         }
         let xf = if orig_dtype == DType::F32 {
             x.clone()
@@ -398,7 +499,9 @@ impl DeviceHadamard {
         };
         #[cfg(feature = "cuda")]
         if u.device().is_cuda() && self.block_size.is_power_of_two() && self.block_size <= 8192 {
-            return hanzo_ml::quantized::cuda::hadamard_fwht(u, signs, self.block_size, true);
+            return prof::timed(u.device(), &prof::HADAMARD_NS, || {
+                hanzo_ml::quantized::cuda::hadamard_fwht(u, signs, self.block_size, true)
+            });
         }
         let uf = if orig_dtype == DType::F32 {
             u.clone()
@@ -886,14 +989,17 @@ impl DenseMlp {
         } else {
             xs
         };
-        let gate = self.gate.forward(gate_in)?;
-        let up = self.up.forward(up_in)?;
+        let (gate, up) = prof::timed(xs.device(), &prof::QPROJ_MLP_NS, || {
+            let gate = self.gate.forward(gate_in)?;
+            let up = self.up.forward(up_in)?;
+            Ok((gate, up))
+        })?;
         let y = crate::ops::mul_and_act(&gate, &up, crate::layers::Activation::Silu)?;
         let y = match &self.down_had {
             Some(had) => had.forward(&y)?,
             None => y,
         };
-        self.down.forward(&y)
+        prof::timed(xs.device(), &prof::QPROJ_MLP_NS, || self.down.forward(&y))
     }
 }
 
@@ -1106,7 +1212,9 @@ impl GatedFullAttention {
         paged: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
     ) -> Result<Tensor> {
         let (q, k, v, gate) = self.project(x, cos_sin)?;
-        let y = self.attend(&q, &k, &v, mask, kv_cache, paged)?;
+        let y = prof::timed(x.device(), &prof::FULL_ATTN_NS, || {
+            self.attend(&q, &k, &v, mask, kv_cache, paged)
+        })?;
         self.output(&y, &gate, x.dtype())
     }
 
@@ -1144,48 +1252,53 @@ impl GatedFullAttention {
             x
         };
 
-        let q_gate = self.attn_q.forward(q_in)?;
-        let k = self.attn_k.forward(k_in)?;
-        let v = self.attn_v.forward(v_in)?;
+        let (q_gate, k, v) = prof::timed(x.device(), &prof::QPROJ_ATTN_NS, || {
+            let q_gate = self.attn_q.forward(q_in)?;
+            let k = self.attn_k.forward(k_in)?;
+            let v = self.attn_v.forward(v_in)?;
+            Ok((q_gate, k, v))
+        })?;
 
-        // Split q_gate into q and gate (interleaved per head: [q_head, gate_head] * n_head).
-        let q_gate = q_gate.reshape((b_sz, seq_len, self.n_head, self.head_dim * 2))?;
-        let q = q_gate.narrow(D::Minus1, 0, self.head_dim)?;
-        let gate = q_gate.narrow(D::Minus1, self.head_dim, self.head_dim)?;
-        let gate = gate.reshape((b_sz, seq_len, self.n_head * self.head_dim))?;
+        prof::timed(x.device(), &prof::FULL_ATTN_NS, || {
+            // Split q_gate into q and gate (interleaved per head: [q_head, gate_head] * n_head).
+            let q_gate = q_gate.reshape((b_sz, seq_len, self.n_head, self.head_dim * 2))?;
+            let q = q_gate.narrow(D::Minus1, 0, self.head_dim)?;
+            let gate = q_gate.narrow(D::Minus1, self.head_dim, self.head_dim)?;
+            let gate = gate.reshape((b_sz, seq_len, self.n_head * self.head_dim))?;
 
-        let (q, k, v) = if seq_len != 1 {
-            let q = q.transpose(1, 2)?;
-            let k = k
-                .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
-                .transpose(1, 2)?;
-            let v = v
-                .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
-                .transpose(1, 2)?;
-            (q, k, v)
-        } else {
-            let q = q.reshape((b_sz, self.n_head, seq_len, self.head_dim))?;
-            let k = k.reshape((b_sz, self.n_kv_head, seq_len, self.head_dim))?;
-            let v = v.reshape((b_sz, self.n_kv_head, seq_len, self.head_dim))?;
-            (q, k, v)
-        };
+            let (q, k, v) = if seq_len != 1 {
+                let q = q.transpose(1, 2)?;
+                let k = k
+                    .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
+                    .transpose(1, 2)?;
+                let v = v
+                    .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
+                    .transpose(1, 2)?;
+                (q, k, v)
+            } else {
+                let q = q.reshape((b_sz, self.n_head, seq_len, self.head_dim))?;
+                let k = k.reshape((b_sz, self.n_kv_head, seq_len, self.head_dim))?;
+                let v = v.reshape((b_sz, self.n_kv_head, seq_len, self.head_dim))?;
+                (q, k, v)
+            };
 
-        // qk RMSNorm then partial NeoX RoPE with the served kernel's roundings.
-        let (q, k) = self.rotary.forward_qk_norm_served(
-            cos_sin,
-            &q.contiguous()?,
-            &k.contiguous()?,
-            self.q_norm.weight(),
-            self.k_norm.weight(),
-            self.q_norm.eps(),
-        )?;
+            // qk RMSNorm then partial NeoX RoPE with the served kernel's roundings.
+            let (q, k) = self.rotary.forward_qk_norm_served(
+                cos_sin,
+                &q.contiguous()?,
+                &k.contiguous()?,
+                self.q_norm.weight(),
+                self.k_norm.weight(),
+                self.q_norm.eps(),
+            )?;
 
-        Ok((
-            q.to_dtype(self.dtype)?,
-            k.to_dtype(self.dtype)?,
-            v.to_dtype(self.dtype)?,
-            gate,
-        ))
+            Ok((
+                q.to_dtype(self.dtype)?,
+                k.to_dtype(self.dtype)?,
+                v.to_dtype(self.dtype)?,
+                gate,
+            ))
+        })
     }
 
     /// `project`'s q attended over this block's cache once k and v are written to it, as
@@ -1257,13 +1370,17 @@ impl GatedFullAttention {
     /// and handed over unrounded: the served graph fuses it into o_proj's activation quantizer
     /// (`…mul_permute_sigmoid…`), which reads it from registers.
     pub(crate) fn output(&self, y: &Tensor, gate: &Tensor, dtype: DType) -> Result<Tensor> {
-        let gate = sigmoid(&gate.to_dtype(DType::F32)?)?;
-        let y = y.to_dtype(DType::F32)?.broadcast_mul(&gate)?;
+        let y = prof::timed(y.device(), &prof::FULL_ATTN_NS, || {
+            let gate = sigmoid(&gate.to_dtype(DType::F32)?)?;
+            y.to_dtype(DType::F32)?.broadcast_mul(&gate)
+        })?;
         let y = match &self.o_had {
             Some(had) => had.forward(&y)?,
             None => y,
         };
-        self.attn_o.forward(&y)?.to_dtype(dtype)
+        prof::timed(y.device(), &prof::QPROJ_ATTN_NS, || {
+            self.attn_o.forward(&y)?.to_dtype(dtype)
+        })
     }
 }
 
@@ -1574,10 +1691,19 @@ impl QGatedDeltaNet {
         } else {
             x
         };
-        let mixed_qkv = store(self.in_proj_qkv.forward(qkv_in)?)?;
-        let z = store(self.in_proj_z.forward(z_in)?)?;
-        let b = store(self.in_proj_b.forward(b_in)?)?;
-        let a = store(self.in_proj_a.forward(a_in)?)?;
+        let (mixed_qkv, z, b, a) = prof::timed(x.device(), &prof::QPROJ_GDN_NS, || {
+            let mixed_qkv = store(self.in_proj_qkv.forward(qkv_in)?)?;
+            let z = store(self.in_proj_z.forward(z_in)?)?;
+            let b = store(self.in_proj_b.forward(b_in)?)?;
+            let a = store(self.in_proj_a.forward(a_in)?)?;
+            Ok((mixed_qkv, z, b, a))
+        })?;
+        let prof_gdn_t0 = if prof::enabled() {
+            x.device().synchronize()?;
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         let z = z.reshape((batch_size, seq_len, self.num_v_heads, self.head_v_dim))?;
         let b = b.reshape((batch_size, seq_len, self.num_v_heads))?;
@@ -1706,12 +1832,21 @@ impl QGatedDeltaNet {
         } else {
             y
         };
+        if let Some(t0) = prof_gdn_t0 {
+            x.device().synchronize()?;
+            prof::GDN_RECURR_NS.fetch_add(
+                t0.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         let y = match &self.out_had {
             Some(had) => had.forward(&y)?,
             None => y,
         };
 
-        self.out_proj.forward(&y)?.to_dtype(rd)
+        prof::timed(x.device(), &prof::QPROJ_GDN_NS, || {
+            self.out_proj.forward(&y)?.to_dtype(rd)
+        })
     }
 
     /// The served causal conv: each tap's product rounded to `rd` (the
@@ -2411,6 +2546,15 @@ impl ModelWeights {
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
     ) -> Result<Tensor> {
         let (b_sz, seq_len) = input_ids.dims2()?;
+        let prof_t0 = if prof::enabled() {
+            if seq_len > 1 {
+                prof::reset();
+            }
+            self.device.synchronize()?;
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let mut x = self.tok_embeddings.forward(input_ids)?;
         if let Some(ref had) = self.embed_hadamard {
             x = had.inverse(&x)?;
@@ -2592,7 +2736,28 @@ impl ModelWeights {
             Some(had) => had.forward(&x)?,
             None => x,
         };
-        self.output.forward(&x.contiguous()?)
+        let x_in = x.contiguous()?;
+        let out = prof::timed(&self.device, &prof::LM_HEAD_NS, || {
+            self.output.forward(&x_in)
+        })?;
+        if let Some(t0) = prof_t0 {
+            self.device.synchronize()?;
+            prof::TOTAL_NS.fetch_add(
+                t0.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            if seq_len > 1 {
+                prof::dump("prefill", seq_len, 1);
+                prof::DECODE_STEPS.store(0, std::sync::atomic::Ordering::Relaxed);
+                prof::reset();
+            } else {
+                let s = prof::DECODE_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if s == 1 || s % 16 == 0 {
+                    prof::dump("decode", seq_len, s);
+                }
+            }
+        }
+        Ok(out)
     }
 
     pub(crate) fn mtp_anchors(&self) -> crate::models::qwen3_5_mtp::AnchorPositions {
@@ -3203,6 +3368,624 @@ mod tests {
                 .to_vec1::<f32>()?;
             check("hadamard_linear", 0, &y_folded, &y_primal, 1e-5);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn spec_capture_pause_and_resume_across_stand_down() -> Result<()> {
+        let cap = crate::speculative::HiddenPrefixCapture::default();
+        cap.request(crate::speculative::CaptureRequest {
+            layers: vec![0, 1],
+            retain: Some(8),
+            dtype: None,
+        });
+        cap.note_forward(&[1]);
+        assert_eq!(cap.layers_for(1), vec![0, 1]);
+        let row = |val: f32, n: usize| Tensor::full(val, (1, n, 4), &Device::Cpu);
+        cap.fold(0, vec![row(1.0, 3)?, row(2.0, 3)?])?;
+        assert!(cap.hiddens().is_some());
+
+        // Stand down: pausing disables layer capture immediately without corrupting owner tracking.
+        cap.set_forward_paused(true);
+        assert!(cap.is_forward_paused());
+        assert!(cap.layers_for(1).is_empty());
+
+        // Resuming on a new sequence reseeds cleanly without mixing seq 1 and seq 2 rows.
+        cap.set_forward_paused(false);
+        assert!(!cap.is_forward_paused());
+        cap.note_forward(&[2]);
+        assert_eq!(cap.layers_for(1), vec![0, 1]);
+        cap.fold(0, vec![row(3.0, 2)?, row(4.0, 2)?])?;
+        let win = cap.hiddens().expect("resumed capture window");
+        assert_eq!(win.start, 0);
+        assert_eq!(win.end()?, 2);
+        let got: Vec<f32> = win.layers[0].flatten_all()?.to_vec1()?;
+        assert!(got.iter().all(|v| (*v - 3.0).abs() < 1e-6));
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_qwen35_stand_down_partial_rewind_kv_gdn_and_cuda_graph_parity() -> Result<()> {
+        use crate::pipeline::cuda_graph::{
+            disable_event_tracking_for_capture, end_cuda_capture_discard,
+            restore_event_tracking_after_capture, CudaDecodeGraphMetadataBuffers, CudaGraphHandle,
+        };
+        use crate::utils::model_config::FromGGUF;
+        use crate::DeviceMapSetting;
+        use hanzo_ml::cuda_backend::cudarc::driver::sys;
+        use hanzo_ml::{IndexOp, Var};
+
+        const Q_HIDDEN: usize = 64;
+        const Q_HEADS: usize = 2;
+        const Q_KV_HEADS: usize = 1;
+        const Q_HEAD_DIM: usize = 64;
+        const Q_ROT_DIM: usize = 16;
+        const Q_GDN_HEADS: usize = 2;
+        const Q_GDN_DIM: usize = 16;
+        const Q_CONV: usize = 4;
+        const Q_FFN: usize = 64;
+        const Q_VOCAB: usize = 32;
+        const BLOCK_SIZE: usize = 16;
+        const NUM_BLOCKS: usize = 4;
+
+        let dev = Device::new_cuda(0)?;
+        let conv_dim = 2 * Q_GDN_HEADS * Q_GDN_DIM + Q_GDN_HEADS * Q_GDN_DIM;
+        let mut rng = StdRng::seed_from_u64(0x5157_3501);
+        let mut specs: Vec<(String, Vec<usize>, Vec<f32>, GgmlDType)> = Vec::new();
+        let mut push_t = |name: String, shape: Vec<usize>, dt: GgmlDType| {
+            let n: usize = shape.iter().product();
+            let is_vec = shape.len() == 1;
+            let data: Vec<f32> = (0..n)
+                .map(|_| {
+                    if is_vec {
+                        if name.ends_with(".ssm_a") {
+                            -rng.random_range(0.05f32..0.4)
+                        } else if name.ends_with(".ssm_dt.bias") {
+                            rng.random_range(-0.3f32..0.3)
+                        } else {
+                            1.0 + rng.random_range(-0.1f32..0.1)
+                        }
+                    } else {
+                        rng.random_range(-0.15f32..0.15)
+                    }
+                })
+                .collect();
+            specs.push((name, shape, data, dt));
+        };
+
+        push_t(
+            "token_embd.weight".into(),
+            vec![Q_VOCAB, Q_HIDDEN],
+            GgmlDType::F16,
+        );
+        push_t("output_norm.weight".into(), vec![Q_HIDDEN], GgmlDType::F32);
+        push_t(
+            "output.weight".into(),
+            vec![Q_VOCAB, Q_HIDDEN],
+            GgmlDType::F16,
+        );
+        for blk in 0..2 {
+            let p = format!("blk.{blk}");
+            push_t(
+                format!("{p}.attn_norm.weight"),
+                vec![Q_HIDDEN],
+                GgmlDType::F32,
+            );
+            push_t(
+                format!("{p}.post_attention_norm.weight"),
+                vec![Q_HIDDEN],
+                GgmlDType::F32,
+            );
+            push_t(
+                format!("{p}.ffn_gate.weight"),
+                vec![Q_FFN, Q_HIDDEN],
+                GgmlDType::F16,
+            );
+            push_t(
+                format!("{p}.ffn_up.weight"),
+                vec![Q_FFN, Q_HIDDEN],
+                GgmlDType::F16,
+            );
+            push_t(
+                format!("{p}.ffn_down.weight"),
+                vec![Q_HIDDEN, Q_FFN],
+                GgmlDType::F16,
+            );
+            if blk == 0 {
+                push_t(
+                    format!("{p}.attn_qkv.weight"),
+                    vec![conv_dim, Q_HIDDEN],
+                    GgmlDType::F16,
+                );
+                push_t(
+                    format!("{p}.attn_gate.weight"),
+                    vec![Q_GDN_HEADS * Q_GDN_DIM, Q_HIDDEN],
+                    GgmlDType::F16,
+                );
+                push_t(
+                    format!("{p}.ssm_beta.weight"),
+                    vec![Q_GDN_HEADS, Q_HIDDEN],
+                    GgmlDType::F16,
+                );
+                push_t(
+                    format!("{p}.ssm_alpha.weight"),
+                    vec![Q_GDN_HEADS, Q_HIDDEN],
+                    GgmlDType::F16,
+                );
+                push_t(
+                    format!("{p}.ssm_out.weight"),
+                    vec![Q_HIDDEN, Q_GDN_HEADS * Q_GDN_DIM],
+                    GgmlDType::F16,
+                );
+                push_t(
+                    format!("{p}.ssm_conv1d.weight"),
+                    vec![conv_dim, Q_CONV],
+                    GgmlDType::F32,
+                );
+                push_t(
+                    format!("{p}.ssm_dt.bias"),
+                    vec![Q_GDN_HEADS],
+                    GgmlDType::F32,
+                );
+                push_t(format!("{p}.ssm_a"), vec![Q_GDN_HEADS], GgmlDType::F32);
+                push_t(
+                    format!("{p}.ssm_norm.weight"),
+                    vec![Q_GDN_DIM],
+                    GgmlDType::F32,
+                );
+            } else {
+                push_t(
+                    format!("{p}.attn_q.weight"),
+                    vec![2 * Q_HEADS * Q_HEAD_DIM, Q_HIDDEN],
+                    GgmlDType::F16,
+                );
+                push_t(
+                    format!("{p}.attn_k.weight"),
+                    vec![Q_KV_HEADS * Q_HEAD_DIM, Q_HIDDEN],
+                    GgmlDType::F16,
+                );
+                push_t(
+                    format!("{p}.attn_v.weight"),
+                    vec![Q_KV_HEADS * Q_HEAD_DIM, Q_HIDDEN],
+                    GgmlDType::F16,
+                );
+                push_t(
+                    format!("{p}.attn_output.weight"),
+                    vec![Q_HIDDEN, Q_HEADS * Q_HEAD_DIM],
+                    GgmlDType::F16,
+                );
+                push_t(
+                    format!("{p}.attn_q_norm.weight"),
+                    vec![Q_HEAD_DIM],
+                    GgmlDType::F32,
+                );
+                push_t(
+                    format!("{p}.attn_k_norm.weight"),
+                    vec![Q_HEAD_DIM],
+                    GgmlDType::F32,
+                );
+            }
+        }
+
+        let dir = tempfile::tempdir().map_err(hanzo_ml::Error::msg)?;
+        let gguf_path = dir.path().join("qwen35_tiny.gguf");
+        let owned_qt = specs
+            .iter()
+            .map(|(name, shape, data, dt)| {
+                let t = Tensor::from_vec(data.clone(), shape.as_slice(), &Device::Cpu)?;
+                Ok((name.as_str(), QTensor::quantize(&t, *dt)?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let qt_refs: Vec<(&str, &QTensor)> = owned_qt.iter().map(|(n, q)| (*n, q)).collect();
+        let meta_kv = [
+            (
+                "general.architecture",
+                gguf_file::Value::String("qwen35".into()),
+            ),
+            ("qwen35.block_count", gguf_file::Value::U32(2)),
+            ("qwen35.full_attention_interval", gguf_file::Value::U32(2)),
+            (
+                "qwen35.embedding_length",
+                gguf_file::Value::U32(Q_HIDDEN as u32),
+            ),
+            (
+                "qwen35.attention.head_count",
+                gguf_file::Value::U32(Q_HEADS as u32),
+            ),
+            (
+                "qwen35.attention.head_count_kv",
+                gguf_file::Value::U32(Q_KV_HEADS as u32),
+            ),
+            (
+                "qwen35.attention.key_length",
+                gguf_file::Value::U32(Q_HEAD_DIM as u32),
+            ),
+            (
+                "qwen35.rope.dimension_count",
+                gguf_file::Value::U32(Q_ROT_DIM as u32),
+            ),
+            (
+                "qwen35.rope.dimension_sections",
+                gguf_file::Value::Array(vec![
+                    gguf_file::Value::I32(4),
+                    gguf_file::Value::I32(2),
+                    gguf_file::Value::I32(2),
+                    gguf_file::Value::I32(0),
+                ]),
+            ),
+            (
+                "qwen35.attention.layer_norm_rms_epsilon",
+                gguf_file::Value::F32(1e-6),
+            ),
+            ("qwen35.context_length", gguf_file::Value::U64(32)),
+            (
+                "qwen35.ssm.conv_kernel",
+                gguf_file::Value::U32(Q_CONV as u32),
+            ),
+            (
+                "qwen35.ssm.state_size",
+                gguf_file::Value::U32(Q_GDN_DIM as u32),
+            ),
+            (
+                "qwen35.ssm.group_count",
+                gguf_file::Value::U32(Q_GDN_HEADS as u32),
+            ),
+            (
+                "qwen35.ssm.time_step_rank",
+                gguf_file::Value::U32(Q_GDN_HEADS as u32),
+            ),
+            (
+                "qwen35.ssm.inner_size",
+                gguf_file::Value::U32((Q_GDN_HEADS * Q_GDN_DIM) as u32),
+            ),
+        ];
+        {
+            let mut out_f = std::fs::File::create(&gguf_path).map_err(hanzo_ml::Error::msg)?;
+            let meta_refs: Vec<(&str, &gguf_file::Value)> =
+                meta_kv.iter().map(|(k, v)| (*k, v)).collect();
+            gguf_file::write(&mut out_f, &meta_refs, &qt_refs)?;
+        }
+
+        let load_model = || -> Result<(ModelWeights, Vec<(Tensor, Tensor)>, usize)> {
+            let mut f = std::fs::File::open(&gguf_path).map_err(hanzo_ml::Error::msg)?;
+            let mut readers = [&mut f];
+            let ct = Content::from_readers(&mut readers)?;
+            let mapper = DeviceMapSetting::dummy().into_mapper(2, &dev, None, &[dev.clone()])?;
+            let model = ModelWeights::from_gguf(
+                ct,
+                &dev,
+                mapper,
+                AttentionImplementation::PagedAttention,
+                DType::F16,
+            )?;
+            let slot = {
+                let mut hybrid = model.cache.hybrid();
+                let s = hybrid.allocate_seq().expect("recurrent slot");
+                hybrid.set_state_indices(Some(Tensor::new(&[s as u32], &dev)?));
+                hybrid.set_state_indices_host(Some(vec![s as u32]));
+                s
+            };
+            let x = 16 / DType::F16.size_in_bytes();
+            let k_cache = Tensor::zeros(
+                (NUM_BLOCKS, Q_KV_HEADS, Q_HEAD_DIM / x, BLOCK_SIZE, x),
+                DType::F16,
+                &dev,
+            )?;
+            let v_cache = Tensor::zeros(
+                (NUM_BLOCKS, Q_KV_HEADS, Q_HEAD_DIM, BLOCK_SIZE),
+                DType::F16,
+                &dev,
+            )?;
+            Ok((model, vec![(k_cache, v_cache)], slot))
+        };
+
+        let make_prefill_meta =
+            |slots: &[i64], ctx_len: usize| -> Result<PagedAttentionInputMetadata> {
+                let mut m = PagedAttentionInputMetadata::dummy(&dev)?;
+                m.slot_mappings = HashMap::from([(
+                    dev.location(),
+                    Tensor::from_vec(slots.to_vec(), (slots.len(),), &dev)?,
+                )]);
+                m.block_tables = Some(HashMap::from([(
+                    dev.location(),
+                    Tensor::from_vec(vec![0u32, 1u32], (1, 2), &dev)?,
+                )]));
+                m.context_lens = Some(HashMap::from([(
+                    dev.location(),
+                    Tensor::from_vec(vec![ctx_len as u32], (1,), &dev)?,
+                )]));
+                m.block_size = Some(BLOCK_SIZE);
+                m.max_context_len = Some(ctx_len);
+                m.paged_context_lens_cpu = Some(vec![ctx_len]);
+                m.is_first_prompt_chunk = true;
+                m.block_table_signature = Some(vec![0u64, 1u64]);
+                Ok(m)
+            };
+        let make_verify_meta =
+            |slots: &[i64], cached: usize, q_len: usize| -> Result<PagedAttentionInputMetadata> {
+                let total = cached + q_len;
+                let mut m = make_prefill_meta(slots, total)?;
+                m.is_first_prompt_chunk = false;
+                m.num_cached_tokens = Some(vec![cached]);
+                m.query_lens = Some(vec![q_len]);
+                m.cu_seqlens_q = Some(HashMap::from([(
+                    dev.location(),
+                    Tensor::from_vec(vec![0u32, q_len as u32], (2,), &dev)?,
+                )]));
+                m.cu_seqlens_kv = Some(HashMap::from([(
+                    dev.location(),
+                    Tensor::from_vec(vec![0u32, total as u32], (2,), &dev)?,
+                )]));
+                Ok(m)
+            };
+        let make_decode_meta = |pos: usize| -> Result<PagedAttentionInputMetadata> {
+            let mut m = make_prefill_meta(&[pos as i64], pos + 1)?;
+            m.is_first_prompt_chunk = false;
+            Ok(m)
+        };
+
+        let (spec_model, spec_kv, spec_slot) = load_model()?;
+        let (plain_model, plain_kv, plain_slot) = load_model()?;
+
+        // 1) Shared prompt [1, 2, 3, 4, 5] (5 tokens)
+        let prompt_ids: Vec<u32> = vec![1, 2, 3, 4, 5];
+        let prompt_tensor = Tensor::from_vec(prompt_ids.clone(), (1, prompt_ids.len()), &dev)?;
+        let prefill_slots: Vec<i64> = (0..prompt_ids.len() as i64).collect();
+        let prefill_meta = make_prefill_meta(&prefill_slots, prompt_ids.len())?;
+
+        spec_model
+            .spec_capture
+            .request(crate::speculative::CaptureRequest {
+                layers: vec![0, 1],
+                retain: Some(16),
+                dtype: None,
+            });
+        spec_model.spec_capture.note_forward(&[1]);
+        let spec_prefill_logits = spec_model.forward(
+            &prompt_tensor,
+            &[0],
+            vec![(prompt_ids.len() - 1, 1)],
+            Some((spec_kv.clone(), &prefill_meta)),
+        )?;
+        let plain_prefill_logits = plain_model.forward(
+            &prompt_tensor,
+            &[0],
+            vec![(prompt_ids.len() - 1, 1)],
+            Some((plain_kv.clone(), &prefill_meta)),
+        )?;
+        assert_eq!(
+            spec_prefill_logits
+                .argmax(D::Minus1)?
+                .flatten_all()?
+                .to_vec1::<u32>()?,
+            plain_prefill_logits
+                .argmax(D::Minus1)?
+                .flatten_all()?
+                .to_vec1::<u32>()?
+        );
+
+        // 2) Speculative verify 4 tokens [6, 10, 20, 21], accept only 2 ([6, 10]) -> reject 2.
+        let verify_tokens: Vec<u32> = vec![6, 10, 20, 21];
+        let verify_tensor =
+            Tensor::from_vec(verify_tokens.clone(), (1, verify_tokens.len()), &dev)?;
+        let verify_slots: Vec<i64> = (5..9).collect();
+        let verify_meta = make_verify_meta(&verify_slots, 5, 4)?;
+        spec_model.cache.hybrid().expect_verify(Some(4));
+        let spec_verify_logits = spec_model.forward(
+            &verify_tensor,
+            &[5],
+            vec![(0, 4)],
+            Some((spec_kv.clone(), &verify_meta)),
+        )?;
+        spec_model.cache.hybrid().expect_verify(None);
+        assert_eq!(
+            spec_model.spec_capture.hiddens().expect("captured").end()?,
+            9
+        );
+
+        // Partial verification rollback on GDN recurrent state (rejecting tokens 20, 21 -> keep offset 7).
+        {
+            let mut hybrid = spec_model.cache.hybrid();
+            hybrid.rewind_recurrent(spec_slot, 2)?;
+            assert_eq!(hybrid.recurrent_offset(spec_slot), Some(7));
+        }
+
+        // Plain reference executes the 2 accepted tokens step-by-step at offsets 5 and 6.
+        let mut plain_accepted_logits = Vec::new();
+        for (i, &tok) in verify_tokens[..2].iter().enumerate() {
+            let pos = 5 + i;
+            let ids = Tensor::from_vec(vec![tok], (1, 1), &dev)?;
+            let meta = make_decode_meta(pos)?;
+            let logits =
+                plain_model.forward(&ids, &[pos], vec![(0, 1)], Some((plain_kv.clone(), &meta)))?;
+            plain_accepted_logits.push(logits);
+        }
+
+        for i in 0..2usize {
+            let spec_row = spec_verify_logits
+                .narrow(1, i, 1)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let plain_row = plain_accepted_logits[i]
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let max_diff = spec_row
+                .iter()
+                .zip(&plain_row)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                max_diff < 2e-2,
+                "verify kept row {i} vs plain decode max_diff={max_diff}"
+            );
+        }
+
+        // 3) Stand down: pause capture so plain decode graph path applies.
+        // Run eager warmup on pos=7 (mirroring `try_cuda_decode_graph_forward`), capture the CUDA
+        // decode graph, then replay pos=8..12 through `cuGraphLaunch` and compare every step
+        // against plain stepwise decode.
+        spec_model.spec_capture.set_forward_paused(true);
+        assert!(spec_model.spec_capture.is_forward_paused());
+        assert!(spec_model.spec_capture.layers_for(1).is_empty());
+
+        let Device::Cuda(cuda_dev) = &dev else {
+            unreachable!();
+        };
+        let post_stand_down_tokens: Vec<u32> = vec![14, 7, 19, 3, 25];
+        let step7_meta = make_decode_meta(7)?;
+        let step7_ids = Tensor::from_vec(vec![post_stand_down_tokens[0]], (1, 1), &dev)?;
+        let (graph_input_var, mut meta_buffers, graph_logits, graph) = {
+            let _htod_guard = cuda_dev.enable_cuda_graph_htod_cache();
+            let warmup_logits = spec_model.forward(
+                &step7_ids,
+                &[7],
+                vec![(0, 1)],
+                Some((spec_kv.clone(), &step7_meta)),
+            )?;
+            dev.synchronize()?;
+            let plain_step7 = plain_model.forward(
+                &step7_ids,
+                &[7],
+                vec![(0, 1)],
+                Some((plain_kv.clone(), &step7_meta)),
+            )?;
+            dev.synchronize()?;
+            assert_eq!(
+                warmup_logits
+                    .argmax(D::Minus1)?
+                    .flatten_all()?
+                    .to_vec1::<u32>()?,
+                plain_step7
+                    .argmax(D::Minus1)?
+                    .flatten_all()?
+                    .to_vec1::<u32>()?,
+                "post-stand-down warmup token mismatch at pos 7"
+            );
+
+            let graph_input_var = Var::from_tensor(&step7_ids)?;
+            let (meta_buffers, rebound_meta) =
+                CudaDecodeGraphMetadataBuffers::new(&step7_meta, &[7], BLOCK_SIZE)?;
+            let graph_input_ids = graph_input_var.as_detached_tensor();
+
+            let stream = cuda_dev.cuda_stream();
+            let restore_ev = disable_event_tracking_for_capture(&stream);
+            stream
+                .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+                .map_err(|e| hanzo_ml::Error::msg(e.to_string()))?;
+            let graph_logits = match spec_model.forward(
+                &graph_input_ids,
+                &[7],
+                vec![(0, 1)],
+                Some((spec_kv.clone(), &rebound_meta)),
+            ) {
+                Ok(l) => l,
+                Err(err) => {
+                    end_cuda_capture_discard(&stream);
+                    restore_event_tracking_after_capture(&stream, restore_ev);
+                    return Err(err);
+                }
+            };
+            let graph = match CudaGraphHandle::end_capture(&stream) {
+                Ok(Some(g)) => g,
+                other => {
+                    restore_event_tracking_after_capture(&stream, restore_ev);
+                    hanzo_ml::bail!("expected captured CUDA graph, got {:?}", other.err());
+                }
+            };
+            restore_event_tracking_after_capture(&stream, restore_ev);
+            graph.upload()?;
+            (graph_input_var, meta_buffers, graph_logits, graph)
+        };
+
+        for (step, &tok) in post_stand_down_tokens.iter().enumerate().skip(1) {
+            let pos = 7 + step;
+            let meta = make_decode_meta(pos)?;
+            let next_ids = Tensor::from_vec(vec![tok], (1, 1), &dev)?;
+            graph_input_var.set(&next_ids)?;
+            meta_buffers.copy_from(&meta, &[pos])?;
+            graph.launch()?;
+            dev.synchronize()?;
+
+            let plain_ids = Tensor::from_vec(vec![tok], (1, 1), &dev)?;
+            let plain_out = plain_model.forward(
+                &plain_ids,
+                &[pos],
+                vec![(0, 1)],
+                Some((plain_kv.clone(), &meta)),
+            )?;
+            dev.synchronize()?;
+
+            let got_tok = graph_logits
+                .argmax(D::Minus1)?
+                .flatten_all()?
+                .to_vec1::<u32>()?;
+            let want_tok = plain_out
+                .argmax(D::Minus1)?
+                .flatten_all()?
+                .to_vec1::<u32>()?;
+            assert_eq!(
+                got_tok, want_tok,
+                "post-stand-down CUDA graph token mismatch at pos {pos}"
+            );
+            let got_v = graph_logits
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let want_v = plain_out
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let max_diff = got_v
+                .iter()
+                .zip(&want_v)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                max_diff < 2e-2,
+                "post-stand-down CUDA graph logits mismatch at pos {pos}: max_diff={max_diff}"
+            );
+        }
+
+        // Verify final GDN recurrent/conv state parity against plain stepwise decode.
+        let (spec_conv, spec_rec) = {
+            let hybrid = spec_model.cache.hybrid();
+            let Some(crate::kv_cache::HybridLayerCache::Recurrent(pool)) = hybrid.get(0) else {
+                hanzo_ml::bail!("expected blk.0 to be GDN recurrent pool");
+            };
+            (
+                pool.conv_state.i(spec_slot)?,
+                pool.recurrent_state.i(spec_slot)?,
+            )
+        };
+        let (plain_conv, plain_rec) = {
+            let hybrid = plain_model.cache.hybrid();
+            let Some(crate::kv_cache::HybridLayerCache::Recurrent(pool)) = hybrid.get(0) else {
+                hanzo_ml::bail!("expected blk.0 to be GDN recurrent pool");
+            };
+            (
+                pool.conv_state.i(plain_slot)?,
+                pool.recurrent_state.i(plain_slot)?,
+            )
+        };
+        let conv_diff = (&spec_conv - &plain_conv)?
+            .to_dtype(DType::F32)?
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .to_scalar::<f32>()?;
+        let rec_diff = (&spec_rec - &plain_rec)?
+            .to_dtype(DType::F32)?
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .to_scalar::<f32>()?;
+        assert!(
+            conv_diff < 1e-2 && rec_diff < 1e-2,
+            "final Qwen3.5 GDN state mismatch after stand-down+graph: conv={conv_diff}, rec={rec_diff}"
+        );
         Ok(())
     }
 }

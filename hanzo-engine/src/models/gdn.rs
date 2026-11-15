@@ -2558,4 +2558,214 @@ mod tests {
         }
         Ok(())
     }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_gdn_stand_down_and_partial_rewind_matches_plain_decode() -> Result<()> {
+        let dev = Device::new_cuda(0)?;
+        let (num_k_heads, num_v_heads, head_k_dim, head_v_dim) = (2usize, 4usize, 16usize, 16usize);
+        let (hidden, conv_kernel_size) = (32usize, 4usize);
+        let key_dim = num_k_heads * head_k_dim;
+        let value_dim = num_v_heads * head_v_dim;
+        let conv_dim = key_dim * 2 + value_dim;
+        let gdn = GatedDeltaNet {
+            in_proj: GdnInProj::Merged {
+                qkvz: Linear::new(
+                    (synthetic((key_dim * 2 + value_dim * 2) * hidden, 51, &dev)? * 0.2)?
+                        .to_dtype(DType::F16)?
+                        .reshape((key_dim * 2 + value_dim * 2, hidden))?,
+                    None,
+                ),
+                ba: Linear::new(
+                    (synthetic(num_v_heads * 2 * hidden, 52, &dev)? * 0.2)?
+                        .to_dtype(DType::F16)?
+                        .reshape((num_v_heads * 2, hidden))?,
+                    None,
+                ),
+            },
+            conv1d_weight: (synthetic(conv_dim * conv_kernel_size, 53, &dev)? * 0.2)?
+                .to_dtype(DType::F16)?
+                .reshape((conv_dim, 1, conv_kernel_size))?,
+            dt_bias: synthetic(num_v_heads, 54, &dev)?,
+            a_log: synthetic(num_v_heads, 55, &dev)?,
+            norm: RmsNormGated::from_weight(
+                synthetic(head_v_dim, 56, &dev)?.to_dtype(DType::F16)?,
+                1e-6,
+            ),
+            out_proj: unquant(
+                (synthetic(hidden * value_dim, 57, &dev)? * 0.2)?
+                    .to_dtype(DType::F16)?
+                    .reshape((hidden, value_dim))?,
+            )?,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            conv_kernel_size,
+            key_dim,
+            value_dim,
+        };
+        let state_dims = [num_v_heads, head_k_dim, head_v_dim];
+        let cfg = RecurrentLayerConfig {
+            conv_dim,
+            conv_width: conv_kernel_size,
+            state_dims: state_dims.to_vec(),
+            conv_dtype: DType::F16,
+            state_dtype: DType::F16,
+        };
+        let mut spec = RecurrentStatePool::new(cfg.clone(), &dev)?;
+        let mut plain = RecurrentStatePool::new(cfg, &dev)?;
+        let seqs = [(1u32, 0u64, 3usize), (0u32, 1u64, 1usize)];
+        for pool in [&mut spec, &mut plain] {
+            for s in [pool.allocate(), pool.allocate()] {
+                s.expect("slot");
+            }
+        }
+        let max_abs = |a: &Tensor, b: &Tensor| -> Result<f32> {
+            (a - b)?
+                .to_dtype(DType::F32)?
+                .abs()?
+                .flatten_all()?
+                .max(0)?
+                .to_scalar::<f32>()
+        };
+        let (prompt, verify, plain_steps) = (5usize, 4usize, 5usize);
+        let tok = |seed: u64, len: usize| -> Result<Tensor> {
+            synthetic(len * hidden, seed as usize, &dev)?
+                .to_dtype(DType::F16)?
+                .reshape((1, len, hidden))
+        };
+        let prompts: Vec<Tensor> = seqs
+            .iter()
+            .map(|&(_, seed, _)| tok(seed + 10, prompt))
+            .collect::<Result<_>>()?;
+        let drafts: Vec<Tensor> = seqs
+            .iter()
+            .map(|&(_, seed, _)| tok(seed + 20, verify))
+            .collect::<Result<_>>()?;
+        let post_stand_down: Vec<Tensor> = seqs
+            .iter()
+            .map(|&(_, seed, _)| tok(seed + 40, plain_steps))
+            .collect::<Result<_>>()?;
+
+        // Reference plain stepwise execution over accepted verify tokens + post-stand-down plain steps.
+        let mut ref_verify_outs = vec![Vec::new(), Vec::new()];
+        let mut ref_rewind_states = Vec::new();
+        let mut ref_plain_outs = vec![Vec::new(), Vec::new()];
+        let mut ref_final_states = Vec::new();
+        for (row, &(slot, _, kept)) in seqs.iter().enumerate() {
+            let slot = slot as usize;
+            forward_pooled(
+                &mut plain,
+                PoolSlots::One { slot, offset: 0 },
+                0,
+                false,
+                |c| gdn.forward(&prompts[row], c),
+            )?;
+            for step in 0..kept {
+                let x = drafts[row].narrow(1, step, 1)?;
+                let y = forward_pooled(
+                    &mut plain,
+                    PoolSlots::One {
+                        slot,
+                        offset: prompt + step,
+                    },
+                    0,
+                    false,
+                    |c| gdn.forward(&x, c),
+                )?;
+                ref_verify_outs[row].push(y);
+            }
+            ref_rewind_states.push((
+                plain.conv_state.i(slot)?.copy()?,
+                plain.recurrent_state.i(slot)?.copy()?,
+            ));
+            for step in 0..plain_steps {
+                let x = post_stand_down[row].narrow(1, step, 1)?;
+                let y = forward_pooled(
+                    &mut plain,
+                    PoolSlots::One {
+                        slot,
+                        offset: prompt + kept + step,
+                    },
+                    0,
+                    false,
+                    |c| gdn.forward(&x, c),
+                )?;
+                ref_plain_outs[row].push(y);
+            }
+            ref_final_states.push((
+                plain.conv_state.i(slot)?.copy()?,
+                plain.recurrent_state.i(slot)?.copy()?,
+            ));
+        }
+
+        // Batched prefill -> speculative verify (trail=true) -> partial rewind.
+        let order = Tensor::from_vec(
+            seqs.iter().map(|&(slot, _, _)| slot).collect::<Vec<_>>(),
+            (2,),
+            &dev,
+        )?;
+        let prompt_batch = Tensor::cat(&prompts, 0)?;
+        forward_pooled(&mut spec, PoolSlots::Many(&order), 0, false, |c| {
+            gdn.forward(&prompt_batch, c)
+        })?;
+
+        let verify_batch = Tensor::cat(&drafts, 0)?;
+        let verify_out = forward_pooled(&mut spec, PoolSlots::Many(&order), 0, true, |c| {
+            gdn.forward(&verify_batch, c)
+        })?;
+        for (row, &(slot, _, kept)) in seqs.iter().enumerate() {
+            let slot = slot as usize;
+            for step in 0..kept {
+                let got = verify_out.narrow(0, row, 1)?.narrow(1, step, 1)?;
+                let out_err = max_abs(&got, &ref_verify_outs[row][step])?;
+                assert!(
+                    out_err < 5e-3,
+                    "CUDA verify row {row} step {step} out_err={out_err}"
+                );
+            }
+            spec.rewind(slot, verify - kept)?;
+            assert_eq!(spec.get_seqlen_offset(slot), prompt + kept);
+            let conv_err = max_abs(&spec.conv_state.i(slot)?, &ref_rewind_states[row].0)?;
+            let rec_err = max_abs(&spec.recurrent_state.i(slot)?, &ref_rewind_states[row].1)?;
+            assert!(
+                conv_err < 5e-3 && rec_err < 5e-3,
+                "CUDA post-rewind state mismatch row {row}: conv={conv_err}, rec={rec_err}"
+            );
+        }
+
+        // Stand-down transition: subsequent plain decode steps (`trail=false`) match stepwise truth.
+        for step in 0..plain_steps {
+            for (row, &(slot, _, kept)) in seqs.iter().enumerate() {
+                let slot = slot as usize;
+                let x = post_stand_down[row].narrow(1, step, 1)?;
+                let got = forward_pooled(
+                    &mut spec,
+                    PoolSlots::One {
+                        slot,
+                        offset: prompt + kept + step,
+                    },
+                    0,
+                    false,
+                    |c| gdn.forward(&x, c),
+                )?;
+                let out_err = max_abs(&got, &ref_plain_outs[row][step])?;
+                assert!(
+                    out_err < 5e-3,
+                    "CUDA post-stand-down step {step} row {row} mismatch: out_err={out_err}"
+                );
+            }
+        }
+        for (row, &(slot, _, _)) in seqs.iter().enumerate() {
+            let slot = slot as usize;
+            let conv_err = max_abs(&spec.conv_state.i(slot)?, &ref_final_states[row].0)?;
+            let rec_err = max_abs(&spec.recurrent_state.i(slot)?, &ref_final_states[row].1)?;
+            assert!(
+                conv_err < 5e-3 && rec_err < 5e-3,
+                "CUDA final post-stand-down state mismatch row {row}: conv={conv_err}, rec={rec_err}"
+            );
+        }
+        Ok(())
+    }
 }
