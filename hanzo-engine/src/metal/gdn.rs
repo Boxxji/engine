@@ -238,16 +238,19 @@ pub fn chunked_gated_delta_rule_recurrence_metal(
         hanzo_ml::bail!("chunked_gated_delta_rule_recurrence_metal: expected Metal device");
     };
 
-    // BT=32 for all Metal variants (fits 32KB threadgroup memory)
+    // Four simdgroups per threadgroup, each covering four V rows (eight lanes per row).
+    const NSG: usize = 4;
     let kernel_name = match k_dim {
-        128 => "chunked_gated_delta_rule_32_128_64",
-        64 => "chunked_gated_delta_rule_32_64_64",
+        128 => "gated_delta_rule_rows_128_4",
+        64 => "gated_delta_rule_rows_64_4",
         _ => {
             // Fallback to sequential kernel for unsupported k_dim
             return gated_delta_rule_recurrence_metal(&q, &k, &v, &g, &beta, state);
         }
     };
-    let bv = 64usize;
+    if v_dim % 4 != 0 {
+        return gated_delta_rule_recurrence_metal(&q, &k, &v, &g, &beta, state);
+    }
 
     let pipeline = load_pipeline(dev.device(), kernel_name)?;
 
@@ -279,14 +282,14 @@ pub fn chunked_gated_delta_rule_recurrence_metal(
     encoder.set_bytes(7, &seq_len_i32);
     encoder.set_bytes(8, &v_dim_i32);
 
-    let grid_x = v_dim.div_ceil(bv);
+    let rows_per_group = 4 * NSG;
     let thread_groups = MTLSize {
-        width: grid_x,
+        width: v_dim.div_ceil(rows_per_group),
         height: bh,
         depth: 1,
     };
     let threads_per_group = MTLSize {
-        width: bv,
+        width: 32 * NSG,
         height: 1,
         depth: 1,
     };
