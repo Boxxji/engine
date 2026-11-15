@@ -616,3 +616,148 @@ pub fn fused_gdn_gating_metal(
 ) -> hanzo_ml::Result<(hanzo_ml::Tensor, hanzo_ml::Tensor)> {
     hanzo_ml::bail!("fused_gdn_gating_metal requires the metal feature")
 }
+
+#[cfg(all(test, feature = "metal"))]
+mod tests {
+    use super::chunked_gated_delta_rule_recurrence_metal;
+    use hanzo_ml::{Device, Tensor};
+    use std::time::Instant;
+
+    struct Lcg(u64);
+    impl Lcg {
+        /// Uniform in [0, 1).
+        fn unit(&mut self) -> f32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 40) as f32) / (1u32 << 24) as f32
+        }
+    }
+
+    /// The gated delta rule one position at a time, in f64: decay the state, correct the
+    /// value by what the state already predicts for k, write the outer product, read with q.
+    #[allow(clippy::too_many_arguments)]
+    fn reference(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        g: &[f32],
+        beta: &[f32],
+        state: &[f32],
+        (bh, s, kd, vd): (usize, usize, usize, usize),
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut out = vec![0f32; bh * s * vd];
+        let mut st: Vec<f64> = state.iter().map(|&x| x as f64).collect();
+        for h in 0..bh {
+            let st_h = &mut st[h * kd * vd..(h + 1) * kd * vd];
+            for t in 0..s {
+                let row = h * s + t;
+                let decay = (g[row] as f64).exp();
+                for x in st_h.iter_mut() {
+                    *x *= decay;
+                }
+                let kt = &k[row * kd..(row + 1) * kd];
+                let qt = &q[row * kd..(row + 1) * kd];
+                let mut delta = vec![0f64; vd];
+                for (c, d) in delta.iter_mut().enumerate() {
+                    let kv: f64 = (0..kd).map(|r| st_h[r * vd + c] * kt[r] as f64).sum();
+                    *d = beta[row] as f64 * (v[row * vd + c] as f64 - kv);
+                }
+                for r in 0..kd {
+                    for c in 0..vd {
+                        st_h[r * vd + c] += kt[r] as f64 * delta[c];
+                    }
+                }
+                for c in 0..vd {
+                    let o: f64 = (0..kd).map(|r| st_h[r * vd + c] * qt[r] as f64).sum();
+                    out[row * vd + c] = o as f32;
+                }
+            }
+        }
+        (out, st.iter().map(|&x| x as f32).collect())
+    }
+
+    fn inputs(
+        rng: &mut Lcg,
+        (bh, s, kd, vd): (usize, usize, usize, usize),
+    ) -> [Vec<f32>; 6] {
+        let mut k: Vec<f32> = (0..bh * s * kd).map(|_| rng.unit() - 0.5).collect();
+        for row in k.chunks_mut(kd) {
+            let n = row.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+            row.iter_mut().for_each(|x| *x /= n);
+        }
+        let scale = 1.0 / (kd as f32).sqrt();
+        let q = (0..bh * s * kd).map(|_| (rng.unit() - 0.5) * scale).collect();
+        let v = (0..bh * s * vd).map(|_| rng.unit() * 2.0 - 1.0).collect();
+        let g = (0..bh * s).map(|_| -(0.01 + 0.5 * rng.unit())).collect();
+        let beta = (0..bh * s).map(|_| 0.1 + 0.8 * rng.unit()).collect();
+        let st = (0..bh * kd * vd).map(|_| (rng.unit() - 0.5) * 0.1).collect();
+        [q, k, v, g, beta, st]
+    }
+
+    #[test]
+    fn chunked_matches_sequential_reference() {
+        let dev = Device::new_metal(0).unwrap();
+        let mut rng = Lcg(0x9E37_79B9_7F4A_7C15);
+        // 33 and 515 end in a partial chunk; 64 is exactly two.
+        for s in [33usize, 64, 96, 515] {
+            let dims = (6usize, s, 128usize, 128usize);
+            let [q, k, v, g, beta, st] = inputs(&mut rng, dims);
+            let (want_out, want_st) = reference(&q, &k, &v, &g, &beta, &st, dims);
+            let (bh, s, kd, vd) = dims;
+            let t = |x: &Vec<f32>, shape: &[usize]| Tensor::from_vec(x.clone(), shape, &dev).unwrap();
+            let mut state = t(&st, &[bh, kd, vd]);
+            let out = chunked_gated_delta_rule_recurrence_metal(
+                &t(&q, &[bh, s, kd]),
+                &t(&k, &[bh, s, kd]),
+                &t(&v, &[bh, s, vd]),
+                &t(&g, &[bh, s]),
+                &t(&beta, &[bh, s]),
+                &mut state,
+            )
+            .unwrap();
+            let got_out: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+            let got_st: Vec<f32> = state.flatten_all().unwrap().to_vec1().unwrap();
+            let err = |a: &[f32], b: &[f32]| {
+                a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max)
+            };
+            let (eo, es) = (err(&got_out, &want_out), err(&got_st, &want_st));
+            println!("seq={s:4}  max|out err|={eo:.2e}  max|state err|={es:.2e}");
+            assert!(eo < 2e-3, "seq {s}: output differs by {eo}");
+            assert!(es < 2e-3, "seq {s}: state differs by {es}");
+        }
+    }
+
+    /// Prefill-shaped timing for the Bonsai 27B linear-attention layer: 48 value heads, K=V=128.
+    #[test]
+    #[ignore]
+    fn chunked_prefill_timing() {
+        let dev = Device::new_metal(0).unwrap();
+        let mut rng = Lcg(7);
+        let dims = (48usize, 515usize, 128usize, 128usize);
+        let [q, k, v, g, beta, st] = inputs(&mut rng, dims);
+        let (bh, s, kd, vd) = dims;
+        let t = |x: &Vec<f32>, shape: &[usize]| Tensor::from_vec(x.clone(), shape, &dev).unwrap();
+        let (qt, kt, vt, gt, bt) = (
+            t(&q, &[bh, s, kd]),
+            t(&k, &[bh, s, kd]),
+            t(&v, &[bh, s, vd]),
+            t(&g, &[bh, s]),
+            t(&beta, &[bh, s]),
+        );
+        let mut state = t(&st, &[bh, kd, vd]);
+        for _ in 0..3 {
+            chunked_gated_delta_rule_recurrence_metal(&qt, &kt, &vt, &gt, &bt, &mut state).unwrap();
+        }
+        dev.synchronize().unwrap();
+        let n = 10;
+        let t0 = Instant::now();
+        for _ in 0..n {
+            chunked_gated_delta_rule_recurrence_metal(&qt, &kt, &vt, &gt, &bt, &mut state).unwrap();
+        }
+        dev.synchronize().unwrap();
+        let ms = t0.elapsed().as_secs_f64() * 1e3 / n as f64;
+        println!("TIMING chunked GDN prefill bh={bh} seq={s}: {ms:.2} ms/layer  ({:.1} ms across 48 layers)", ms * 48.0);
+    }
+}

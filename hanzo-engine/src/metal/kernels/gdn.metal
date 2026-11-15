@@ -229,12 +229,17 @@ template <int BT, int BK, int BV>
   device float *state_bh = state + bh * BK * v_dim;
   device float *out_bh = output + bh * seq_len * v_dim;
 
-  // Threadgroup memory
+  // Threadgroup memory. Everything that does not depend on the V column is computed once
+  // per threadgroup here, not once per thread: the k.k and q.k dot products, the decay
+  // matrix and the end-of-chunk decay weights.
   threadgroup float k_chunk[BT * BK];
   threadgroup float kk_dot[BT * BT];
+  threadgroup float dec[BT * BT]; // exp(gcum[i] - gcum[j]) for j <= i
   threadgroup float gcum[BT];
   threadgroup float beta_s[BT];
+  threadgroup float w_end[BT]; // exp(gcum[last] - gcum[t])
   threadgroup float q_buf[BK];
+  threadgroup float qk_row[BT]; // decayed q[i].k[j] for the current i
 
   // Load state column into registers
   float s[BK];
@@ -272,10 +277,13 @@ template <int BT, int BK, int BV>
       threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // === Phase 2: Compute kk_dot[i][j] = dot(k[i], k[j]) for j < i ===
+    // === Phase 2: kk_dot[i][j] = dot(k[i], k[j]) for j < i, decay matrix, end weights ===
     for (int idx = (int)tid; idx < chunk_len * chunk_len; idx += BV) {
       int i = idx / chunk_len;
       int j = idx % chunk_len;
+      if (j <= i) {
+        dec[i * BT + j] = exp(gcum[i] - gcum[j]);
+      }
       if (j < i) {
         float dot = 0.0f;
         for (int d = 0; d < BK; d++) {
@@ -283,6 +291,9 @@ template <int BT, int BK, int BV>
         }
         kk_dot[i * BT + j] = dot;
       }
+    }
+    if ((int)tid < chunk_len) {
+      w_end[tid] = exp(gcum[chunk_len - 1] - gcum[tid]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -302,13 +313,13 @@ template <int BT, int BK, int BV>
 
       // Subtract lower-triangular contributions (intra-chunk)
       for (int j = 0; j < i; j++) {
-        float a_ij = beta_i * kk_dot[i * BT + j] * exp(gcum[i] - gcum[j]);
+        float a_ij = beta_i * kk_dot[i * BT + j] * dec[i * BT + j];
         rhs -= a_ij * delta_arr[j];
       }
       delta_arr[i] = rhs;
     }
 
-    // === Phase 4: Output computation (per V-column) ===
+    // === Phase 4: Output computation ===
     for (int i = 0; i < chunk_len; i++) {
       // Cooperatively load q[i] into threadgroup memory
       for (int j = (int)tid; j < BK; j += BV) {
@@ -316,21 +327,26 @@ template <int BT, int BK, int BV>
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
 
-      float decay_i = exp(gcum[i]);
+      // Threads 0..i each compute one decayed q[i].k[j] once for the whole threadgroup.
+      if ((int)tid <= i) {
+        float qk = 0.0f;
+        for (int d = 0; d < BK; d++) {
+          qk = fma(q_buf[d], k_chunk[tid * BK + d], qk);
+        }
+        qk_row[tid] = qk * dec[i * BT + tid];
+      }
 
       // Inter-chunk contribution: q[i] @ (state * decay)
+      float decay_i = exp(gcum[i]);
       float o_val = 0.0f;
       for (int d = 0; d < BK; d++) {
         o_val = fma(q_buf[d], s[d] * decay_i, o_val);
       }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
 
       // Intra-chunk contribution
       for (int j = 0; j <= i; j++) {
-        float qk_dot = 0.0f;
-        for (int d = 0; d < BK; d++) {
-          qk_dot = fma(q_buf[d], k_chunk[j * BK + d], qk_dot);
-        }
-        o_val += qk_dot * delta_arr[j] * exp(gcum[i] - gcum[j]);
+        o_val = fma(qk_row[j], delta_arr[j], o_val);
       }
 
       out_bh[(chunk_start + i) * v_dim + v_idx] = o_val;
@@ -338,11 +354,14 @@ template <int BT, int BK, int BV>
     }
 
     // === Phase 5: State update for next chunk ===
-    float g_total = gcum[chunk_len - 1];
+    for (int t = 0; t < chunk_len; t++) {
+      delta_arr[t] *= w_end[t];
+    }
+    const float eg = exp(gcum[chunk_len - 1]);
     for (int d = 0; d < BK; d++) {
-      float s_new = s[d] * exp(g_total);
+      float s_new = s[d] * eg;
       for (int t = 0; t < chunk_len; t++) {
-        s_new += k_chunk[t * BK + d] * delta_arr[t] * exp(g_total - gcum[t]);
+        s_new = fma(k_chunk[t * BK + d], delta_arr[t], s_new);
       }
       s[d] = s_new;
     }
