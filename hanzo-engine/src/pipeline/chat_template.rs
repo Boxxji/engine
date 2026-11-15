@@ -1,10 +1,12 @@
 use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
 
 use anyhow::Result;
 use either::Either;
 use indexmap::IndexMap;
 use itertools::Itertools;
 use minijinja::{context, value::Kwargs, Environment, Error, ErrorKind, Value};
+use parking_lot::Mutex;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
@@ -655,6 +657,62 @@ fn normalize_developer_and_system_messages(
     *messages = out;
 }
 
+static DESC_RANGE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"range\((?P<expr>[^,]+),\s*-1,\s*-1\)").unwrap());
+
+const CHAT_TEMPLATE_ENV_CACHE_CAP: usize = 64;
+
+static CHAT_TEMPLATE_ENV_CACHE: LazyLock<Mutex<IndexMap<String, Arc<Environment<'static>>>>> =
+    LazyLock::new(|| Mutex::new(IndexMap::with_capacity(16)));
+
+fn get_or_compile_chat_env(resolved_template: &str) -> Result<Arc<Environment<'static>>> {
+    {
+        let cache = CHAT_TEMPLATE_ENV_CACHE.lock();
+        if let Some(env) = cache.get(resolved_template) {
+            return Ok(Arc::clone(env));
+        }
+    }
+
+    let mut template = resolved_template.replace("[::-1]", "|reverse");
+    // Convert Python-style descending ranges `range(..., -1, -1)` to a forward
+    // range followed by Jinja's `|reverse` filter so it works even when
+    // negative-step ranges aren't supported.
+    template = DESC_RANGE_RE
+        .replace_all(&template, |caps: &regex::Captures| {
+            format!("range({})|reverse", &caps["expr"])
+        })
+        .into_owned();
+
+    if template.contains("{{ meta }}") {
+        // Fix for GLM4 models
+        template = template.replace("{%- set meta = message.get(\"metadata\", \"\") %}", "");
+        template = template.replace("{{ meta }}", "");
+    }
+    template = strip_generation_tags(&template);
+
+    let mut env = Environment::new();
+    // enable python methods such as .strip()
+    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+    // https://github.com/huggingface/transformers/blob/76a33a10923ccc1074917f6b6a1e719e626b7dc9/src/transformers/tokenization_utils_base.py#L1842
+    env.set_lstrip_blocks(true);
+    env.set_trim_blocks(true);
+    env.add_function("raise_exception", raise_exception);
+    env.add_filter("tojson", tojson);
+    env.add_function("strftime_now", strftime_now);
+    env.add_template_owned("chat_template", template)?;
+
+    let compiled = Arc::new(env);
+    let mut cache = CHAT_TEMPLATE_ENV_CACHE.lock();
+    if let Some(existing) = cache.get(resolved_template) {
+        return Ok(Arc::clone(existing));
+    }
+    if cache.len() >= CHAT_TEMPLATE_ENV_CACHE_CAP {
+        cache.shift_remove_index(0);
+    }
+    cache.insert(resolved_template.to_string(), Arc::clone(&compiled));
+    Ok(compiled)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn apply_chat_template_to(
     mut messages: Vec<IndexMap<String, MessageContent>>,
@@ -668,15 +726,6 @@ pub fn apply_chat_template_to(
     unk_tok: Option<String>,
     tools: Vec<Tool>,
 ) -> Result<String> {
-    let mut env = Environment::new();
-
-    // enable python methods such as .strip()
-    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-
-    // https://github.com/huggingface/transformers/blob/76a33a10923ccc1074917f6b6a1e719e626b7dc9/src/transformers/tokenization_utils_base.py#L1842
-    env.set_lstrip_blocks(true);
-    env.set_trim_blocks(true);
-
     #[derive(Serialize, Deserialize)]
     struct UntaggedContent(#[serde(with = "either::serde_untagged")] MessageContent);
 
@@ -740,29 +789,7 @@ pub fn apply_chat_template_to(
         new_messages.push(new_message);
     }
 
-    // Use the already-resolved template string
-    let mut template = resolved_template.replace("[::-1]", "|reverse");
-    // Convert Python‑style descending ranges `range(..., -1, -1)` to a forward
-    // range followed by Jinja’s `|reverse` filter so it works even when
-    // negative‑step ranges aren’t supported.
-    let re = Regex::new(r"range\((?P<expr>[^,]+),\s*-1,\s*-1\)").unwrap();
-    template = re
-        .replace_all(&template, |caps: &regex::Captures| {
-            format!("range({})|reverse", &caps["expr"])
-        })
-        .into_owned();
-
-    if template.contains("{{ meta }}") {
-        // Fix for GLM4 models
-        template = template.replace("{%- set meta = message.get(\"metadata\", \"\") %}", "");
-        template = template.replace("{{ meta }}", "");
-    }
-    template = strip_generation_tags(&template);
-
-    env.add_template("chat_template", &template)?;
-    env.add_function("raise_exception", raise_exception);
-    env.add_filter("tojson", tojson);
-    env.add_function("strftime_now", strftime_now);
+    let env = get_or_compile_chat_env(&resolved_template)?;
     let tmpl = env.get_template("chat_template")?;
 
     let date = chrono::Utc::now();
@@ -902,9 +929,10 @@ mod tests {
             render(&format!("{template}{{# xhigh #}}"), None, None, None).unwrap(),
             "p|e"
         );
+        // minijinja >= 2.22 (mitsuhiko/minijinja#913) renders booleans like Python Jinja2 (`True`/`False`).
         assert_eq!(
             render(template, None, None, Some(false)).unwrap(),
-            "Pfalse|E"
+            "PFalse|E"
         );
     }
 
@@ -1245,5 +1273,63 @@ mod tests {
             rendered,
             "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\nworld<|im_end|>\n"
         );
+    }
+
+    #[test]
+    fn minijinja_2_22_features_and_env_cache_parity() {
+        let tpl = ChatTemplateValue(Either::Left(
+            "{%- for m in messages %}\
+             {%- if m.role == 'skip' %}{% continue %}{% endif %}\
+             {%- if m.role == 'stop' %}{% break %}{% endif %}\
+             {%- if loop.previtem is defined and loop.previtem.role == m.role %}[same]{% endif %}\
+             <{{ m.role }}:{{ m.content|urlencode }}>\
+             {%- if loop.nextitem is defined and loop.nextitem.role == 'stop' %}[end]{% endif %}\
+             {%- endfor %}"
+                .to_string(),
+        ));
+        let msgs = vec![
+            IndexMap::from([
+                ("role".to_string(), Either::Left("skip".to_string())),
+                ("content".to_string(), Either::Left("ignored".to_string())),
+            ]),
+            user_text_message("hello world"),
+            IndexMap::from([
+                ("role".to_string(), Either::Left("user".to_string())),
+                ("content".to_string(), Either::Left("a&b".to_string())),
+            ]),
+            IndexMap::from([
+                ("role".to_string(), Either::Left("stop".to_string())),
+                ("content".to_string(), Either::Left("halt".to_string())),
+            ]),
+            user_text_message("unreachable"),
+        ];
+        let first = apply_chat_template_to(
+            msgs.clone(),
+            false,
+            None,
+            None,
+            None,
+            &tpl,
+            None,
+            None,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        let second = apply_chat_template_to(
+            msgs,
+            false,
+            None,
+            None,
+            None,
+            &tpl,
+            None,
+            None,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(first, "<user:hello%20world>[same]<user:a%26b>[end]");
+        assert_eq!(first, second);
     }
 }
