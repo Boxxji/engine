@@ -1,4 +1,4 @@
-use crate::utils::image_to_pixels;
+use crate::utils::{image_to_normalized_pixels, image_to_pixels, image_to_unit_pixels};
 use hanzo_ml::{Device, Result, Tensor, D};
 use image::DynamicImage;
 
@@ -12,7 +12,23 @@ impl ImageTransform for ToTensor {
     type Input = DynamicImage;
     type Output = Tensor;
     fn map(&self, x: &Self::Input, device: &Device) -> Result<Self::Output> {
-        image_to_pixels(x, device)? / 255.
+        image_to_unit_pixels(x, device)
+    }
+}
+
+/// Fused RGB8 -> `[0, 1]` -> per-channel `(x - mean) / std` -> `(3, height, width)` `F32` tensor.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ToNormalizedTensor {
+    pub mean: [f32; 3],
+    pub std: [f32; 3],
+}
+
+impl ImageTransform for ToNormalizedTensor {
+    type Input = DynamicImage;
+    type Output = Tensor;
+
+    fn map(&self, x: &Self::Input, device: &Device) -> Result<Self::Output> {
+        image_to_normalized_pixels(x, &self.mean, &self.std, device)
     }
 }
 
@@ -152,5 +168,47 @@ mod tests {
         .map(&image, &Device::Cpu)
         .unwrap();
         assert_eq!(res.dims(), &[3, 5, 4])
+    }
+
+    #[test]
+    fn test_to_normalized_tensor_and_simd_resize_parity() {
+        use crate::{simd_resize_rgb, ImageTransform, Normalize, ToNormalizedTensor, ToTensor};
+        use hanzo_ml::Device;
+        use image::{DynamicImage, Rgb, RgbImage};
+
+        let rgb = RgbImage::from_fn(29, 17, |x, y| {
+            Rgb([
+                ((x * 37 + y * 13) % 256) as u8,
+                ((x * 11 + y * 59) % 256) as u8,
+                ((x * 73 + y * 23) % 256) as u8,
+            ])
+        });
+        let img = DynamicImage::ImageRgb8(rgb);
+        let mean = [0.48145466f32, 0.4578275, 0.40821073];
+        let std = [0.26862954f32, 0.26130258, 0.27577711];
+
+        let unit = ToTensor.map(&img, &Device::Cpu).unwrap();
+        let reference = Normalize {
+            mean: mean.iter().map(|&v| v as f64).collect(),
+            std: std.iter().map(|&v| v as f64).collect(),
+        }
+        .map(&unit, &Device::Cpu)
+        .unwrap();
+        let fused = ToNormalizedTensor { mean, std }.map(&img, &Device::Cpu).unwrap();
+
+        assert_eq!(fused.dims(), reference.dims());
+        let diff = (fused - reference)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(diff < 1e-6, "max abs diff {diff} exceeded 1e-6");
+
+        let resized = simd_resize_rgb(&img, 42, 24).unwrap();
+        assert_eq!(resized.width(), 42);
+        assert_eq!(resized.height(), 24);
     }
 }

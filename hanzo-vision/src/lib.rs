@@ -31,7 +31,10 @@ pub(crate) mod utils;
 pub use geometry::{crop, paste_resized};
 pub use ops::{get_resize_image_size, make_pixel_mask, pad};
 pub use pad::{pad_to_max_edge, pad_to_max_image_size};
-pub use transforms::{InterpolateResize, Normalize, Rescale, ToTensor, ToTensorNoNorm};
+pub use transforms::{
+    InterpolateResize, Normalize, Rescale, ToNormalizedTensor, ToTensor, ToTensorNoNorm,
+};
+pub use utils::{image_to_normalized_pixels, simd_resize_rgb};
 
 /// A transform over an image. The input may vary but the output is always a Tensor.
 pub trait ImageTransform {

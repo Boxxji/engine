@@ -15,4 +15,5 @@ homepage.workspace = true
 [dependencies]
 hanzo-ml.workspace = true
 image.workspace = true
+fast_image_resize.workspace = true
 rayon.workspace = true

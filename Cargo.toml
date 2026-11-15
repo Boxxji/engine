@@ -77,6 +77,7 @@ image = { version = "0.25.9", default-features = false, features = [
     'tiff',
     'webp',
 ] }
+fast_image_resize = "5"
 reqwest = { version = "0.13.1", default-features = false, features = [
     "blocking",
     "rustls",
