@@ -1425,8 +1425,16 @@ impl GGUFPipeline {
         if !cuda_decode_graphs_enabled() || !self.model_supports_decode_graph() {
             return Ok(None);
         }
-        if self.draft_proposer.is_some() || crate::attention::LsaConfig::global().is_some() {
+        if self.draft_proposer.is_some() {
             return Ok(None);
+        }
+        if let Some(ref lsa_cfg) = crate::attention::LsaConfig::global() {
+            let max_kv_len = metadata
+                .max_context_len
+                .unwrap_or_else(|| seqlen_offsets.iter().copied().max().unwrap_or(0) + 1);
+            if max_kv_len >= lsa_cfg.min_seq_len && max_kv_len > lsa_cfg.top_k {
+                return Ok(None);
+            }
         }
         // Only steady-state single-token decode with paged metadata present and no
         // prefix-cache prefill in flight. Prefill stays eager: its causal mask and

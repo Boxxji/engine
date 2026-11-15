@@ -344,17 +344,25 @@ impl DeviceHadamard {
                 self.block_size
             );
         }
+        let signs = if let Some(s) = self.signs.get(&width) {
+            Some(s)
+        } else if self.explicit_signs {
+            hanzo_ml::bail!("Missing Hadamard sign vector for width {width}");
+        } else {
+            None
+        };
+        #[cfg(feature = "cuda")]
+        if x.device().is_cuda() && self.block_size.is_power_of_two() && self.block_size <= 8192 {
+            return hanzo_ml::quantized::cuda::hadamard_fwht(x, signs, self.block_size, false);
+        }
         let xf = if orig_dtype == DType::F32 {
             x.clone()
         } else {
             x.to_dtype(DType::F32)?
         };
-        let xf = if let Some(s) = self.signs.get(&width) {
-            xf.broadcast_mul(s)?
-        } else if self.explicit_signs {
-            hanzo_ml::bail!("Missing Hadamard sign vector for width {width}");
-        } else {
-            xf
+        let xf = match signs {
+            Some(s) => xf.broadcast_mul(s)?,
+            None => xf,
         };
         let rows = orig_shape.elem_count() / self.block_size;
         let out = xf
@@ -381,6 +389,17 @@ impl DeviceHadamard {
                 self.block_size
             );
         }
+        let signs = if let Some(s) = self.signs.get(&width) {
+            Some(s)
+        } else if self.explicit_signs {
+            hanzo_ml::bail!("Missing Hadamard sign vector for width {width}");
+        } else {
+            None
+        };
+        #[cfg(feature = "cuda")]
+        if u.device().is_cuda() && self.block_size.is_power_of_two() && self.block_size <= 8192 {
+            return hanzo_ml::quantized::cuda::hadamard_fwht(u, signs, self.block_size, true);
+        }
         let uf = if orig_dtype == DType::F32 {
             u.clone()
         } else {
@@ -391,12 +410,9 @@ impl DeviceHadamard {
             .reshape((rows, self.block_size))?
             .matmul(&self.h_b)?
             .reshape(orig_shape)?;
-        let out = if let Some(s) = self.signs.get(&width) {
-            out.broadcast_mul(s)?
-        } else if self.explicit_signs {
-            hanzo_ml::bail!("Missing Hadamard sign vector for width {width}");
-        } else {
-            out
+        let out = match signs {
+            Some(s) => out.broadcast_mul(s)?,
+            None => out,
         };
         if orig_dtype == DType::F32 {
             Ok(out)

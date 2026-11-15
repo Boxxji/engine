@@ -569,6 +569,23 @@ impl PrefixCacheManagerV2 {
         Some(out)
     }
 
+    /// Lookup the longest recurrent-state snapshot matching any non-empty prefix of `key`.
+    /// Returns `(matched_num_blocks, snapshots)` and updates LRU order.
+    pub fn get_longest_paged_recurrent_prefix(
+        &mut self,
+        key: &[BlockHash],
+    ) -> Option<(usize, Vec<RecurrentStateSnapshot>)> {
+        if self.no_prefix_cache || !self.has_paged_attention || key.is_empty() {
+            return None;
+        }
+        for len in (1..=key.len()).rev() {
+            if let Some(snapshots) = self.get_paged_recurrent_prefix(&key[..len]) {
+                return Some((len, snapshots));
+            }
+        }
+        None
+    }
+
     /// Search for a matching cache given some tokens. Image-containing sequences are now cached too.
     pub fn search_for_matching_cache(
         &mut self,

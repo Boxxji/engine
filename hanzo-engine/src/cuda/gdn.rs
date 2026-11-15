@@ -13,14 +13,15 @@ use hanzo_ml::DType;
 ///
 /// Returns: output [BH, S, V]
 #[cfg(feature = "cuda")]
-pub fn gated_delta_rule_recurrence_cuda(
+fn run_gated_delta_rule_recurrence_cuda(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
     g: &Tensor,
     beta: &Tensor,
     state: &mut Tensor,
-) -> Result<Tensor> {
+    save_trail: bool,
+) -> Result<(Tensor, Option<Tensor>)> {
     use hanzo_ml::cuda_backend::cudarc::driver::DevicePtr;
 
     let (bh, seq_len, k_dim) = q.dims3()?;
@@ -71,34 +72,90 @@ pub fn gated_delta_rule_recurrence_cuda(
     let state_offset = state_l.start_offset();
 
     let output_buf = unsafe { dev.alloc::<f32>(bh * seq_len * v_dim) }?;
+    let trail_buf = if save_trail {
+        Some(unsafe { dev.alloc::<f32>(seq_len * bh * k_dim * v_dim) }?)
+    } else {
+        None
+    };
 
     let stream = dev.cuda_stream().cu_stream() as i64;
 
-    unsafe {
-        crate::cuda::ffi::gated_delta_rule_recurrence(
-            q_s.slice(q_offset..).device_ptr(q_s.stream()).0 as *const f32,
-            k_s.slice(k_offset..).device_ptr(k_s.stream()).0 as *const f32,
-            v_s.slice(v_offset..).device_ptr(v_s.stream()).0 as *const f32,
-            g_s.slice(g_offset..).device_ptr(g_s.stream()).0 as *const f32,
-            beta_s.slice(beta_offset..).device_ptr(beta_s.stream()).0 as *const f32,
-            state_s.slice(state_offset..).device_ptr(state_s.stream()).0 as *mut f32,
-            output_buf.device_ptr(output_buf.stream()).0 as *mut f32,
-            bh as i32,
-            seq_len as i32,
-            k_dim as i32,
-            v_dim as i32,
-            stream,
-        );
+    if let Some(ref t_buf) = trail_buf {
+        unsafe {
+            crate::cuda::ffi::gated_delta_rule_recurrence_with_trail(
+                q_s.slice(q_offset..).device_ptr(q_s.stream()).0 as *const f32,
+                k_s.slice(k_offset..).device_ptr(k_s.stream()).0 as *const f32,
+                v_s.slice(v_offset..).device_ptr(v_s.stream()).0 as *const f32,
+                g_s.slice(g_offset..).device_ptr(g_s.stream()).0 as *const f32,
+                beta_s.slice(beta_offset..).device_ptr(beta_s.stream()).0 as *const f32,
+                state_s.slice(state_offset..).device_ptr(state_s.stream()).0 as *mut f32,
+                output_buf.device_ptr(output_buf.stream()).0 as *mut f32,
+                t_buf.device_ptr(t_buf.stream()).0 as *mut f32,
+                bh as i32,
+                seq_len as i32,
+                k_dim as i32,
+                v_dim as i32,
+                stream,
+            );
+        }
+    } else {
+        unsafe {
+            crate::cuda::ffi::gated_delta_rule_recurrence(
+                q_s.slice(q_offset..).device_ptr(q_s.stream()).0 as *const f32,
+                k_s.slice(k_offset..).device_ptr(k_s.stream()).0 as *const f32,
+                v_s.slice(v_offset..).device_ptr(v_s.stream()).0 as *const f32,
+                g_s.slice(g_offset..).device_ptr(g_s.stream()).0 as *const f32,
+                beta_s.slice(beta_offset..).device_ptr(beta_s.stream()).0 as *const f32,
+                state_s.slice(state_offset..).device_ptr(state_s.stream()).0 as *mut f32,
+                output_buf.device_ptr(output_buf.stream()).0 as *mut f32,
+                bh as i32,
+                seq_len as i32,
+                k_dim as i32,
+                v_dim as i32,
+                stream,
+            );
+        }
     }
 
-    // The kernel wrote state in-place via the raw pointer; rewrap
-    // (state tensor's underlying CudaSlice was modified directly)
-
     let output_storage = hanzo_ml::CudaStorage::wrap_cuda_slice(output_buf, dev.clone());
-    Ok(Tensor::from((
+    let output_tensor = Tensor::from((
         hanzo_ml::Storage::Cuda(output_storage),
         (bh, seq_len, v_dim),
-    )))
+    ));
+    let trail_tensor = trail_buf.map(|t_buf| {
+        let trail_storage = hanzo_ml::CudaStorage::wrap_cuda_slice(t_buf, dev.clone());
+        Tensor::from((
+            hanzo_ml::Storage::Cuda(trail_storage),
+            (seq_len, bh, k_dim, v_dim),
+        ))
+    });
+    Ok((output_tensor, trail_tensor))
+}
+
+#[cfg(feature = "cuda")]
+pub fn gated_delta_rule_recurrence_cuda(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    state: &mut Tensor,
+) -> Result<Tensor> {
+    Ok(run_gated_delta_rule_recurrence_cuda(q, k, v, g, beta, state, false)?.0)
+}
+
+#[cfg(feature = "cuda")]
+pub fn gated_delta_rule_recurrence_with_trail_cuda(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    state: &mut Tensor,
+) -> Result<(Tensor, Tensor)> {
+    let (out, trail) = run_gated_delta_rule_recurrence_cuda(q, k, v, g, beta, state, true)?;
+    let trail = trail.ok_or_else(|| hanzo_ml::Error::msg("missing GDN trail tensor"))?;
+    Ok((out, trail))
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -112,6 +169,19 @@ pub fn gated_delta_rule_recurrence_cuda(
     _state: &mut Tensor,
 ) -> Result<Tensor> {
     hanzo_ml::bail!("gated_delta_rule_recurrence_cuda requires the cuda feature")
+}
+
+#[cfg(not(feature = "cuda"))]
+#[allow(unused)]
+pub fn gated_delta_rule_recurrence_with_trail_cuda(
+    _q: &Tensor,
+    _k: &Tensor,
+    _v: &Tensor,
+    _g: &Tensor,
+    _beta: &Tensor,
+    _state: &mut Tensor,
+) -> Result<(Tensor, Tensor)> {
+    hanzo_ml::bail!("gated_delta_rule_recurrence_with_trail_cuda requires the cuda feature")
 }
 
 /// CUDA-accelerated chunked gated delta rule recurrence (prefill optimization).

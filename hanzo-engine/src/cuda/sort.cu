@@ -916,6 +916,244 @@ extern "C" int topk_f16(const __half *input, __half *values_out,
                              (cudaStream_t)stream);
 }
 
+// Two-stage multi-block top-k for wide rows (4096 <= ncols <= 262144, k <= 128).
+// Stage 1 splits each row across chunks of 4096 columns (256 threads/block = up to
+// 16 elements held in registers per thread, zero global re-reads). Stage 2 merges
+// the num_chunks * k candidates in a single 512-thread block per row with up to 16
+// candidates held in registers per thread. Ties break identically to `topk_kernel`
+// (smaller column index wins).
+constexpr int TOPK_MB_CHUNK = 4096;
+constexpr int TOPK_MB_S1_THREADS = 256;
+constexpr int TOPK_MB_S2_THREADS = 512;
+
+template <typename T>
+__global__ void topk_multiblock_stage1(const T *__restrict__ input,
+                                       float *__restrict__ stage1_vals,
+                                       uint32_t *__restrict__ stage1_idxs,
+                                       const int nrows, const int ncols,
+                                       const int k, const int num_chunks) {
+  const int chunk = blockIdx.x;
+  const int row = blockIdx.y;
+  if (chunk >= num_chunks || row >= nrows)
+    return;
+
+  const int tid = threadIdx.x;
+  const int warp_id = tid >> 5;
+  const int lane_id = tid & 31;
+  const int start = chunk * TOPK_MB_CHUNK;
+  const int end = min(start + TOPK_MB_CHUNK, ncols);
+  const T *row_in = input + (size_t)row * ncols;
+
+  float vals[16];
+  uint16_t valid_mask = 0;
+#pragma unroll
+  for (int r = 0; r < 16; ++r) {
+    const int col = start + tid + r * TOPK_MB_S1_THREADS;
+    if (col < end) {
+      const float c = (float)row_in[col];
+      if (c == c) {
+        vals[r] = c;
+        valid_mask |= (uint16_t)(1u << r);
+      } else {
+        vals[r] = -INFINITY;
+      }
+    } else {
+      vals[r] = -INFINITY;
+    }
+  }
+
+  __shared__ float warp_vals[8];
+  __shared__ int warp_idxs[8];
+  __shared__ int s_win;
+
+  const size_t out_base = ((size_t)row * num_chunks + chunk) * k;
+
+  for (int ki = 0; ki < k; ++ki) {
+    float best = -INFINITY;
+    int best_idx = -1;
+#pragma unroll
+    for (int r = 0; r < 16; ++r) {
+      if ((valid_mask >> r) & 1u) {
+        const float c = vals[r];
+        const int col = start + tid + r * TOPK_MB_S1_THREADS;
+        if (best_idx < 0 || c > best || (c == best && col < best_idx)) {
+          best = c;
+          best_idx = col;
+        }
+      }
+    }
+    warp_max_with_idx(best, best_idx);
+    if (lane_id == 0) {
+      warp_vals[warp_id] = best;
+      warp_idxs[warp_id] = best_idx;
+    }
+    __syncthreads();
+    if (warp_id == 0) {
+      float v = (lane_id < 8) ? warp_vals[lane_id] : -INFINITY;
+      int idx = (lane_id < 8) ? warp_idxs[lane_id] : -1;
+      warp_max_with_idx(v, idx);
+      if (lane_id == 0) {
+        stage1_vals[out_base + ki] = v;
+        stage1_idxs[out_base + ki] =
+            (idx >= 0) ? (uint32_t)idx : 0xFFFFFFFFu;
+        s_win = idx;
+      }
+    }
+    __syncthreads();
+    if (s_win >= 0) {
+      const int lp = s_win - start;
+      if ((lp & 255) == tid) {
+        valid_mask &= ~(uint16_t)(1u << (lp >> 8));
+      }
+    }
+    __syncthreads();
+  }
+}
+
+template <typename T>
+__global__ void topk_multiblock_stage2(const float *__restrict__ stage1_vals,
+                                       const uint32_t *__restrict__ stage1_idxs,
+                                       T *__restrict__ values_out,
+                                       uint32_t *__restrict__ indices_out,
+                                       const int nrows, const int num_chunks,
+                                       const int k) {
+  const int row = blockIdx.x;
+  if (row >= nrows)
+    return;
+
+  const int tid = threadIdx.x;
+  const int warp_id = tid >> 5;
+  const int lane_id = tid & 31;
+  constexpr int NUM_WARPS = TOPK_MB_S2_THREADS >> 5; // 16
+  const int total_cands = num_chunks * k;
+  const size_t base = (size_t)row * total_cands;
+
+  float c_vals[16];
+  int c_idxs[16];
+  uint16_t valid_mask = 0;
+#pragma unroll
+  for (int r = 0; r < 16; ++r) {
+    const int pos = tid + r * TOPK_MB_S2_THREADS;
+    if (pos < total_cands) {
+      const uint32_t idx = stage1_idxs[base + pos];
+      if (idx != 0xFFFFFFFFu) {
+        c_vals[r] = stage1_vals[base + pos];
+        c_idxs[r] = (int)idx;
+        valid_mask |= (uint16_t)(1u << r);
+      } else {
+        c_vals[r] = -INFINITY;
+        c_idxs[r] = -1;
+      }
+    } else {
+      c_vals[r] = -INFINITY;
+      c_idxs[r] = -1;
+    }
+  }
+
+  __shared__ float warp_vals[NUM_WARPS];
+  __shared__ int warp_idxs[NUM_WARPS];
+  __shared__ int s_win;
+
+  T *row_vals = values_out + (size_t)row * k;
+  uint32_t *row_idxs = indices_out + (size_t)row * k;
+
+  for (int ki = 0; ki < k; ++ki) {
+    float best = -INFINITY;
+    int best_idx = -1;
+#pragma unroll
+    for (int r = 0; r < 16; ++r) {
+      if ((valid_mask >> r) & 1u) {
+        const float c = c_vals[r];
+        const int col = c_idxs[r];
+        if (best_idx < 0 || c > best || (c == best && col < best_idx)) {
+          best = c;
+          best_idx = col;
+        }
+      }
+    }
+    warp_max_with_idx(best, best_idx);
+    if (lane_id == 0) {
+      warp_vals[warp_id] = best;
+      warp_idxs[warp_id] = best_idx;
+    }
+    __syncthreads();
+    if (warp_id == 0) {
+      float v = (lane_id < NUM_WARPS) ? warp_vals[lane_id] : -INFINITY;
+      int idx = (lane_id < NUM_WARPS) ? warp_idxs[lane_id] : -1;
+      warp_max_with_idx(v, idx);
+      if (lane_id == 0) {
+        if (idx < 0) {
+          row_vals[ki] = (T)0.0f;
+          row_idxs[ki] = 0u;
+        } else {
+          row_vals[ki] = (T)v;
+          row_idxs[ki] = (uint32_t)idx;
+        }
+        s_win = idx;
+      }
+    }
+    __syncthreads();
+    if (s_win >= 0) {
+#pragma unroll
+      for (int r = 0; r < 16; ++r) {
+        if (((valid_mask >> r) & 1u) && c_idxs[r] == s_win) {
+          valid_mask &= ~(uint16_t)(1u << r);
+        }
+      }
+    }
+    __syncthreads();
+  }
+}
+
+template <typename T>
+static int launch_topk_multiblock(const T *input, float *stage1_vals,
+                                  uint32_t *stage1_idxs, T *values_out,
+                                  uint32_t *indices_out, int nrows, int ncols,
+                                  int k, cudaStream_t stream) {
+  if (nrows <= 0 || k <= 0)
+    return 0;
+  const int num_chunks = (ncols + TOPK_MB_CHUNK - 1) / TOPK_MB_CHUNK;
+  if (ncols <= 0 || k > ncols || k > 128 || num_chunks > 64)
+    return (int)cudaErrorInvalidValue;
+  const dim3 grid1(num_chunks, nrows, 1);
+  topk_multiblock_stage1<T><<<grid1, TOPK_MB_S1_THREADS, 0, stream>>>(
+      input, stage1_vals, stage1_idxs, nrows, ncols, k, num_chunks);
+  const cudaError_t err1 = cudaGetLastError();
+  if (err1 != cudaSuccess)
+    return (int)err1;
+  topk_multiblock_stage2<T><<<nrows, TOPK_MB_S2_THREADS, 0, stream>>>(
+      stage1_vals, stage1_idxs, values_out, indices_out, nrows, num_chunks, k);
+  return (int)cudaGetLastError();
+}
+
+extern "C" int topk_multiblock_f32(const float *input, float *stage1_vals,
+                                   uint32_t *stage1_idxs, float *values_out,
+                                   uint32_t *indices_out, int nrows, int ncols,
+                                   int k, int64_t stream) {
+  return launch_topk_multiblock<float>(input, stage1_vals, stage1_idxs,
+                                       values_out, indices_out, nrows, ncols, k,
+                                       (cudaStream_t)stream);
+}
+
+extern "C" int topk_multiblock_bf16(const __nv_bfloat16 *input,
+                                    float *stage1_vals, uint32_t *stage1_idxs,
+                                    __nv_bfloat16 *values_out,
+                                    uint32_t *indices_out, int nrows, int ncols,
+                                    int k, int64_t stream) {
+  return launch_topk_multiblock<__nv_bfloat16>(
+      input, stage1_vals, stage1_idxs, values_out, indices_out, nrows, ncols, k,
+      (cudaStream_t)stream);
+}
+
+extern "C" int topk_multiblock_f16(const __half *input, float *stage1_vals,
+                                   uint32_t *stage1_idxs, __half *values_out,
+                                   uint32_t *indices_out, int nrows, int ncols,
+                                   int k, int64_t stream) {
+  return launch_topk_multiblock<__half>(input, stage1_vals, stage1_idxs,
+                                        values_out, indices_out, nrows, ncols,
+                                        k, (cudaStream_t)stream);
+}
+
 __device__ __forceinline__ float warp_reduce_sum_f32(float val) {
 #pragma unroll
   for (int offset = 16; offset > 0; offset /= 2) {

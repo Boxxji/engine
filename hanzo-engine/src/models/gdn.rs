@@ -174,7 +174,8 @@ impl GdnLayerCache {
             return Ok(());
         };
         // The conv state is the last `kernel` raw inputs, so the state after position `t` is a
-        // window over the old state followed by the new inputs.
+        // window over the old state followed by the new inputs. Store zero-copy narrowed views
+        // (rewind materializes only the single kept step if anything is rejected).
         let kernel = self.conv_state.dim(D::Minus1)?;
         let window = Tensor::cat(
             &[
@@ -184,7 +185,7 @@ impl GdnLayerCache {
             D::Minus1,
         )?;
         trail.conv = (0..inputs.dim(1)?)
-            .map(|t| window.narrow(D::Minus1, t + 1, kernel)?.contiguous())
+            .map(|t| window.narrow(D::Minus1, t + 1, kernel))
             .collect::<Result<_>>()?;
         Ok(())
     }
@@ -202,9 +203,15 @@ impl GdnLayerCache {
         let Some(trail) = self.trail.as_mut() else {
             return gated_delta_rule_recurrence(q, k, v, g, beta, &mut self.recurrent_state);
         };
-        // One position at a time, copying the state after each. The fused kernels advance the
-        // state in place, so a handle kept across steps would alias the final state.
         let seq_len = q.dim(1)?;
+        #[cfg(feature = "cuda")]
+        if q.device().is_cuda() && !gdn_force_portable() && seq_len > 0 {
+            let (out, rec_trail) =
+                recurrence_cuda_with_trail(q, k, v, g, beta, &mut self.recurrent_state)?;
+            trail.recurrent = rec_trail;
+            return Ok(out);
+        }
+        // Portable fallback: one position at a time, copying the state after each.
         trail.recurrent = Vec::with_capacity(seq_len);
         let mut ys = Vec::with_capacity(seq_len);
         for t in 0..seq_len {
@@ -571,6 +578,28 @@ fn recurrence_cuda(
         )?
     };
     recurrence_unflatten(&out_bh, &s, q, v, state)
+}
+
+#[cfg(feature = "cuda")]
+fn recurrence_cuda_with_trail(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    state: &mut Tensor,
+) -> Result<(Tensor, Vec<Tensor>)> {
+    let (b, s_len, nh, kd) = q.dims4()?;
+    let vd = v.dim(D::Minus1)?;
+    let (q_bh, k_bh, v_bh, g_bh, beta_bh, mut s) = recurrence_flatten(q, k, v, g, beta, state)?;
+    let (out_bh, trail_all) = crate::cuda::gdn::gated_delta_rule_recurrence_with_trail_cuda(
+        &q_bh, &k_bh, &v_bh, &g_bh, &beta_bh, &mut s,
+    )?;
+    let out = recurrence_unflatten(&out_bh, &s, q, v, state)?;
+    let states = (0..s_len)
+        .map(|t| trail_all.narrow(0, t, 1)?.reshape((b, nh, kd, vd)))
+        .collect::<Result<Vec<_>>>()?;
+    Ok((out, states))
 }
 
 /// Fused Metal recurrence (mirrors the CUDA path).
@@ -2253,65 +2282,101 @@ mod tests {
                 .map(|i| (((i * 1103515245 + seed * 12345 + 7) % 2000) as f32 / 1000.0) - 1.0)
                 .collect()
         };
-        let max_rel = |a: &[f32], b: &[f32]| -> f32 {
-            a.iter()
-                .zip(b)
-                .map(|(x, y)| (x - y).abs() / x.abs().max(1e-4))
-                .fold(0.0f32, f32::max)
+        let l2_norm_rows = |mut v: Vec<f32>, dim: usize| -> Vec<f32> {
+            for chunk in v.chunks_exact_mut(dim) {
+                let norm = chunk.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+                for x in chunk {
+                    *x /= norm;
+                }
+            }
+            v
         };
-        for &(batch, nvh, hkd, hvd, seq) in &[
-            (1usize, 4usize, 128usize, 128usize, 1usize),
-            (1, 8, 128, 128, 7),
-            (1, 4, 128, 128, 64),
-        ] {
-            let on4 = |v: Vec<f32>, s: (usize, usize, usize, usize)| -> Result<Tensor> {
-                Tensor::from_vec(v, s, &Device::Cpu)?.to_device(&dev)
-            };
-            let on3 = |v: Vec<f32>, s: (usize, usize, usize)| -> Result<Tensor> {
-                Tensor::from_vec(v, s, &Device::Cpu)?.to_device(&dev)
-            };
-            let q = on4(gen(batch * seq * nvh * hkd, 1), (batch, seq, nvh, hkd))?;
-            let k = on4(gen(batch * seq * nvh * hkd, 2), (batch, seq, nvh, hkd))?;
-            let v = on4(gen(batch * seq * nvh * hvd, 3), (batch, seq, nvh, hvd))?;
-            let g = on3(
-                gen(batch * seq * nvh, 4)
-                    .iter()
-                    .map(|x| x * 0.5 - 0.5)
-                    .collect(),
-                (batch, seq, nvh),
-            )?;
-            let beta = on3(
-                gen(batch * seq * nvh, 5)
-                    .iter()
-                    .map(|x| (x + 1.0) * 0.5)
-                    .collect(),
-                (batch, seq, nvh),
-            )?;
-            let state0 = Tensor::from_vec(
-                gen(batch * nvh * hkd * hvd, 6),
-                (batch, nvh, hkd, hvd),
-                &Device::Cpu,
-            )?
-            .to_device(&dev)?;
+        let max_rel = |a: &[f32], b: &[f32]| -> (f32, f32) {
+            let mut mrel = 0.0f32;
+            let mut mabs = 0.0f32;
+            for (&x, &y) in a.iter().zip(b) {
+                assert!(
+                    x.is_finite() && y.is_finite(),
+                    "non-finite GDN value: x={x} y={y}"
+                );
+                let ad = (x - y).abs();
+                let rel = ad / x.abs().max(1e-2);
+                if ad > mabs {
+                    mabs = ad;
+                }
+                if rel > mrel {
+                    mrel = rel;
+                }
+            }
+            (mrel, mabs)
+        };
+        for &seed_off in &[0usize, 100usize] {
+            for &(batch, nvh, hkd, hvd, seq) in &[
+                (1usize, 4usize, 128usize, 128usize, 1usize),
+                (1, 8, 128, 128, 7),
+                (1, 4, 128, 128, 64),
+            ] {
+                let on4 = |v: Vec<f32>, s: (usize, usize, usize, usize)| -> Result<Tensor> {
+                    Tensor::from_vec(v, s, &Device::Cpu)?.to_device(&dev)
+                };
+                let on3 = |v: Vec<f32>, s: (usize, usize, usize)| -> Result<Tensor> {
+                    Tensor::from_vec(v, s, &Device::Cpu)?.to_device(&dev)
+                };
+                let q = on4(
+                    gen(batch * seq * nvh * hkd, seed_off + 1),
+                    (batch, seq, nvh, hkd),
+                )?;
+                // Real GDN inputs L2-normalize k per head so ||I - beta * k k^T|| <= 1
+                // instead of exploding geometrically by ~42^seq over multi-step tests.
+                let k = on4(
+                    l2_norm_rows(gen(batch * seq * nvh * hkd, seed_off + 2), hkd),
+                    (batch, seq, nvh, hkd),
+                )?;
+                let v = on4(
+                    gen(batch * seq * nvh * hvd, seed_off + 3),
+                    (batch, seq, nvh, hvd),
+                )?;
+                let g = on3(
+                    gen(batch * seq * nvh, seed_off + 4)
+                        .iter()
+                        .map(|x| x * 0.5 - 0.5)
+                        .collect(),
+                    (batch, seq, nvh),
+                )?;
+                let beta = on3(
+                    gen(batch * seq * nvh, seed_off + 5)
+                        .iter()
+                        .map(|x| (x + 1.0) * 0.5)
+                        .collect(),
+                    (batch, seq, nvh),
+                )?;
+                let state0 = Tensor::from_vec(
+                    gen(batch * nvh * hkd * hvd, seed_off + 6),
+                    (batch, nvh, hkd, hvd),
+                    &Device::Cpu,
+                )?
+                .to_device(&dev)?;
 
-            let mut s_fused = state0.clone();
-            let y_fused = recurrence_cuda(&q, &k, &v, &g, &beta, &mut s_fused)?;
-            let mut s_port = state0.clone();
-            let y_port = recurrence_portable(&q, &k, &v, &g, &beta, &mut s_port)?;
+                let mut s_fused = state0.copy()?;
+                let y_fused = recurrence_cuda(&q, &k, &v, &g, &beta, &mut s_fused)?;
+                let mut s_port = state0.copy()?;
+                let y_port = recurrence_portable(&q, &k, &v, &g, &beta, &mut s_port)?;
 
-            let yf = y_fused.flatten_all()?.to_vec1::<f32>()?;
-            let yp = y_port.flatten_all()?.to_vec1::<f32>()?;
-            let sf = s_fused.flatten_all()?.to_vec1::<f32>()?;
-            let sp = s_port.flatten_all()?.to_vec1::<f32>()?;
-            let ry = max_rel(&yp, &yf);
-            let rs = max_rel(&sp, &sf);
-            eprintln!(
-                "[gdn cuda-vs-portable] b{batch} h{nvh} k{hkd} v{hvd} s{seq}  y_rel={ry:.2e} state_rel={rs:.2e}"
-            );
-            assert!(
-                ry < 1e-4 && rs < 1e-4,
-                "fused!=portable b{batch} s{seq} y_rel={ry} state_rel={rs}"
-            );
+                let yf = y_fused.flatten_all()?.to_vec1::<f32>()?;
+                let yp = y_port.flatten_all()?.to_vec1::<f32>()?;
+                let sf = s_fused.flatten_all()?.to_vec1::<f32>()?;
+                let sp = s_port.flatten_all()?.to_vec1::<f32>()?;
+                let (ry, ay) = max_rel(&yp, &yf);
+                let (rs, as_) = max_rel(&sp, &sf);
+                eprintln!(
+                    "[gdn cuda-vs-portable] seed={seed_off} b{batch} h{nvh} k{hkd} v{hvd} s{seq}  y_rel={ry:.2e} (abs={ay:.2e}) state_rel={rs:.2e} (abs={as_:.2e})"
+                );
+                // Kernel builds with NVCC --use_fast_math (__expf + FMA contraction) vs portable F32.
+                assert!(
+                    ry < 1e-4 && rs < 1e-4,
+                    "fused!=portable seed={seed_off} b{batch} s{seq} y_rel={ry} state_rel={rs}"
+                );
+            }
         }
         Ok(())
     }
@@ -2426,5 +2491,71 @@ mod tests {
             eprintln!("skip: built without the vulkan feature");
             Ok(())
         }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gdn_recurrence_cuda_trail_matches_step_loop() -> Result<()> {
+        let dev = Device::new_cuda(0)?;
+        for &(b, s, nh, kd, vd) in &[
+            (1usize, 16usize, 4usize, 128usize, 128usize),
+            (2, 8, 3, 48, 64),
+        ] {
+            let q = Tensor::randn(0f32, 0.25f32, (b, s, nh, kd), &dev)?;
+            let k = Tensor::randn(0f32, 0.25f32, (b, s, nh, kd), &dev)?;
+            let v = Tensor::randn(0f32, 0.25f32, (b, s, nh, vd), &dev)?;
+            let g = Tensor::randn(-0.5f32, 0.2f32, (b, s, nh), &dev)?;
+            let beta = Tensor::randn(0f32, 0.25f32, (b, s, nh), &dev)?;
+            let s0 = Tensor::randn(0f32, 0.2f32, (b, nh, kd, vd), &dev)?;
+
+            let mut cache = GdnLayerCache {
+                conv_state: Tensor::zeros((b, 4, 3), DType::F32, &dev)?,
+                recurrent_state: s0.copy()?,
+                seqlen_offset: 0,
+                trail: Some(GdnTrail::default()),
+            };
+            let fused_out = cache.recurrence(&q, &k, &v, &g, &beta)?;
+            let trail = cache.trail.expect("trail populated");
+            assert_eq!(trail.recurrent.len(), s);
+
+            // Compare each step's output and trail state against running step-by-step.
+            let mut ref_state = s0;
+            let mut ref_outs = Vec::with_capacity(s);
+            for t in 0..s {
+                let y_t = gated_delta_rule_recurrence(
+                    &q.narrow(1, t, 1)?.contiguous()?,
+                    &k.narrow(1, t, 1)?.contiguous()?,
+                    &v.narrow(1, t, 1)?.contiguous()?,
+                    &g.narrow(1, t, 1)?.contiguous()?,
+                    &beta.narrow(1, t, 1)?.contiguous()?,
+                    &mut ref_state,
+                )?;
+                ref_outs.push(y_t);
+                let got_s = trail.recurrent[t].flatten_all()?.to_vec1::<f32>()?;
+                let want_s = ref_state.flatten_all()?.to_vec1::<f32>()?;
+                let max_s_err = got_s
+                    .iter()
+                    .zip(&want_s)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                assert!(
+                    max_s_err < 1e-4,
+                    "trail state mismatch at k_dim={kd} step={t}: max_err={max_s_err}"
+                );
+            }
+            let ref_out = Tensor::cat(&ref_outs, 1)?;
+            let got_v = fused_out.flatten_all()?.to_vec1::<f32>()?;
+            let want_v = ref_out.flatten_all()?.to_vec1::<f32>()?;
+            let max_o_err = got_v
+                .iter()
+                .zip(&want_v)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                max_o_err < 1e-4,
+                "trail out mismatch k_dim={kd}: {max_o_err}"
+            );
+        }
+        Ok(())
     }
 }

@@ -378,6 +378,10 @@ pub mod text_models_inputs_processor {
         /// Cumulative KV lengths [batch+1], u32, for gather_kv_cache and flash_attn_varlen.
         /// Each entry is sum of (cached + new) tokens.
         pub cu_seqlens_kv: Option<HashMap<DeviceLocation, Tensor>>,
+        /// Cached row-0 block table vectors on CPU (when batch == 1) to avoid
+        /// synchronous D2H copies on every full-attention layer in `try_paged_lsa`.
+        pub block_tables_row0_cpu: Option<std::sync::Arc<Vec<usize>>>,
+        pub full_block_tables_row0_cpu: Option<std::sync::Arc<Vec<usize>>>,
     }
 
     #[cfg(all(feature = "cuda", target_family = "unix"))]
@@ -678,6 +682,8 @@ pub mod text_models_inputs_processor {
                 query_lens: None,
                 cu_seqlens_q: None,
                 cu_seqlens_kv: None,
+                block_tables_row0_cpu: None,
+                full_block_tables_row0_cpu: None,
             })
         }
 
@@ -925,6 +931,8 @@ pub mod text_models_inputs_processor {
                 query_lens: Some(query_lens.to_vec()),
                 cu_seqlens_q: Some(cu_q_map),
                 cu_seqlens_kv: Some(cu_kv_map),
+                block_tables_row0_cpu: self.block_tables_row0_cpu.clone(),
+                full_block_tables_row0_cpu: self.full_block_tables_row0_cpu.clone(),
             })
         }
     }
@@ -1292,6 +1300,7 @@ pub mod text_models_inputs_processor {
                 kv_chunk_size,
                 block_valid_mask,
             ) = make_paged_kv_prefill_tensors(&prefill_query_lens, block_size)?;
+            let block_tables_row0_cpu = block_tables.first().cloned().map(std::sync::Arc::new);
             let block_tables = _make_tensor_with_pad(
                 block_tables
                     .iter()
@@ -1348,6 +1357,11 @@ pub mod text_models_inputs_processor {
             let mut full_kv_chunk_size_map = HashMap::new();
             let mut full_block_valid_mask_map = HashMap::new();
 
+            let full_block_tables_row0_cpu = if sliding_window.is_some() {
+                full_block_tables.first().cloned().map(std::sync::Arc::new)
+            } else {
+                None
+            };
             let (
                 full_block_tables_tensor,
                 full_context_lens_tensor,
@@ -1599,6 +1613,8 @@ pub mod text_models_inputs_processor {
                 } else {
                     None
                 },
+                block_tables_row0_cpu,
+                full_block_tables_row0_cpu,
             })
         } else {
             None
@@ -1783,6 +1799,16 @@ pub mod text_models_inputs_processor {
             let paged_block_table_signature =
                 block_table_signature(&block_tables, &paged_attn_context_lens, block_size);
             let full_matches_paged = paged_attn_input.sliding_window.is_none();
+            let block_tables_row0_cpu = (block_tables.len() == 1)
+                .then(|| block_tables[0].clone())
+                .map(std::sync::Arc::new);
+            let full_block_tables_row0_cpu = if full_matches_paged {
+                block_tables_row0_cpu.clone()
+            } else {
+                (full_block_tables.len() == 1)
+                    .then(|| full_block_tables[0].clone())
+                    .map(std::sync::Arc::new)
+            };
 
             let block_tables = _make_tensor_with_pad(
                 block_tables
@@ -2016,6 +2042,8 @@ pub mod text_models_inputs_processor {
                 query_lens: None,
                 cu_seqlens_q: None,
                 cu_seqlens_kv: None,
+                block_tables_row0_cpu,
+                full_block_tables_row0_cpu,
             })
         } else {
             None
