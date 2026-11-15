@@ -32,9 +32,14 @@ pub trait SelfSpeculative {
     /// The proposer a pipeline attaches: the head's draft, continued by prompt lookup when `cfg`
     /// names one.
     fn mtp_proposer(&self, cfg: &MtpConfig) -> Result<Box<dyn SpeculativeProposer + Send + Sync>> {
-        let draft = self.attach_mtp(cfg)?;
+        let mut draft = self.attach_mtp(cfg)?;
+        if cfg.adaptive_guard {
+            draft = Box::new(crate::speculative::GuardedDraft::new(draft));
+        }
         Ok(match cfg.lookup {
-            Some(lookup) => Box::new(Extended::new(draft, lookup)),
+            Some(lookup) => {
+                Box::new(Extended::new(draft, lookup).with_sa_bypass(cfg.sa_bypass_threshold))
+            }
             None => draft,
         })
     }

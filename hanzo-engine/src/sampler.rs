@@ -1927,16 +1927,40 @@ mod tests {
     fn top_k_one_with_temperature_is_argmax() {
         use super::Sampler;
 
-        let top_k_one = Sampler::new(Some(1.0), 0, None, None, None, None, None, 1, 1.0, 0.0, vec![])
-            .unwrap();
+        let top_k_one = Sampler::new(
+            Some(1.0),
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            1,
+            1.0,
+            0.0,
+            vec![],
+        )
+        .unwrap();
         assert!(top_k_one.is_argmax());
 
-        let top_k_two = Sampler::new(Some(1.0), 0, None, None, None, None, None, 2, 1.0, 0.0, vec![])
-            .unwrap();
+        let top_k_two = Sampler::new(
+            Some(1.0),
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            2,
+            1.0,
+            0.0,
+            vec![],
+        )
+        .unwrap();
         assert!(!top_k_two.is_argmax());
 
-        let no_temp = Sampler::new(None, 0, None, None, None, None, None, -1, 1.0, 0.0, vec![])
-            .unwrap();
+        let no_temp =
+            Sampler::new(None, 0, None, None, None, None, None, -1, 1.0, 0.0, vec![]).unwrap();
         assert!(no_temp.is_argmax());
     }
 }

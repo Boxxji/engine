@@ -404,6 +404,8 @@ fn draft_window(
             verify_rounds: now.verify_rounds - before.verify_rounds,
             accepted_sum: now.accepted_sum.saturating_sub(before.accepted_sum),
             proposed_sum: now.proposed_sum.saturating_sub(before.proposed_sum),
+            sa_bypass_rounds: now.sa_bypass_rounds.saturating_sub(before.sa_bypass_rounds),
+            guard_skips: now.guard_skips.saturating_sub(before.guard_skips),
         }
     };
     if window.verify_rounds == 0 {
@@ -505,6 +507,8 @@ mod tests {
             verify_rounds,
             accepted_sum,
             proposed_sum,
+            sa_bypass_rounds: 0,
+            guard_skips: 0,
         }
     }
 

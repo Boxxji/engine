@@ -737,6 +737,12 @@ pub struct RuntimeOptions {
     #[serde(default)]
     pub prompt_lookup_ngram: Option<usize>,
 
+    /// SA_SPEC draft bypass threshold: when greedy context suffix match length reaches `N`,
+    /// propose directly from context and bypass the neural MTP forward pass.
+    #[arg(long)]
+    #[serde(default)]
+    pub sa_bypass_threshold: Option<usize>,
+
     /// Attach a DFlash 2 block-diffusion draft from this checkpoint directory (`config.json` +
     /// `model.safetensors`). The draft has no embedding or output head of its own and decodes
     /// through the target's, so it pairs only with the model it was trained beside.
@@ -931,6 +937,11 @@ pub struct BenchRuntimeOptions {
     #[arg(long)]
     pub prompt_lookup_ngram: Option<usize>,
 
+    /// SA_SPEC draft bypass threshold: when greedy context suffix match length reaches `N`,
+    /// propose directly from context and bypass the neural MTP forward pass.
+    #[arg(long)]
+    pub sa_bypass_threshold: Option<usize>,
+
     /// Attach a DFlash 2 block-diffusion draft from this checkpoint directory.
     #[arg(long)]
     pub dflash: Option<String>,
@@ -966,9 +977,10 @@ impl BenchRuntimeOptions {
     }
 
     pub fn mtp_config(&self) -> Option<hanzo_engine::MtpConfig> {
-        self.mtp_model
-            .clone()
-            .map(|model| hanzo_engine::MtpConfig::new(model, self.mtp_n_predict))
+        self.mtp_model.clone().map(|model| {
+            hanzo_engine::MtpConfig::new(model, self.mtp_n_predict)
+                .with_sa_bypass_threshold(self.sa_bypass_threshold)
+        })
     }
 
     pub fn draft_model_selected(
@@ -1039,9 +1051,10 @@ impl RuntimeOptions {
     }
 
     pub fn mtp_config(&self) -> Option<hanzo_engine::MtpConfig> {
-        self.mtp_model
-            .clone()
-            .map(|model| hanzo_engine::MtpConfig::new(model, self.mtp_n_predict))
+        self.mtp_model.clone().map(|model| {
+            hanzo_engine::MtpConfig::new(model, self.mtp_n_predict)
+                .with_sa_bypass_threshold(self.sa_bypass_threshold)
+        })
     }
 
     /// Build the draft model selector for classic draft+target speculative decoding, if a draft was
@@ -1163,6 +1176,7 @@ impl Default for RuntimeOptions {
             draft_quantized_file: None,
             gamma: None,
             prompt_lookup_ngram: None,
+            sa_bypass_threshold: None,
             dflash: None,
             dflash_block_size: 0,
             lsa: false,

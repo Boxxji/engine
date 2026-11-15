@@ -142,7 +142,7 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p hanzo-engine -p hanzo-quant -p hanzo-vision
+      - run: cargo test -p hanzo-engine -p hanzo-quant -p hanzo-vision -p hanzo-tokenizer -p hanzo-kv-fabric
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
 

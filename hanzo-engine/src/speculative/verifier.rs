@@ -68,19 +68,16 @@ pub async fn finish_verified_step<P: Pipeline>(
     let mut accepted = 0usize;
     for (idx, draft) in proposal.iter().copied().enumerate() {
         let row = logit_row(&verify_logits, idx)?;
-        let (emitted, is_draft) = match &candidates {
-            Some(candidates) if seq.forced_token().is_none() => {
-                let candidate_row = logit_row(candidates, idx)?;
-                judge_draft(seq, row, candidate_row, draft, return_logprobs, &rng)?
-            }
-            _ => {
-                let sampled =
-                    sample_sequence(row, seq, return_logprobs, rng.clone(), false, false, false)
-                        .await?;
-                let is_draft = sampled.token == draft;
-                (sampled, is_draft)
-            }
-        };
+        let (emitted, is_draft) = verify_draft_slot(
+            seq,
+            row,
+            draft,
+            candidates.as_ref(),
+            idx,
+            return_logprobs,
+            &rng,
+        )
+        .await?;
         if is_draft {
             accepted += 1;
             seq.record_drafts(0, 1);
@@ -122,6 +119,42 @@ pub async fn finish_verified_step<P: Pipeline>(
         Some(token)
     };
     Ok(outcome(accepted, base_len + 1 + accepted, continuation))
+}
+
+/// Verify one staged draft token at `slot_idx` against the target's logits.
+///
+/// Whenever `candidates` is `None` (greedy, recognizer-constrained, `PromptLookup`,
+/// `SA_SPEC`, or `DFlash2`), this unconditionally samples from `target_row` and
+/// requires `sampled.token == draft`.
+pub(crate) async fn verify_draft_slot(
+    seq: &mut Sequence,
+    target_row: Tensor,
+    draft: u32,
+    candidates: Option<&Tensor>,
+    slot_idx: usize,
+    return_logprobs: bool,
+    rng: &Arc<std::sync::Mutex<Isaac64Rng>>,
+) -> Result<(Logprobs, bool)> {
+    match candidates {
+        Some(candidates) if seq.forced_token().is_none() => {
+            let candidate_row = logit_row(candidates, slot_idx)?;
+            judge_draft(seq, target_row, candidate_row, draft, return_logprobs, rng)
+        }
+        _ => {
+            let sampled = sample_sequence(
+                target_row,
+                seq,
+                return_logprobs,
+                rng.clone(),
+                false,
+                false,
+                false,
+            )
+            .await?;
+            let is_draft = sampled.token == draft;
+            Ok((sampled, is_draft))
+        }
+    }
 }
 
 /// Judges one draft by speculative sampling: the draft is kept with probability min(1, p/q), and

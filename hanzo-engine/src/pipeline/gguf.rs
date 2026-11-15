@@ -1289,6 +1289,40 @@ impl MetadataMixin for GGUFPipeline {
     }
 }
 
+impl GGUFPipeline {
+    fn draft_needs_target_hiddens(&self) -> bool {
+        match self.model {
+            Model::Qwen35(ref model) => {
+                self.draft_proposer
+                    .as_ref()
+                    .is_some_and(|p| p.needs_target_hiddens())
+                    && !model.spec_capture.is_forward_paused()
+            }
+            _ => self
+                .draft_proposer
+                .as_ref()
+                .is_some_and(|p| p.needs_target_hiddens()),
+        }
+    }
+
+    fn sync_model_spec_capture(&self) {
+        let capture = self.draft_needs_target_hiddens();
+        let is_mtp = self.drafter.as_ref().is_some_and(|d| {
+            matches!(
+                d.kind,
+                crate::speculative::SpeculativeAttachKind::Mtp { .. }
+            )
+        });
+        match self.model {
+            Model::Qwen35(ref model) if is_mtp => model.set_store_spec(capture),
+            Model::Zen6(ref model) => model.set_store_spec(capture),
+            Model::Deepseek2(ref model) => model.set_store_spec_hidden(capture),
+            Model::Deepseek4(ref model) => model.set_store_spec_hidden(capture),
+            _ => {}
+        }
+    }
+}
+
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 impl GGUFPipeline {
     /// Whether the active model variant's decode forward is position-invariant under
@@ -1425,20 +1459,14 @@ impl GGUFPipeline {
         if !cuda_decode_graphs_enabled() || !self.model_supports_decode_graph() {
             return Ok(None);
         }
-        let spec_active = match self.model {
-            Model::Qwen35(ref model) => {
-                self.draft_proposer.is_some() && !model.spec_capture.is_forward_paused()
-            }
-            _ => self.draft_proposer.is_some(),
-        };
-        if spec_active {
+        if self.draft_needs_target_hiddens() {
             return Ok(None);
         }
         if let Some(ref lsa_cfg) = crate::attention::LsaConfig::global() {
             let max_kv_len = metadata
                 .max_context_len
                 .unwrap_or_else(|| seqlen_offsets.iter().copied().max().unwrap_or(0) + 1);
-            if max_kv_len >= lsa_cfg.min_seq_len && max_kv_len > lsa_cfg.top_k {
+            if lsa_cfg.active_for_seq_len(max_kv_len) {
                 return Ok(None);
             }
         }
@@ -1673,7 +1701,19 @@ impl GGUFPipeline {
         if !cuda_prefill_graphs_enabled() || !self.model_supports_prefill_graph() {
             return Ok(None);
         }
-        if self.draft_proposer.is_some() || crate::attention::LsaConfig::global().is_some() {
+        let (batch, q_len) = input_ids.dims2()?;
+        let lsa_active = crate::attention::LsaConfig::global().is_some_and(|lsa_cfg| {
+            let max_kv_len = metadata.max_context_len.unwrap_or_else(|| {
+                seqlen_offsets
+                    .iter()
+                    .copied()
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(q_len)
+            });
+            lsa_cfg.active_for_seq_len(max_kv_len)
+        });
+        if self.draft_needs_target_hiddens() || lsa_active {
             return Ok(None);
         }
         // Offset-0 first prompt chunk only: the mask/positions/cumulative-seqlens are then fixed for
@@ -1685,7 +1725,6 @@ impl GGUFPipeline {
         {
             return Ok(None);
         }
-        let (batch, q_len) = input_ids.dims2()?;
         if batch != 1
             || q_len <= 1
             || seqlen_offsets.len() != 1
@@ -1917,7 +1956,18 @@ impl GGUFPipeline {
         // re-issues only the recorded kernels, so none of that runs and the draft reads rows
         // that were never written. The CUDA and Vulkan paths stay eager under speculation for
         // this reason; this one claimed to mirror the CUDA gate and had not.
-        if self.draft_proposer.is_some() || crate::attention::LsaConfig::global().is_some() {
+        let lsa_active = crate::attention::LsaConfig::global().is_some_and(|lsa_cfg| {
+            let max_kv_len = metadata.max_context_len.unwrap_or_else(|| {
+                seqlen_offsets
+                    .iter()
+                    .copied()
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1)
+            });
+            lsa_cfg.active_for_seq_len(max_kv_len)
+        });
+        if self.draft_needs_target_hiddens() || lsa_active {
             return Ok(None);
         }
         // Mirror the CUDA gate: only steady-state single-token decode with paged
@@ -2259,9 +2309,18 @@ impl GGUFPipeline {
         seqlen_offsets: &[usize],
         context_lens: &[(usize, usize)],
     ) -> Result<Option<Tensor>, hanzo_ml::Error> {
+        let lsa_active = crate::attention::LsaConfig::global().is_some_and(|lsa_cfg| {
+            let max_kv_len = seqlen_offsets
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
+            lsa_cfg.active_for_seq_len(max_kv_len)
+        });
         if !crate::perf_flags::vulkan_graphs_enabled()
-            || self.draft_proposer.is_some()
-            || crate::attention::LsaConfig::global().is_some()
+            || self.draft_needs_target_hiddens()
+            || lsa_active
         {
             return Ok(None);
         }
@@ -2517,6 +2576,7 @@ impl Pipeline for GGUFPipeline {
             }
             (None, None) => None,
         };
+        self.sync_model_spec_capture();
         // Vulkan decode command-graph fast path. The Vulkan naive-KV-cache decode has no paged
         // metadata (so the ROCm/CUDA blocks below never fire); this replays the captured single-token
         // forward (or captures it on the first decode step) instead of re-recording ~1.7k dispatches
@@ -2846,6 +2906,9 @@ impl Pipeline for GGUFPipeline {
                         own.to_string_lossy().into_owned(),
                         mtp_config.n_predict,
                     )
+                    .with_lookup(mtp_config.lookup)
+                    .with_sa_bypass_threshold(mtp_config.sa_bypass_threshold)
+                    .with_adaptive_guard(mtp_config.adaptive_guard)
                 } else {
                     mtp_config
                 };
@@ -2980,7 +3043,7 @@ impl crate::speculative::driver::SpeculativePipelineExt for GGUFPipeline {
         &self,
         rows: &[(usize, usize)],
     ) -> hanzo_ml::Result<Option<Tensor>> {
-        if self.draft_proposer.is_none() || rows.is_empty() {
+        if !self.draft_needs_target_hiddens() || rows.is_empty() {
             return Ok(None);
         }
         // Qwen3.5 and Qwen3.8-Flash-Next stash the position of each row beside its hidden state;

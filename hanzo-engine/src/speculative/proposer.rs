@@ -139,6 +139,21 @@ pub trait SpeculativeProposer {
         target_embedder: Option<&TargetTokenEmbedder<'_>>,
     ) -> Result<SpeculativeProposalBatch>;
 
+    /// Whether this proposer currently requires the target model's next forward pass to stash
+    /// hidden states (for example MTP/DFlash draft conditioning).
+    ///
+    /// Proposers that do not read target hidden states (`PromptLookup`, `DraftModel`), or
+    /// adaptive wrappers currently in cooldown, return `false` so the target forward can skip
+    /// hidden extraction and remain eligible for CUDA/ROCm/Vulkan decode graphs.
+    fn needs_target_hiddens(&self) -> bool {
+        true
+    }
+
+    /// Observe finalized verification counts `(proposed, accepted)` for `seq_ids` at the start
+    /// of a speculative round, allowing wrapped guards to sync baselines without penalizing or
+    /// advancing cooldown when another proposer (such as `SA_SPEC`) bypasses the inner draft.
+    fn observe_outcomes(&mut self, _seq_ids: &[usize], _sequences: &[&crate::sequence::Sequence]) {}
+
     /// Drop per-sequence proposer state for sequences no longer live. `live` is the set of
     /// still-running sequence ids; anything keyed off a finished sequence must be released so a
     /// long-running server doesn't leak. Default no-op: proposers that hold no per-seq state

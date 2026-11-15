@@ -1181,6 +1181,12 @@ impl Sequence {
         group.total_draft_accepted += accepted;
     }
 
+    /// Cumulative `(total_draft_toks, total_draft_accepted)` counters for this sequence group.
+    pub(crate) fn draft_counts(&self) -> (usize, usize) {
+        let group = get_mut_group!(self);
+        (group.total_draft_toks, group.total_draft_accepted)
+    }
+
     pub fn responder(&self) -> Sender<Response> {
         self.responder.clone()
     }

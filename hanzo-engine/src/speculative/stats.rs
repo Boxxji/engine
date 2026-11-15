@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static VERIFY_ROUNDS: AtomicU64 = AtomicU64::new(0);
 static ACCEPTED_SUM: AtomicU64 = AtomicU64::new(0);
 static PROPOSED_SUM: AtomicU64 = AtomicU64::new(0);
+static SA_BYPASS_ROUNDS: AtomicU64 = AtomicU64::new(0);
+static GUARD_SKIPS: AtomicU64 = AtomicU64::new(0);
 
 /// One verify round: `accepted` drafts confirmed out of `proposed` staged.
 pub fn record_verify(accepted: usize, proposed: usize) {
@@ -19,11 +21,23 @@ pub fn record_verify(accepted: usize, proposed: usize) {
     PROPOSED_SUM.fetch_add(proposed as u64, Ordering::Relaxed);
 }
 
+/// Record one neural draft forward bypassed by `SA_SPEC`.
+pub fn record_sa_bypass() {
+    SA_BYPASS_ROUNDS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record one speculative step cooled down by `AdaptiveSpeculativeGuard`.
+pub fn record_guard_skip() {
+    GUARD_SKIPS.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Zero the counters before a measured run.
 pub fn reset() {
     VERIFY_ROUNDS.store(0, Ordering::Relaxed);
     ACCEPTED_SUM.store(0, Ordering::Relaxed);
     PROPOSED_SUM.store(0, Ordering::Relaxed);
+    SA_BYPASS_ROUNDS.store(0, Ordering::Relaxed);
+    GUARD_SKIPS.store(0, Ordering::Relaxed);
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -31,6 +45,8 @@ pub struct SpeculativeStats {
     pub verify_rounds: u64,
     pub accepted_sum: u64,
     pub proposed_sum: u64,
+    pub sa_bypass_rounds: u64,
+    pub guard_skips: u64,
 }
 
 impl SpeculativeStats {
@@ -59,5 +75,7 @@ pub fn snapshot() -> SpeculativeStats {
         verify_rounds: VERIFY_ROUNDS.load(Ordering::Relaxed),
         accepted_sum: ACCEPTED_SUM.load(Ordering::Relaxed),
         proposed_sum: PROPOSED_SUM.load(Ordering::Relaxed),
+        sa_bypass_rounds: SA_BYPASS_ROUNDS.load(Ordering::Relaxed),
+        guard_skips: GUARD_SKIPS.load(Ordering::Relaxed),
     }
 }

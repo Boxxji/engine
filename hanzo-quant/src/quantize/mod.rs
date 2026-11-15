@@ -35,6 +35,7 @@ pub enum Fp8Mode {
 }
 
 impl Fp8Mode {
+    #[cfg(feature = "cuda")]
     fn code(self) -> i32 {
         match self {
             Self::Linear => 0,

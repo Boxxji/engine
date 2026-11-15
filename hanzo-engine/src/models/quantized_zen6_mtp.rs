@@ -236,6 +236,7 @@ pub(crate) struct Mtp {
     spec: Option<(Tensor, Vec<Vec<usize>>)>,
     anchors: AnchorPositions,
     max_seq_len: usize,
+    capture: bool,
 }
 
 /// Where a target keeps its head: empty until one is attached.
@@ -253,6 +254,15 @@ impl Mtp {
             spec: None,
             anchors,
             max_seq_len,
+            capture: true,
+        }
+    }
+
+    fn set_capture(&mut self, capture: bool) {
+        self.capture = capture;
+        if !capture {
+            self.spec = None;
+            self.forward.clear();
         }
     }
 
@@ -267,6 +277,10 @@ impl Mtp {
         context_lens: &[(usize, usize)],
     ) -> Result<()> {
         let seqs = std::mem::take(&mut self.forward);
+        if !self.capture {
+            self.spec = None;
+            return Ok(());
+        }
         let (b, s, n, h) = x.dims4()?;
         let x = x.reshape((b, s, n * h))?;
         let positions = context_lens
@@ -450,6 +464,15 @@ impl ModelWeights {
         let mtp = slot.as_ref()?;
         let (hidden, positions) = mtp.spec.clone()?;
         Some((hidden, positions, mtp.anchors.clone()))
+    }
+
+    /// Enable or pause stashing target streams / feeding the head's KV tracks.
+    pub(crate) fn set_store_spec(&self, store: bool) {
+        if let Ok(mut slot) = self.mtp.lock() {
+            if let Some(mtp) = slot.as_mut() {
+                mtp.set_capture(store);
+            }
+        }
     }
 
     /// Detach the head: forwards stop feeding it.

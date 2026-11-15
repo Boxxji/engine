@@ -94,6 +94,13 @@ pub struct MtpConfig {
     pub n_predict: Option<usize>,
     /// Prompt lookup continuing each head draft, when set.
     pub lookup: Option<Lookup>,
+    /// SA_SPEC bypass threshold: when greedy context n-gram match length reaches
+    /// this threshold, propose directly from suffix automaton and skip the MTP
+    /// draft forward pass.
+    pub sa_bypass_threshold: Option<usize>,
+    /// Wrap the MTP head in [`crate::speculative::GuardedDraft`] (default `true`) so low
+    /// acceptance cools down MTP and restores CUDA/ROCm/Vulkan decode graphs.
+    pub adaptive_guard: bool,
 }
 
 impl MtpConfig {
@@ -102,12 +109,26 @@ impl MtpConfig {
             model: model.into(),
             n_predict,
             lookup: None,
+            sa_bypass_threshold: None,
+            adaptive_guard: true,
         }
     }
 
     /// Continue each head draft by `lookup`.
     pub fn with_lookup(mut self, lookup: Option<Lookup>) -> Self {
         self.lookup = lookup;
+        self
+    }
+
+    /// Skip the MTP draft forward pass when greedy context match length reaches `threshold`.
+    pub fn with_sa_bypass_threshold(mut self, threshold: Option<usize>) -> Self {
+        self.sa_bypass_threshold = threshold;
+        self
+    }
+
+    /// Enable or disable the [`crate::speculative::GuardedDraft`] cooldown wrapper.
+    pub fn with_adaptive_guard(mut self, enabled: bool) -> Self {
+        self.adaptive_guard = enabled;
         self
     }
 

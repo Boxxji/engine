@@ -149,6 +149,7 @@ pub mod defaults {
     pub const MTP_CONFIG: Option<hanzo_engine::MtpConfig> = None;
     pub const DRAFT_MODEL: Option<hanzo_engine::ModelSelected> = None;
     pub const PROMPT_LOOKUP_NGRAM: Option<usize> = None;
+    pub const SA_BYPASS_THRESHOLD: Option<usize> = None;
     pub const DFLASH: Option<(String, usize)> = None;
     /// Shortest tail n-gram prompt-lookup will match on (Hugging Face / apoorvumang parity:
     /// search down to a single token).
@@ -294,6 +295,8 @@ pub struct ServerBuilder {
 
     /// Optional max n-gram for prompt-lookup speculative decoding (no draft model).
     prompt_lookup_ngram: Option<usize>,
+    /// Optional SA_SPEC bypass threshold for MTP/DFlash + suffix lookup.
+    sa_bypass_threshold: Option<usize>,
 
     /// Optional DFlash 2 block-diffusion draft: `(checkpoint_dir, block_size)`, where a
     /// `block_size` of 0 drafts the checkpoint's full trained block.
@@ -346,6 +349,7 @@ impl Default for ServerBuilder {
             mtp_config: defaults::MTP_CONFIG,
             draft_model: defaults::DRAFT_MODEL,
             prompt_lookup_ngram: defaults::PROMPT_LOOKUP_NGRAM,
+            sa_bypass_threshold: defaults::SA_BYPASS_THRESHOLD,
             dflash: defaults::DFLASH,
             lsa: None,
             gamma: defaults::GAMMA,
@@ -686,6 +690,34 @@ impl ServerBuilder {
         self
     }
 
+    /// Set the SA_SPEC draft-bypass match-length threshold for MTP + suffix lookup.
+    pub fn with_sa_bypass_threshold(mut self, threshold: usize) -> Self {
+        self.sa_bypass_threshold = Some(threshold);
+        self
+    }
+
+    /// Conditionally set the SA_SPEC draft-bypass threshold when `Some`.
+    pub fn with_sa_bypass_threshold_optional(mut self, threshold: Option<usize>) -> Self {
+        if let Some(threshold) = threshold {
+            self = self.with_sa_bypass_threshold(threshold);
+        }
+        self
+    }
+
+    fn resolve_mtp_config(
+        mut mtp_config: MtpConfig,
+        prompt_lookup_ngram: Option<usize>,
+        gamma: usize,
+        sa_bypass_threshold: Option<usize>,
+    ) -> anyhow::Result<MtpConfig> {
+        let lookup = Self::mtp_lookup(prompt_lookup_ngram, gamma)?.or(mtp_config.lookup);
+        mtp_config = mtp_config.with_lookup(lookup);
+        if sa_bypass_threshold.is_some() {
+            mtp_config = mtp_config.with_sa_bypass_threshold(sa_bypass_threshold);
+        }
+        Ok(mtp_config)
+    }
+
     /// Attach a DFlash 2 block-diffusion draft if a checkpoint directory was given. The draft
     /// decodes through the target's own embedding and output head, so it pairs only with the
     /// model it was trained beside. `block_size` 0 drafts the full trained block.
@@ -886,12 +918,16 @@ impl ServerBuilder {
                 },
             )?;
         } else if let Some(mtp_config) = self.mtp_config.clone() {
+            let resolved = Self::resolve_mtp_config(
+                mtp_config,
+                self.prompt_lookup_ngram,
+                self.gamma,
+                self.sa_bypass_threshold,
+            )?;
             pipeline
                 .lock()
                 .await
-                .attach_speculative(hanzo_engine::SpeculativeConfig::Mtp(
-                    mtp_config.with_lookup(Self::mtp_lookup(self.prompt_lookup_ngram, self.gamma)?),
-                ))?;
+                .attach_speculative(hanzo_engine::SpeculativeConfig::Mtp(resolved))?;
         } else if let Some(ngram_max) = self.prompt_lookup_ngram {
             pipeline.lock().await.attach_speculative(
                 hanzo_engine::SpeculativeConfig::PromptLookup {
@@ -1060,12 +1096,16 @@ impl ServerBuilder {
                 },
             )?;
         } else if let Some(mtp_config) = self.mtp_config.clone() {
+            let resolved = Self::resolve_mtp_config(
+                mtp_config,
+                self.prompt_lookup_ngram,
+                self.gamma,
+                self.sa_bypass_threshold,
+            )?;
             pipeline
                 .lock()
                 .await
-                .attach_speculative(hanzo_engine::SpeculativeConfig::Mtp(
-                    mtp_config.with_lookup(Self::mtp_lookup(self.prompt_lookup_ngram, self.gamma)?),
-                ))?;
+                .attach_speculative(hanzo_engine::SpeculativeConfig::Mtp(resolved))?;
         } else if let Some(ngram_max) = self.prompt_lookup_ngram {
             pipeline.lock().await.attach_speculative(
                 hanzo_engine::SpeculativeConfig::PromptLookup {

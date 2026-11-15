@@ -4,11 +4,13 @@ pub mod capture;
 pub mod config;
 pub mod draft;
 pub mod driver;
+pub mod guard;
 pub mod logging;
 pub mod prompt_lookup;
 pub mod proposer;
 pub(crate) mod staging;
 pub mod stats;
+pub mod suffix_automaton;
 pub mod target;
 pub mod verifier;
 
@@ -16,6 +18,7 @@ pub use capability::SelfSpeculative;
 pub use capture::{CaptureRequest, HiddenPrefixCapture, HiddenWindow};
 pub use config::{MtpConfig, SpeculativeConfig};
 pub use draft::{DraftModelProposer, DraftPipeline};
+pub use guard::{AdaptiveSpeculativeGuard, GuardedDraft};
 pub use logging::{SpeculativeAttachInfo, SpeculativeAttachKind};
 pub use prompt_lookup::{Extended, Lookup, PromptLookupProposer};
 pub(crate) use proposer::{draft_contexts, sample_drafts};
@@ -23,4 +26,5 @@ pub use proposer::{
     SpeculativeKvCache, SpeculativeProposal, SpeculativeProposalBatch, SpeculativeProposeBatchCtx,
     SpeculativeProposer, TargetTokenEmbedder,
 };
+pub use suffix_automaton::SuffixAutomaton;
 pub use target::{SpeculativeSharedHeads, SpeculativeTargetMixin};

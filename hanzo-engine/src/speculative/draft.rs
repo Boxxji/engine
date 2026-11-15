@@ -173,6 +173,10 @@ impl SpeculativeProposer for DraftModelProposer {
         Ok(SpeculativeProposalBatch::new(proposals))
     }
 
+    fn needs_target_hiddens(&self) -> bool {
+        false
+    }
+
     fn retain_seqs(&mut self, live: &[usize]) {
         prune_to_live(&mut self.caches, live);
     }

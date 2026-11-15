@@ -28,10 +28,10 @@ fn planar_chw_f32(
             let (p1, p2) = rest.split_at_mut(plane);
             let (s0, s1, s2) = (scales[0], scales[1], scales[2]);
             let (b0, b1, b2) = (biases[0], biases[1], biases[2]);
-            for (idx, chunk) in raw.chunks_exact(3).enumerate() {
-                p0[idx] = f32::from(chunk[0]) * s0 + b0;
-                p1[idx] = f32::from(chunk[1]) * s1 + b1;
-                p2[idx] = f32::from(chunk[2]) * s2 + b2;
+            for (idx, &[c0, c1, c2]) in raw.as_chunks::<3>().0.iter().enumerate() {
+                p0[idx] = f32::from(c0) * s0 + b0;
+                p1[idx] = f32::from(c1) * s1 + b1;
+                p2[idx] = f32::from(c2) * s2 + b2;
             }
         }
         _ => {

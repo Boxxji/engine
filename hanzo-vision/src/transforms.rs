@@ -185,7 +185,7 @@ mod tests {
         });
         let img = DynamicImage::ImageRgb8(rgb);
         let mean = [0.48145466f32, 0.4578275, 0.40821073];
-        let std = [0.26862954f32, 0.26130258, 0.27577711];
+        let std = [0.26862954f32, 0.261_302_6, 0.275_777_1];
 
         let unit = ToTensor.map(&img, &Device::Cpu).unwrap();
         let reference = Normalize {
@@ -194,7 +194,9 @@ mod tests {
         }
         .map(&unit, &Device::Cpu)
         .unwrap();
-        let fused = ToNormalizedTensor { mean, std }.map(&img, &Device::Cpu).unwrap();
+        let fused = ToNormalizedTensor { mean, std }
+            .map(&img, &Device::Cpu)
+            .unwrap();
 
         assert_eq!(fused.dims(), reference.dims());
         let diff = (fused - reference)
