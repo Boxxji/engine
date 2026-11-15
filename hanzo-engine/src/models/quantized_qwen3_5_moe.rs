@@ -2370,7 +2370,8 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 conv_width: props.conv_kernel,
                 state_dims: vec![props.num_v_heads, props.head_k_dim, props.head_v_dim],
                 conv_dtype: dtype,
-                state_dtype: dtype,
+                // The ROCm fused GDN mixer reads and writes its recurrent state as f32.
+                state_dtype: if device.is_rocm() { DType::F32 } else { dtype },
             },
         );
         let pipeline_cache = Arc::new(Mutex::new(

@@ -3497,9 +3497,9 @@ dependencies = [
 
 [[package]]
 name = "hanzo-ml"
-version = "0.11.116"
+version = "0.11.117"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1d14c4ca640368630698ff851acde0ddacdb0d987df625fd5e24a0f0cf07dd0"
+checksum = "6d268dcc28e09cb6c814c961a5cffb6fa1bbf5bd37194040f75ecb1ab2da7f21"
 dependencies = [
  "accelerate-src",
  "ash",
@@ -3638,9 +3638,9 @@ dependencies = [
 
 [[package]]
 name = "hanzo-rocm"
-version = "0.5.2"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0dbfef9cc690175e1da724aa4880e1500e02f63b65ce4fdc56961e091c6d4392"
+checksum = "0624bc473ddc39a1835b2c62de9ab7811c1cf7853382fa62e8f0f78359b7c3b5"
 dependencies = [
  "bindgen 0.71.1",
  "paste",
