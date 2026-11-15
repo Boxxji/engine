@@ -251,24 +251,46 @@ fn bench_tokenizer_pair(
         ));
         turns.push(conv.clone());
     }
-    let t_cold = Instant::now();
+    // Verify 20-turn PromptTokenCache parity against HF outside timed loops.
+    let mut parity_cache = PromptTokenCache::new(16);
     for p in &turns {
-        std::hint::black_box(fast_tok.encode_with_special_tokens(p, true)?);
-    }
-    let cold_20t_us = t_cold.elapsed().as_secs_f64() * 1_000_000.0;
-
-    let mut cache = PromptTokenCache::new(16);
-    let t_cached = Instant::now();
-    for p in &turns {
-        let got = fast_tok.encode_with_cache(p, true, &mut cache)?;
+        let got = fast_tok.encode_with_cache(p, true, &mut parity_cache)?;
         let exp = hf_tok.encode_fast(p.as_str(), true).unwrap();
         anyhow::ensure!(
             got.as_slice() == exp.get_ids(),
             "{label}: 20-turn PromptTokenCache parity mismatch"
         );
     }
-    let cached_20t_us = t_cached.elapsed().as_secs_f64() * 1_000_000.0;
-    let stats = cache.stats();
+
+    // Warmup cold path before measuring median 20-turn cold vs cached latency.
+    for p in &turns {
+        std::hint::black_box(fast_tok.encode_with_special_tokens(p, true)?);
+    }
+
+    let mut cold_samples = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let t_cold = Instant::now();
+        for p in &turns {
+            std::hint::black_box(fast_tok.encode_with_special_tokens(p, true)?);
+        }
+        cold_samples.push(t_cold.elapsed().as_secs_f64() * 1_000_000.0);
+    }
+    cold_samples.sort_by(f64::total_cmp);
+    let cold_20t_us = cold_samples[cold_samples.len() / 2];
+
+    let mut cached_samples = Vec::with_capacity(5);
+    let mut stats = parity_cache.stats();
+    for _ in 0..5 {
+        let mut cache = PromptTokenCache::new(16);
+        let t_cached = Instant::now();
+        for p in &turns {
+            std::hint::black_box(fast_tok.encode_with_cache(p, true, &mut cache)?);
+        }
+        cached_samples.push(t_cached.elapsed().as_secs_f64() * 1_000_000.0);
+        stats = cache.stats();
+    }
+    cached_samples.sort_by(f64::total_cmp);
+    let cached_20t_us = cached_samples[cached_samples.len() / 2];
 
     println!(
         "  tokenizer [{label:<20}]: hf={hf_p50:>8.1}us hanzo={hz_p50:>7.1}us ({:.2}x) | 20T cold={cold_20t_us:>7.1}us cached={cached_20t_us:>7.1}us (hits={} bypassed={})",
@@ -474,17 +496,30 @@ fn bench_vision() -> Result<Vec<VisionBenchRow>> {
             .flatten_all()?
             .to_vec1::<f32>()?;
         let fast_img = simd_resize_rgb(&img, 896, 896)?;
+        let ref_norm_on_fast = fast_img
+            .clone()
+            .apply(baseline_tf, &dev)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
         let fast_t = fast_tf
             .map(&fast_img, &dev)?
             .flatten_all()?
             .to_vec1::<f32>()?;
-        let max_diff = base_t
+        let max_diff = ref_norm_on_fast
             .iter()
             .zip(fast_t.iter())
             .fold(0.0f32, |acc, (a, b)| acc.max((a - b).abs()));
         anyhow::ensure!(
             max_diff < 1e-5,
-            "vision numerical drift too high on {label}: {max_diff}"
+            "vision normalization drift too high on {label}: {max_diff}"
+        );
+        let resize_diff = base_t
+            .iter()
+            .zip(fast_t.iter())
+            .fold(0.0f32, |acc, (a, b)| acc.max((a - b).abs()));
+        anyhow::ensure!(
+            resize_diff <= (1.0 / 127.5) + 1e-4,
+            "vision resize+norm drift exceeds 1 u8 LSB on {label}: {resize_diff}"
         );
 
         let iters = 8;

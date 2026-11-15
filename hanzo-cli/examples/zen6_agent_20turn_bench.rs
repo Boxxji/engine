@@ -25,9 +25,30 @@ use indexmap::IndexMap;
 use serde::Serialize;
 use tokio::sync::mpsc::channel;
 
-const MODEL_DIR: &str = "/data/models/zen6-source/4B-gguf";
-const MODEL_FILE: &str = "Ternary-Bonsai-2-4B-PQ2_0-MTP-Q8_0.gguf";
+const MODEL_DIR: &str = "/data/models/zen6-trained/4B";
+const MODEL_FILE: &str = "zen6-nano-4b-PQ2_0-MTP-Q8_0.gguf";
 const DEFAULT_OUT_JSON: &str = "zen6_20turn_results.json";
+
+fn resolve_model_path() -> Result<(PathBuf, String, String)> {
+    let model_path = match std::env::var("ZEN6_BENCH_MODEL") {
+        Ok(p) if !p.trim().is_empty() => PathBuf::from(p),
+        _ => PathBuf::from(MODEL_DIR).join(MODEL_FILE),
+    };
+    let parent = model_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .context("ZEN6_BENCH_MODEL must include a parent directory")?;
+    let file = model_path
+        .file_name()
+        .context("ZEN6_BENCH_MODEL must include a filename")?
+        .to_string_lossy()
+        .into_owned();
+    Ok((
+        model_path.clone(),
+        parent.to_string_lossy().into_owned(),
+        file,
+    ))
+}
 const MAX_SEQ_LEN: usize = 8192;
 const MAX_GEN_TOKENS: usize = 96;
 
@@ -155,12 +176,16 @@ fn developer_turn_prompts() -> Vec<String> {
     ]
 }
 
-async fn build_engine(spec: &BenchConfigSpec) -> Result<Arc<Hanzo>> {
+async fn build_engine(
+    spec: &BenchConfigSpec,
+    model_dir: &str,
+    model_file: &str,
+) -> Result<Arc<Hanzo>> {
     let mut builder = ServerBuilder::new()
         .with_model(ModelSelected::GGUF {
             tok_model_id: None,
-            quantized_model_id: MODEL_DIR.to_string(),
-            quantized_filename: MODEL_FILE.to_string(),
+            quantized_model_id: model_dir.to_string(),
+            quantized_filename: model_file.to_string(),
             dtype: ModelDType::Auto,
             topology: None,
             rope_yarn_factor: None,
@@ -322,9 +347,14 @@ struct TurnMetricsWithoutIndex {
     output_text: String,
 }
 
-async fn run_config(spec: &BenchConfigSpec, prompts: &[String]) -> Result<ConfigSummary> {
+async fn run_config(
+    spec: &BenchConfigSpec,
+    prompts: &[String],
+    model_dir: &str,
+    model_file: &str,
+) -> Result<ConfigSummary> {
     eprintln!("\n=== Building engine for `{}` ===", spec.name);
-    let hanzo = build_engine(spec).await?;
+    let hanzo = build_engine(spec, model_dir, model_file).await?;
 
     // Unrelated warmup request to warm CUDA kernels/allocators without seeding conversation KV prefix.
     let warmup_msgs = vec![
@@ -459,7 +489,7 @@ fn first_diff_char(a: &str, b: &str) -> Option<usize> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let model_path = PathBuf::from(MODEL_DIR).join(MODEL_FILE);
+    let (model_path, model_dir, model_file) = resolve_model_path()?;
     anyhow::ensure!(
         model_path.is_file(),
         "missing Zen6 model GGUF at {}",
@@ -521,7 +551,7 @@ async fn main() -> Result<()> {
     let mut outputs_by_cfg: HashMap<String, Vec<String>> = HashMap::new();
 
     for spec in &specs {
-        let summary = run_config(spec, &prompts).await?;
+        let summary = run_config(spec, &prompts, &model_dir, &model_file).await?;
         let texts: Vec<String> = summary
             .turns
             .iter()
