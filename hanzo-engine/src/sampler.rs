@@ -451,7 +451,7 @@ impl Sampler {
     }
 
     pub fn is_argmax(&self) -> bool {
-        self.temperature.is_none()
+        self.temperature.is_none() || self.top_k == 1
     }
 
     fn get_top_logprobs(&self, probs: &[f32]) -> Result<Vec<TopLogprob>> {
@@ -1921,5 +1921,22 @@ mod tests {
             .unwrap()
             .top_logprobs
             .is_none());
+    }
+
+    #[test]
+    fn top_k_one_with_temperature_is_argmax() {
+        use super::Sampler;
+
+        let top_k_one = Sampler::new(Some(1.0), 0, None, None, None, None, None, 1, 1.0, 0.0, vec![])
+            .unwrap();
+        assert!(top_k_one.is_argmax());
+
+        let top_k_two = Sampler::new(Some(1.0), 0, None, None, None, None, None, 2, 1.0, 0.0, vec![])
+            .unwrap();
+        assert!(!top_k_two.is_argmax());
+
+        let no_temp = Sampler::new(None, 0, None, None, None, None, None, -1, 1.0, 0.0, vec![])
+            .unwrap();
+        assert!(no_temp.is_argmax());
     }
 }

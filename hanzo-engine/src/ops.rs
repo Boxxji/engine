@@ -49,7 +49,7 @@ fn cuda_topk(input: &Tensor, k: usize) -> Result<TopKOutput> {
     *out_dims.last_mut().unwrap() = k;
     let out_elem_count = nrows as usize * k;
 
-    let (storage, _layout) = input.storage_and_layout();
+    let (storage, layout) = input.storage_and_layout();
     let storage = match &*storage {
         hanzo_ml::Storage::Cuda(s) => s,
         _ => hanzo_ml::bail!("cuda_topk requires CUDA tensor"),
@@ -59,13 +59,14 @@ fn cuda_topk(input: &Tensor, k: usize) -> Result<TopKOutput> {
     let stream = dev.cuda_stream();
     let stream_raw = stream.cu_stream() as i64;
 
-    let (src_ptr, _src_guard) = match &storage.slice {
+    let (src_ptr, src_guard) = match &storage.slice {
         CudaStorageSlice::BF16(inp) => inp.device_ptr(inp.stream()),
         CudaStorageSlice::F16(inp) => inp.device_ptr(inp.stream()),
         CudaStorageSlice::F32(inp) => inp.device_ptr(inp.stream()),
         _ => hanzo_ml::bail!("cuda_topk only supports BF16/F16/F32"),
     };
-    let src_ptr = src_ptr as *const c_void;
+    let byte_offset = layout.start_offset() * input.dtype().size_in_bytes();
+    let src_ptr = unsafe { (src_ptr as *const u8).add(byte_offset) as *const c_void };
 
     // Allocate both output buffers
     let mut indices_dst = unsafe { dev.alloc::<u32>(out_elem_count) }?;
@@ -259,6 +260,8 @@ fn cuda_topk(input: &Tensor, k: usize) -> Result<TopKOutput> {
         dt => hanzo_ml::bail!("cuda_topk unsupported dtype: {:?}", dt),
     };
 
+    drop(src_guard);
+
     Ok(TopKOutput {
         values: values_tensor,
         indices: indices_tensor,
@@ -429,7 +432,7 @@ pub fn cuda_topk_logits_f32(
         );
     }
 
-    let (storage, _layout) = input.storage_and_layout();
+    let (storage, layout) = input.storage_and_layout();
     let storage = match &*storage {
         hanzo_ml::Storage::Cuda(s) => s,
         _ => hanzo_ml::bail!("cuda_topk_logits_f32 requires CUDA tensor"),
@@ -439,10 +442,11 @@ pub fn cuda_topk_logits_f32(
     let stream = dev.cuda_stream();
     let stream_raw = stream.cu_stream() as i64;
 
-    let (src_ptr, _src_guard) = match &storage.slice {
+    let (src_ptr, src_guard) = match &storage.slice {
         CudaStorageSlice::F32(inp) => inp.device_ptr(inp.stream()),
         _ => hanzo_ml::bail!("cuda_topk_logits_f32 only supports F32"),
     };
+    let src_ptr = unsafe { (src_ptr as *const f32).add(layout.start_offset()) };
 
     let workspace_elems = nblocks * k;
     let mut block_values = unsafe { dev.alloc::<f32>(workspace_elems) }?;
@@ -463,7 +467,7 @@ pub fn cuda_topk_logits_f32(
 
     unsafe {
         ffi::topk_large_f32(
-            src_ptr as *const f32,
+            src_ptr,
             block_values_ptr as *mut f32,
             block_indices_ptr as *mut u32,
             block_maxes_ptr as *mut f32,
@@ -480,6 +484,7 @@ pub fn cuda_topk_logits_f32(
         );
     }
 
+    drop(src_guard);
     drop(block_values_guard);
     drop(block_indices_guard);
     drop(block_maxes_guard);
@@ -594,7 +599,7 @@ pub fn cuda_topk_logits_f32_packed(
         );
     }
 
-    let (storage, _layout) = input.storage_and_layout();
+    let (storage, layout) = input.storage_and_layout();
     let storage = match &*storage {
         hanzo_ml::Storage::Cuda(s) => s,
         _ => hanzo_ml::bail!("cuda_topk_logits_f32_packed requires CUDA tensor"),
@@ -608,6 +613,7 @@ pub fn cuda_topk_logits_f32_packed(
         CudaStorageSlice::F32(inp) => inp.device_ptr(inp.stream()),
         _ => hanzo_ml::bail!("cuda_topk_logits_f32_packed only supports F32"),
     };
+    let src_ptr = unsafe { (src_ptr as *const f32).add(layout.start_offset()) };
 
     let workspace_elems = nblocks * k;
     let mut block_values = unsafe { dev.alloc::<f32>(workspace_elems) }?;
@@ -624,7 +630,7 @@ pub fn cuda_topk_logits_f32_packed(
 
     unsafe {
         ffi::topk_large_f32_packed(
-            src_ptr as *const f32,
+            src_ptr,
             block_values_ptr as *mut f32,
             block_indices_ptr as *mut u32,
             block_maxes_ptr as *mut f32,
@@ -735,7 +741,7 @@ pub fn cuda_top1_logits_f32_cached(
     }
     let nblocks = ncols.div_ceil(CHUNK_SIZE);
 
-    let (storage, _layout) = input.storage_and_layout();
+    let (storage, layout) = input.storage_and_layout();
     let storage = match &*storage {
         hanzo_ml::Storage::Cuda(s) => s,
         _ => hanzo_ml::bail!("cuda_top1_logits_f32_cached requires CUDA tensor"),
@@ -764,6 +770,7 @@ pub fn cuda_top1_logits_f32_cached(
         CudaStorageSlice::F32(inp) => inp.device_ptr(inp.stream()),
         _ => hanzo_ml::bail!("cuda_top1_logits_f32_cached only supports F32"),
     };
+    let src_ptr = unsafe { (src_ptr as *const f32).add(layout.start_offset()) };
 
     let workspace = cache
         .as_mut()
@@ -774,7 +781,7 @@ pub fn cuda_top1_logits_f32_cached(
 
     unsafe {
         ffi::top1_large_f32_packed(
-            src_ptr as *const f32,
+            src_ptr,
             block_values_ptr as *mut f32,
             block_indices_ptr as *mut u32,
             packed_ptr as *mut f32,
@@ -3885,6 +3892,74 @@ mod tests {
             ref_hv.to_dtype(DType::F32)?.to_vec2::<f32>()?,
             "F16 partial-chunk k=128 multiblock topk values mismatch"
         );
+
+        Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod cuda_offset_tests {
+    use super::*;
+    use hanzo_ml::{DType, Device, Tensor};
+
+    #[test]
+    fn cuda_sliced_row_topk_respects_start_offset() -> hanzo_ml::Result<()> {
+        let Ok(cuda) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        let nrows = 4usize;
+        let ncols = 4096usize;
+        let mut data = vec![-10.0f32; nrows * ncols];
+        for r in 0..nrows {
+            let peak = 100 + r * 777;
+            data[r * ncols + peak] = 20.0 + r as f32;
+            data[r * ncols + peak + 1] = 10.0 + r as f32;
+        }
+        let logits = Tensor::from_vec(data, (1, nrows, ncols), &Device::Cpu)?.to_device(&cuda)?;
+
+        let mut top1_cache = None;
+        for r in 0..nrows {
+            let expected_idx = (100 + r * 777) as u32;
+            let row_tensor = logits.narrow(1, r, 1)?.squeeze(0)?.squeeze(0)?;
+            assert_eq!(row_tensor.layout().start_offset(), r * ncols);
+
+            let top1 = cuda_top1_logits_f32_cached(&row_tensor, &mut top1_cache)?;
+            assert_eq!(
+                top1[1] as u32, expected_idx,
+                "cuda_top1_logits_f32_cached row {r} read wrong offset"
+            );
+
+            let packed_out = cuda_topk_logits_f32_packed(&row_tensor, 4, 1.0)?;
+            let packed = packed_out.packed.to_vec1::<f32>()?;
+            assert_eq!(
+                packed[packed_out.k] as u32, expected_idx,
+                "cuda_topk_logits_f32_packed row {r} read wrong offset"
+            );
+
+            let large_out = cuda_topk_logits_f32(&row_tensor, 4, 1.0)?;
+            let large_idxs = large_out.indices.to_vec1::<u32>()?;
+            assert_eq!(
+                large_idxs[0], expected_idx,
+                "cuda_topk_logits_f32 row {r} read wrong offset"
+            );
+
+            let topk_f32 = cuda_topk(&row_tensor, 4)?;
+            assert_eq!(
+                topk_f32.indices.to_vec1::<u32>()?[0],
+                expected_idx,
+                "cuda_topk f32 row {r} read wrong offset"
+            );
+
+            let logits_bf16 = logits.to_dtype(DType::BF16)?;
+            let sliced_bf16 = logits_bf16.narrow(1, r, 1)?.squeeze(0)?.squeeze(0)?;
+            assert_eq!(sliced_bf16.layout().start_offset(), r * ncols);
+            let topk_bf16 = cuda_topk(&sliced_bf16, 4)?;
+            assert_eq!(
+                topk_bf16.indices.to_vec1::<u32>()?[0],
+                expected_idx,
+                "cuda_topk bf16 row {r} read wrong offset"
+            );
+        }
 
         Ok(())
     }
