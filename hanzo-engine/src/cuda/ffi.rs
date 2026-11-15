@@ -461,6 +461,39 @@ extern "C" {
         k: i32,
         stream: i64,
     ) -> i32;
+    pub(crate) fn topk_multiblock_f32(
+        input: *const c_void,
+        stage1_vals: *mut c_void, // [nrows, num_chunks, k] as f32
+        stage1_idxs: *mut c_void, // [nrows, num_chunks, k] as u32
+        values_out: *mut c_void,
+        indices_out: *mut c_void,
+        nrows: i32,
+        ncols: i32,
+        k: i32,
+        stream: i64,
+    ) -> i32;
+    pub(crate) fn topk_multiblock_bf16(
+        input: *const c_void,
+        stage1_vals: *mut c_void,
+        stage1_idxs: *mut c_void,
+        values_out: *mut c_void,
+        indices_out: *mut c_void,
+        nrows: i32,
+        ncols: i32,
+        k: i32,
+        stream: i64,
+    ) -> i32;
+    pub(crate) fn topk_multiblock_f16(
+        input: *const c_void,
+        stage1_vals: *mut c_void,
+        stage1_idxs: *mut c_void,
+        values_out: *mut c_void,
+        indices_out: *mut c_void,
+        nrows: i32,
+        ncols: i32,
+        k: i32,
+        stream: i64,
+    ) -> i32;
 
     // exact/route.cu: the ported topkGating. Returns 0, 1 for an unsupported
     // expert count or score, 2 for a launch error.
@@ -611,6 +644,21 @@ extern "C" {
         beta: *const f32,
         state: *mut f32,
         output: *mut f32,
+        bh: i32,
+        seq_len: i32,
+        k_dim: i32,
+        v_dim: i32,
+        stream: i64,
+    );
+    pub(crate) fn gated_delta_rule_recurrence_with_trail(
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        g: *const f32,
+        beta: *const f32,
+        state: *mut f32,
+        output: *mut f32,
+        trail_states: *mut f32,
         bh: i32,
         seq_len: i32,
         k_dim: i32,

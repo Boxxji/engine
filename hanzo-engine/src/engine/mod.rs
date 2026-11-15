@@ -740,15 +740,18 @@ impl Engine {
                                             );
                                             if block_hashes.len() < num_prefix_blocks {
                                                 fallback_to_full_prompt = true;
-                                            } else if let Some(snapshots) = prefix_cacher
-                                                .get_paged_recurrent_prefix(
-                                                    &block_hashes[..num_prefix_blocks],
-                                                )
-                                                .filter(|snapshots| {
-                                                    snapshots.iter().all(|snapshot| {
-                                                        snapshot.seqlen_offset == cached_prefix_len
+                                            } else if let Some((matched_blocks, snapshots)) =
+                                                prefix_cacher
+                                                    .get_longest_paged_recurrent_prefix(
+                                                        &block_hashes[..num_prefix_blocks],
+                                                    )
+                                                    .filter(|(matched_blocks, snapshots)| {
+                                                        let expected_len =
+                                                            matched_blocks * block_size;
+                                                        snapshots.iter().all(|snapshot| {
+                                                            snapshot.seqlen_offset == expected_len
+                                                        })
                                                     })
-                                                })
                                             {
                                                 if let Err(e) = hybrid_cache
                                                     .restore_recurrent_state(slot_idx, &snapshots)
@@ -758,6 +761,34 @@ impl Engine {
                                                         seq.id()
                                                     );
                                                     fallback_to_full_prompt = true;
+                                                } else if matched_blocks < num_prefix_blocks {
+                                                    let matched_len = matched_blocks * block_size;
+                                                    let seq_id = *seq.id();
+                                                    let num_tokens = seq.get_toks().len();
+                                                    let mut kv_mgr =
+                                                        get_mut_arcmutex!(kv_cache_manager);
+                                                    kv_mgr.free(seq_id);
+                                                    let computed = kv_mgr.get_computed_blocks(
+                                                        &block_hashes[..matched_blocks],
+                                                        num_tokens,
+                                                    );
+                                                    let realloc_ok = kv_mgr
+                                                        .allocate_slots(
+                                                            seq_id,
+                                                            num_tokens,
+                                                            &computed.block_ids,
+                                                        )
+                                                        .is_some();
+                                                    drop(kv_mgr);
+                                                    if realloc_ok {
+                                                        seq.set_prefix_cache_len(
+                                                            computed
+                                                                .num_computed_tokens
+                                                                .min(matched_len),
+                                                        );
+                                                    } else {
+                                                        fallback_to_full_prompt = true;
+                                                    }
                                                 }
                                             } else {
                                                 tracing::warn!(

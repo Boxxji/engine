@@ -283,6 +283,11 @@ impl<'a> SpeculativeCacheAccess for PagedSpeculativeCacheAccess<'a> {
         let input = Tensor::from_vec(verify_tokens.to_vec(), (1, verify_len), device)?;
         let slot_mappings = Tensor::from_vec(slot_mappings, (1, verify_len), &cpu)?;
 
+        let block_tables_row0_cpu = block_tables.first().map(|r| std::sync::Arc::new(r.clone()));
+        let full_block_tables_row0_cpu = full_block_tables
+            .first()
+            .map(|r| std::sync::Arc::new(r.clone()));
+
         let max_block_table_len = block_tables.iter().map(Vec::len).max().unwrap_or(1).max(1);
         let block_tables = repeated_table_tensor(&block_tables, max_block_table_len, &cpu)?;
         let context_lens = Tensor::from_vec(context_lens, (verify_len,), &cpu)?;
@@ -348,6 +353,8 @@ impl<'a> SpeculativeCacheAccess for PagedSpeculativeCacheAccess<'a> {
                 query_lens: None,
                 cu_seqlens_q: None,
                 cu_seqlens_kv: None,
+                block_tables_row0_cpu,
+                full_block_tables_row0_cpu,
             }),
             flash_meta: FlashParams::empty(true),
         };

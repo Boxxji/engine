@@ -1315,11 +1315,29 @@ pub trait Pipeline:
                 } else {
                     None
                 };
+                let has_hybrid = self.has_hybrid_cache();
+                let pa_block_size = metadata.block_size.max(1);
                 let should_chunk = chunk_size.is_some_and(|chunk_size| {
                     input_seqs.iter().any(|seq| {
-                        seq.get_toks().len().saturating_sub(seq.prefix_cache_len()) > chunk_size
+                        let total = seq.get_toks().len();
+                        let prefix = seq.prefix_cache_len();
+                        let aligned = if has_hybrid && total > pa_block_size {
+                            (total.saturating_sub(1) / pa_block_size) * pa_block_size
+                        } else {
+                            total
+                        };
+                        total.saturating_sub(prefix) > chunk_size
+                            || (has_hybrid && prefix < aligned && aligned < total)
                     })
                 });
+                let originals_for_hybrid = if is_prompt && has_hybrid {
+                    input_seqs
+                        .iter()
+                        .map(|seq| seq.get_toks().to_vec())
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
                 let (logits, raw_out_logits, embedding_logits, mut exec_duration) = {
                     let inputs_iter = if let (Some(chunk_size), true) = (chunk_size, should_chunk) {
                         let originals = input_seqs
@@ -1349,9 +1367,22 @@ pub trait Pipeline:
                                 })
                                 .collect::<Vec<_>>();
 
+                            let mut next_ends = vec![0usize; input_seqs.len()];
                             for &seq_idx in &active_indices {
                                 let start = starts[seq_idx];
-                                let end = (start + chunk_size).min(total_lens[seq_idx]);
+                                let total = total_lens[seq_idx];
+                                let aligned = if has_hybrid && total > pa_block_size {
+                                    (total.saturating_sub(1) / pa_block_size) * pa_block_size
+                                } else {
+                                    total
+                                };
+                                let raw_end = (start + chunk_size).min(total);
+                                let end = if start < aligned && raw_end > aligned {
+                                    aligned
+                                } else {
+                                    raw_end
+                                };
+                                next_ends[seq_idx] = end;
                                 let seq = &mut input_seqs[seq_idx];
                                 seq.set_prefix_cache_len(start);
                                 seq.set_prefill_toks(originals[seq_idx].0[..end].to_vec());
@@ -1387,8 +1418,7 @@ pub trait Pipeline:
                             }
                             inputs.push(processed);
                             for &seq_idx in &active_indices {
-                                starts[seq_idx] =
-                                    (starts[seq_idx] + chunk_size).min(total_lens[seq_idx]);
+                                starts[seq_idx] = next_ends[seq_idx];
                             }
                         }
                         for (seq, (tokens, prefix_len)) in
@@ -1432,6 +1462,48 @@ pub trait Pipeline:
                         let raw_logits = self.forward_inputs(inputs, return_raw_logits)?;
                         let end = Instant::now();
                         exec_duration += end.duration_since(start);
+
+                        if is_prompt && has_hybrid {
+                            let hybrid_cache = self.cache().hybrid();
+                            for &seq_idx in &seq_indices {
+                                let seq = &input_seqs[seq_idx];
+                                let Some(slot_idx) = seq.recurrent_state_idx() else {
+                                    continue;
+                                };
+                                let Some(seq_len) = hybrid_cache.recurrent_offset(slot_idx) else {
+                                    continue;
+                                };
+                                let Some(orig_toks) = originals_for_hybrid.get(seq_idx) else {
+                                    continue;
+                                };
+                                if seq_len == 0
+                                    || seq_len % pa_block_size != 0
+                                    || seq_len > orig_toks.len()
+                                {
+                                    continue;
+                                }
+                                if let Ok(snapshots) =
+                                    hybrid_cache.snapshot_recurrent_state(slot_idx)
+                                {
+                                    if !snapshots.is_empty() {
+                                        let num_blocks = seq_len / pa_block_size;
+                                        let block_hashes =
+                                            crate::paged_attention::block_hash::compute_block_hashes(
+                                                orig_toks,
+                                                pa_block_size,
+                                                seq.mm_features(),
+                                                &[],
+                                            );
+                                        if block_hashes.len() >= num_blocks {
+                                            prefix_cacher.add_paged_recurrent_prefix(
+                                                block_hashes[..num_blocks].to_vec(),
+                                                snapshots,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
 
                         for (logit_idx, seq_idx) in seq_indices.into_iter().enumerate() {
                             if let ForwardInputsResult::RawLogits { logits } = &raw_logits {

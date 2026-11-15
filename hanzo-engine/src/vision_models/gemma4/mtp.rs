@@ -1003,6 +1003,8 @@ fn make_mtp_decode_metadata(
         query_lens: None,
         cu_seqlens_q: None,
         cu_seqlens_kv: None,
+        block_tables_row0_cpu: None,
+        full_block_tables_row0_cpu: None,
     })
 }
 

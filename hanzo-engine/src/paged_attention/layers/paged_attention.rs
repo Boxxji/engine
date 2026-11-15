@@ -304,6 +304,7 @@ fn try_paged_lsa(
     k_scale: Option<&Tensor>,
     v_scale: Option<&Tensor>,
     block_tables: &Tensor,
+    block_tables_row0_cpu: Option<&[usize]>,
     kv_len: usize,
     allow_tail_close: bool,
     attention_mask: &AttentionMask,
@@ -328,38 +329,47 @@ fn try_paged_lsa(
 
     let block_size = cache_block_size(key_cache, value_cache)?;
     let needed_blocks = kv_len.div_ceil(block_size);
-    let max_bt_cols = block_tables.dim(1)?;
-    let take_cols = needed_blocks.min(max_bt_cols);
-    if take_cols == 0 {
-        return Ok(None);
-    }
-    let bt_row_tensor = block_tables
-        .narrow(0, 0, 1)?
-        .narrow(1, 0, take_cols)?
-        .to_device(&Device::Cpu)?;
-    let bt_vec: Vec<i32> = match bt_row_tensor.dtype() {
-        DType::I32 => bt_row_tensor.flatten_all()?.to_vec1::<i32>()?,
-        DType::U32 => bt_row_tensor
-            .flatten_all()?
-            .to_vec1::<u32>()?
-            .into_iter()
-            .map(|v| v as i32)
-            .collect(),
-        other => hanzo_ml::bail!("unexpected block_tables dtype {other:?}"),
+    let bt_owned: Vec<usize>;
+    let bt_usize: &[usize] = if let Some(row0) = block_tables_row0_cpu {
+        if needed_blocks == 0 || row0.is_empty() {
+            return Ok(None);
+        }
+        let take_cols = needed_blocks.min(row0.len());
+        &row0[..take_cols]
+    } else {
+        let max_bt_cols = block_tables.dim(1)?;
+        let take_cols = needed_blocks.min(max_bt_cols);
+        if take_cols == 0 {
+            return Ok(None);
+        }
+        let bt_row_tensor = block_tables
+            .narrow(0, 0, 1)?
+            .narrow(1, 0, take_cols)?
+            .to_device(&Device::Cpu)?;
+        let bt_vec: Vec<i32> = match bt_row_tensor.dtype() {
+            DType::I32 => bt_row_tensor.flatten_all()?.to_vec1::<i32>()?,
+            DType::U32 => bt_row_tensor
+                .flatten_all()?
+                .to_vec1::<u32>()?
+                .into_iter()
+                .map(|v| v as i32)
+                .collect(),
+            other => hanzo_ml::bail!("unexpected block_tables dtype {other:?}"),
+        };
+        bt_owned = bt_vec.iter().map(|&v| v as usize).collect();
+        &bt_owned
     };
-    let bt_usize: Vec<usize> = bt_vec.iter().map(|&v| v as usize).collect();
 
     let dev = query_4d.device();
     let dtype = query_4d.dtype();
     let q_offset = kv_len.saturating_sub(seq_len);
-    let bt_dtype = block_tables.dtype();
 
     let out = crate::attention::paged_lsa_sdpa(
         query_4d,
         &crate::attention::PagedKvGather {
             key_cache,
             block_size,
-            block_table: &bt_usize,
+            block_table: bt_usize,
             kv_len,
             q_offset,
             allow_tail_close,
@@ -367,17 +377,12 @@ fn try_paged_lsa(
         |start_tok, end_tok| {
             let gather_start = (start_tok / block_size) * block_size;
             let first_blk = gather_start / block_size;
-            let last_blk = end_tok.div_ceil(block_size).min(bt_vec.len());
+            let last_blk = end_tok.div_ceil(block_size).min(bt_usize.len());
             let gather_len = end_tok - gather_start;
-            let slice_i32 = &bt_vec[first_blk..last_blk];
-            let bt_slice = match bt_dtype {
-                DType::I32 => Tensor::from_slice(slice_i32, (1, slice_i32.len()), dev)?,
-                DType::U32 => {
-                    let slice_u32: Vec<u32> = slice_i32.iter().map(|&v| v as u32).collect();
-                    Tensor::from_slice(&slice_u32, (1, slice_u32.len()), dev)?
-                }
-                other => hanzo_ml::bail!("unexpected block_tables dtype {other:?}"),
-            };
+            let bt_slice = block_tables
+                .narrow(0, 0, 1)?
+                .narrow(1, first_blk, last_blk - first_blk)?
+                .contiguous()?;
             let cu_kv = Tensor::from_slice(&[0u32, gather_len as u32], (2,), dev)?;
             let (k_g, v_g) = gather_kv_cache_for_layout(
                 key_cache,
@@ -610,6 +615,15 @@ impl PagedAttention {
             };
 
             if kv_lens.len() == 1 && crate::attention::LsaConfig::global().is_some() {
+                let bt_row0_cpu = if use_full {
+                    input_metadata
+                        .full_block_tables_row0_cpu
+                        .as_deref()
+                        .or(input_metadata.block_tables_row0_cpu.as_deref())
+                } else {
+                    input_metadata.block_tables_row0_cpu.as_deref()
+                }
+                .map(Vec::as_slice);
                 if let Some(att) = try_paged_lsa(
                     query,
                     key_cache.as_ref().unwrap(),
@@ -617,6 +631,7 @@ impl PagedAttention {
                     self.k_scale.as_ref(),
                     self.v_scale.as_ref(),
                     block_tables,
+                    bt_row0_cpu,
                     kv_lens[0],
                     seq_len == 1 || seq_len > 64,
                     attention_mask,
@@ -783,6 +798,15 @@ impl PagedAttention {
                             } else {
                                 input_metadata.max_context_len.unwrap_or(seq_len)
                             };
+                            let bt_row0_cpu = if use_full {
+                                input_metadata
+                                    .full_block_tables_row0_cpu
+                                    .as_deref()
+                                    .or(input_metadata.block_tables_row0_cpu.as_deref())
+                            } else {
+                                input_metadata.block_tables_row0_cpu.as_deref()
+                            }
+                            .map(Vec::as_slice);
                             if let Some(att) = try_paged_lsa(
                                 query,
                                 &kc,
@@ -790,6 +814,7 @@ impl PagedAttention {
                                 self.k_scale.as_ref(),
                                 self.v_scale.as_ref(),
                                 bt,
+                                bt_row0_cpu,
                                 kv_len,
                                 true,
                                 attention_mask,
@@ -943,6 +968,15 @@ impl PagedAttention {
             ) {
                 let kv_len =
                     resolve_decode_kv_len(input_metadata, use_full, resolve_context_lens(&dev));
+                let bt_row0_cpu = if use_full {
+                    input_metadata
+                        .full_block_tables_row0_cpu
+                        .as_deref()
+                        .or(input_metadata.block_tables_row0_cpu.as_deref())
+                } else {
+                    input_metadata.block_tables_row0_cpu.as_deref()
+                }
+                .map(Vec::as_slice);
                 if let Some(att) = try_paged_lsa(
                     query_4d,
                     kc,
@@ -950,6 +984,7 @@ impl PagedAttention {
                     self.k_scale.as_ref(),
                     self.v_scale.as_ref(),
                     bt,
+                    bt_row0_cpu,
                     kv_len,
                     seq_len == 1 || seq_len > 64,
                     attention_mask,
@@ -1247,6 +1282,7 @@ mod tests {
             None,
             None,
             &bt,
+            None,
             8192,
             true,
             &AttentionMask::None,

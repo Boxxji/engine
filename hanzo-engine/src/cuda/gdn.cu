@@ -23,19 +23,21 @@
 // ============================================================================
 
 // Optimized kernel: BK known at compile time -> registers + full unrolling
-template <int BK, int BV>
+template <int BK, int BV, bool SAVE_TRAIL>
 __global__ void gated_delta_rule_recurrence_kernel_tiled(
-    const float *__restrict__ q,    // [BH, S, K]
-    const float *__restrict__ k,    // [BH, S, K]
-    const float *__restrict__ v,    // [BH, S, V]
-    const float *__restrict__ g,    // [BH, S]
-    const float *__restrict__ beta, // [BH, S]
-    float *__restrict__ state,      // [BH, K, V]
-    float *__restrict__ output,     // [BH, S, V]
+    const float *__restrict__ q,            // [BH, S, K]
+    const float *__restrict__ k,            // [BH, S, K]
+    const float *__restrict__ v,            // [BH, S, V]
+    const float *__restrict__ g,            // [BH, S]
+    const float *__restrict__ beta,         // [BH, S]
+    float *__restrict__ state,              // [BH, K, V]
+    float *__restrict__ output,             // [BH, S, V]
+    float *__restrict__ trail_states,       // [S, BH, K, V] if SAVE_TRAIL
     int seq_len, int v_dim) {
 
   const int v_tile = blockIdx.x;       // which V-tile
   const int bh = blockIdx.y;           // batch*head index
+  const int total_bh = gridDim.y;      // total batch*head count
   const int tid = threadIdx.x;         // thread within tile [0, BV)
   const int v_idx = v_tile * BV + tid; // global V index
 
@@ -104,6 +106,13 @@ __global__ void gated_delta_rule_recurrence_kernel_tiled(
     }
 
     out_bh[t * v_dim + v_idx] = y_t;
+    if constexpr (SAVE_TRAIL) {
+      float *trail_bh = trail_states + ((size_t)t * total_bh + bh) * BK * v_dim;
+#pragma unroll
+      for (int j = 0; j < BK; j++) {
+        trail_bh[j * v_dim + v_idx] = s[j];
+      }
+    }
 
     __syncthreads();
   }
@@ -116,15 +125,17 @@ __global__ void gated_delta_rule_recurrence_kernel_tiled(
 }
 
 // Fallback kernel: runtime k_dim, still V-tiled for occupancy
-template <int BV, int MAX_K>
+template <int BV, int MAX_K, bool SAVE_TRAIL>
 __global__ void gated_delta_rule_recurrence_kernel_fallback(
     const float *__restrict__ q, const float *__restrict__ k,
     const float *__restrict__ v, const float *__restrict__ g,
     const float *__restrict__ beta, float *__restrict__ state,
-    float *__restrict__ output, int seq_len, int k_dim, int v_dim) {
+    float *__restrict__ output, float *__restrict__ trail_states,
+    int seq_len, int k_dim, int v_dim) {
 
   const int v_tile = blockIdx.x;
   const int bh = blockIdx.y;
+  const int total_bh = gridDim.y;
   const int tid = threadIdx.x;
   const int v_idx = v_tile * BV + tid;
 
@@ -178,6 +189,13 @@ __global__ void gated_delta_rule_recurrence_kernel_fallback(
     }
 
     out_bh[t * v_dim + v_idx] = y_t;
+    if constexpr (SAVE_TRAIL) {
+      float *trail_bh =
+          trail_states + ((size_t)t * total_bh + bh) * k_dim * v_dim;
+      for (int j = 0; j < k_dim; j++) {
+        trail_bh[j * v_dim + v_idx] = s[j];
+      }
+    }
 
     __syncthreads();
   }
@@ -187,44 +205,59 @@ __global__ void gated_delta_rule_recurrence_kernel_fallback(
   }
 }
 
+template <bool SAVE_TRAIL>
+static void launch_gated_delta_rule_recurrence(
+    const float *q, const float *k, const float *v, const float *g,
+    const float *beta, float *state, float *output, float *trail_states, int bh,
+    int seq_len, int k_dim, int v_dim, int64_t stream) {
+  const cudaStream_t custream = (cudaStream_t)stream;
+
+  if (k_dim == 128) {
+    constexpr int BK = 128;
+    constexpr int BV = 64;
+    dim3 grid((v_dim + BV - 1) / BV, bh);
+    dim3 block(BV);
+    gated_delta_rule_recurrence_kernel_tiled<BK, BV, SAVE_TRAIL>
+        <<<grid, block, 0, custream>>>(q, k, v, g, beta, state, output,
+                                       trail_states, seq_len, v_dim);
+  } else if (k_dim == 64) {
+    constexpr int BK = 64;
+    constexpr int BV = 64;
+    dim3 grid((v_dim + BV - 1) / BV, bh);
+    dim3 block(BV);
+    gated_delta_rule_recurrence_kernel_tiled<BK, BV, SAVE_TRAIL>
+        <<<grid, block, 0, custream>>>(q, k, v, g, beta, state, output,
+                                       trail_states, seq_len, v_dim);
+  } else {
+    constexpr int BV = 64;
+    constexpr int MAX_K = 256;
+    dim3 grid((v_dim + BV - 1) / BV, bh);
+    dim3 block(BV);
+    size_t smem = 2 * k_dim * sizeof(float);
+    gated_delta_rule_recurrence_kernel_fallback<BV, MAX_K, SAVE_TRAIL>
+        <<<grid, block, smem, custream>>>(q, k, v, g, beta, state, output,
+                                          trail_states, seq_len, k_dim, v_dim);
+  }
+}
+
 extern "C" void gated_delta_rule_recurrence(const float *q, const float *k,
                                             const float *v, const float *g,
                                             const float *beta, float *state,
                                             float *output, int bh, int seq_len,
                                             int k_dim, int v_dim,
                                             int64_t stream) {
+  launch_gated_delta_rule_recurrence<false>(
+      q, k, v, g, beta, state, output, nullptr, bh, seq_len, k_dim, v_dim,
+      stream);
+}
 
-  const cudaStream_t custream = (cudaStream_t)stream;
-
-  if (k_dim == 128) {
-    // Fast path for Qwen3-Next (k_dim=128)
-    constexpr int BK = 128;
-    constexpr int BV = 64;
-    dim3 grid((v_dim + BV - 1) / BV, bh);
-    dim3 block(BV);
-    gated_delta_rule_recurrence_kernel_tiled<BK, BV>
-        <<<grid, block, 0, custream>>>(q, k, v, g, beta, state, output, seq_len,
-                                       v_dim);
-  } else if (k_dim == 64) {
-    // Fast path for models with k_dim=64
-    constexpr int BK = 64;
-    constexpr int BV = 64;
-    dim3 grid((v_dim + BV - 1) / BV, bh);
-    dim3 block(BV);
-    gated_delta_rule_recurrence_kernel_tiled<BK, BV>
-        <<<grid, block, 0, custream>>>(q, k, v, g, beta, state, output, seq_len,
-                                       v_dim);
-  } else {
-    // Fallback for other k_dim values (runtime loop, still V-tiled)
-    constexpr int BV = 64;
-    constexpr int MAX_K = 256;
-    dim3 grid((v_dim + BV - 1) / BV, bh);
-    dim3 block(BV);
-    size_t smem = 2 * k_dim * sizeof(float);
-    gated_delta_rule_recurrence_kernel_fallback<BV, MAX_K>
-        <<<grid, block, smem, custream>>>(q, k, v, g, beta, state, output,
-                                          seq_len, k_dim, v_dim);
-  }
+extern "C" void gated_delta_rule_recurrence_with_trail(
+    const float *q, const float *k, const float *v, const float *g,
+    const float *beta, float *state, float *output, float *trail_states, int bh,
+    int seq_len, int k_dim, int v_dim, int64_t stream) {
+  launch_gated_delta_rule_recurrence<true>(
+      q, k, v, g, beta, state, output, trail_states, bh, seq_len, k_dim, v_dim,
+      stream);
 }
 
 // ============================================================================

@@ -71,21 +71,52 @@ fn cuda_topk(input: &Tensor, k: usize) -> Result<TopKOutput> {
     let mut indices_dst = unsafe { dev.alloc::<u32>(out_elem_count) }?;
     let (indices_ptr, indices_guard) = indices_dst.device_ptr_mut(&stream);
 
+    // For wide vocabulary-scale rows (4K..=256K cols, small batch, k <= 128), split across
+    // multi-block 4096-col chunks so Stage 1 saturates all SMs with register-held values.
+    let use_multiblock = (4096..=262_144).contains(&ncols) && k <= 128 && nrows > 0 && nrows <= 128;
+    let num_chunks = ncols.div_ceil(4096);
+    let mut mb_scratch = if use_multiblock {
+        let s1_count = (nrows as usize) * num_chunks * k;
+        let s1_vals = unsafe { dev.alloc::<f32>(s1_count) }?;
+        let s1_idxs = unsafe { dev.alloc::<u32>(s1_count) }?;
+        Some((s1_vals, s1_idxs))
+    } else {
+        None
+    };
+
     let (values_tensor, indices_tensor) = match input.dtype() {
         DType::BF16 => {
             let mut values_dst = unsafe { dev.alloc::<half::bf16>(out_elem_count) }?;
             let (values_ptr, values_guard) = values_dst.device_ptr_mut(&stream);
 
-            let err = unsafe {
-                ffi::topk_bf16(
-                    src_ptr,
-                    values_ptr as *mut c_void,
-                    indices_ptr as *mut c_void,
-                    nrows,
-                    ncols_i32,
-                    k_i32,
-                    stream_raw,
-                )
+            let err = if let Some((ref mut s1_vals, ref mut s1_idxs)) = mb_scratch {
+                let (s1v_ptr, _s1v_g) = s1_vals.device_ptr_mut(&stream);
+                let (s1i_ptr, _s1i_g) = s1_idxs.device_ptr_mut(&stream);
+                unsafe {
+                    ffi::topk_multiblock_bf16(
+                        src_ptr,
+                        s1v_ptr as *mut c_void,
+                        s1i_ptr as *mut c_void,
+                        values_ptr as *mut c_void,
+                        indices_ptr as *mut c_void,
+                        nrows,
+                        ncols_i32,
+                        k_i32,
+                        stream_raw,
+                    )
+                }
+            } else {
+                unsafe {
+                    ffi::topk_bf16(
+                        src_ptr,
+                        values_ptr as *mut c_void,
+                        indices_ptr as *mut c_void,
+                        nrows,
+                        ncols_i32,
+                        k_i32,
+                        stream_raw,
+                    )
+                }
             };
             topk_launched(err, dims, k)?;
 
@@ -115,16 +146,34 @@ fn cuda_topk(input: &Tensor, k: usize) -> Result<TopKOutput> {
             let mut values_dst = unsafe { dev.alloc::<half::f16>(out_elem_count) }?;
             let (values_ptr, values_guard) = values_dst.device_ptr_mut(&stream);
 
-            let err = unsafe {
-                ffi::topk_f16(
-                    src_ptr,
-                    values_ptr as *mut c_void,
-                    indices_ptr as *mut c_void,
-                    nrows,
-                    ncols_i32,
-                    k_i32,
-                    stream_raw,
-                )
+            let err = if let Some((ref mut s1_vals, ref mut s1_idxs)) = mb_scratch {
+                let (s1v_ptr, _s1v_g) = s1_vals.device_ptr_mut(&stream);
+                let (s1i_ptr, _s1i_g) = s1_idxs.device_ptr_mut(&stream);
+                unsafe {
+                    ffi::topk_multiblock_f16(
+                        src_ptr,
+                        s1v_ptr as *mut c_void,
+                        s1i_ptr as *mut c_void,
+                        values_ptr as *mut c_void,
+                        indices_ptr as *mut c_void,
+                        nrows,
+                        ncols_i32,
+                        k_i32,
+                        stream_raw,
+                    )
+                }
+            } else {
+                unsafe {
+                    ffi::topk_f16(
+                        src_ptr,
+                        values_ptr as *mut c_void,
+                        indices_ptr as *mut c_void,
+                        nrows,
+                        ncols_i32,
+                        k_i32,
+                        stream_raw,
+                    )
+                }
             };
             topk_launched(err, dims, k)?;
 
@@ -154,16 +203,34 @@ fn cuda_topk(input: &Tensor, k: usize) -> Result<TopKOutput> {
             let mut values_dst = unsafe { dev.alloc::<f32>(out_elem_count) }?;
             let (values_ptr, values_guard) = values_dst.device_ptr_mut(&stream);
 
-            let err = unsafe {
-                ffi::topk_f32(
-                    src_ptr,
-                    values_ptr as *mut c_void,
-                    indices_ptr as *mut c_void,
-                    nrows,
-                    ncols_i32,
-                    k_i32,
-                    stream_raw,
-                )
+            let err = if let Some((ref mut s1_vals, ref mut s1_idxs)) = mb_scratch {
+                let (s1v_ptr, _s1v_g) = s1_vals.device_ptr_mut(&stream);
+                let (s1i_ptr, _s1i_g) = s1_idxs.device_ptr_mut(&stream);
+                unsafe {
+                    ffi::topk_multiblock_f32(
+                        src_ptr,
+                        s1v_ptr as *mut c_void,
+                        s1i_ptr as *mut c_void,
+                        values_ptr as *mut c_void,
+                        indices_ptr as *mut c_void,
+                        nrows,
+                        ncols_i32,
+                        k_i32,
+                        stream_raw,
+                    )
+                }
+            } else {
+                unsafe {
+                    ffi::topk_f32(
+                        src_ptr,
+                        values_ptr as *mut c_void,
+                        indices_ptr as *mut c_void,
+                        nrows,
+                        ncols_i32,
+                        k_i32,
+                        stream_raw,
+                    )
+                }
             };
             topk_launched(err, dims, k)?;
 
@@ -3674,6 +3741,149 @@ mod tests {
         assert_eq!(
             repeat_interleaved.to_vec1::<f64>()?,
             vec![1., 2., 2., 3., 3., 3., 4., 4., 4., 4.]
+        );
+
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_topk_multiblock_matches_cpu() -> hanzo_ml::Result<()> {
+        use crate::ops::{TopKLastDimOp, TopKOutput};
+        use hanzo_ml::{DType, Device, Tensor};
+
+        let Ok(cuda) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        let nrows = 4usize;
+        let ncols = 32_768usize;
+        let k = 32usize;
+        let mut data = vec![0f32; nrows * ncols];
+        for r in 0..nrows {
+            for c in 0..ncols {
+                // Deterministic pattern spanning chunks + exact ties near top.
+                let v = ((c * 37 + r * 101) % 997) as f32 * 0.25 - 120.0;
+                data[r * ncols + c] = v;
+            }
+            // Inject planted ties across separate 4096-col chunks.
+            data[r * ncols + 5] = 900.0;
+            data[r * ncols + 4101] = 900.0;
+            data[r * ncols + 16390] = 950.0;
+            data[r * ncols + 28675] = 925.0;
+        }
+
+        let cpu_f32 = Tensor::from_vec(data, (nrows, ncols), &Device::Cpu)?;
+        let TopKOutput {
+            values: ref_v,
+            indices: ref_i,
+        } = cpu_f32.topk(k)?;
+        let gpu_f32 = cpu_f32.to_device(&cuda)?;
+        let TopKOutput {
+            values: gpu_v,
+            indices: gpu_i,
+        } = gpu_f32.topk(k)?;
+        assert_eq!(
+            gpu_i.to_vec2::<u32>()?,
+            ref_i.to_vec2::<u32>()?,
+            "F32 multiblock topk indices mismatch"
+        );
+        assert_eq!(
+            gpu_v.to_vec2::<f32>()?,
+            ref_v.to_vec2::<f32>()?,
+            "F32 multiblock topk values mismatch"
+        );
+
+        // Also test BF16 at DFlash vocab scale (248,320 cols).
+        let ncols_big = 248_320usize;
+        let nrows_big = 3usize;
+        let mut big = vec![0f32; nrows_big * ncols_big];
+        for r in 0..nrows_big {
+            for c in 0..ncols_big {
+                big[r * ncols_big + c] = ((c * 13 + r * 71) % 251) as f32 - 125.0;
+            }
+            big[r * ncols_big + 123] = 512.0;
+            big[r * ncols_big + 123_456] = 512.0;
+            big[r * ncols_big + 240_000] = 1024.0;
+        }
+        let cpu_bf16 =
+            Tensor::from_vec(big, (nrows_big, ncols_big), &Device::Cpu)?.to_dtype(DType::BF16)?;
+        let TopKOutput {
+            values: ref_bv,
+            indices: ref_bi,
+        } = cpu_bf16.topk(k)?;
+        let gpu_bf16 = cpu_bf16.to_device(&cuda)?;
+        let TopKOutput {
+            values: gpu_bv,
+            indices: gpu_bi,
+        } = gpu_bf16.topk(k)?;
+        assert_eq!(
+            gpu_bi.to_vec2::<u32>()?,
+            ref_bi.to_vec2::<u32>()?,
+            "BF16 248K multiblock topk indices mismatch"
+        );
+        assert_eq!(
+            gpu_bv.to_dtype(DType::F32)?.to_vec2::<f32>()?,
+            ref_bv.to_dtype(DType::F32)?.to_vec2::<f32>()?,
+            "BF16 248K multiblock topk values mismatch"
+        );
+
+        // Partial trailing chunk, non-power-of-two ncols, max multiblock k=128, ties, and -inf.
+        let ncols_odd = 10_003usize;
+        let nrows_odd = 2usize;
+        let k_max = 128usize;
+        let mut odd = vec![0f32; nrows_odd * ncols_odd];
+        for r in 0..nrows_odd {
+            for c in 0..ncols_odd {
+                odd[r * ncols_odd + c] = if c % 97 == 0 {
+                    f32::NEG_INFINITY
+                } else {
+                    ((c * 19 + r * 53) % 1031) as f32 * 0.5 - 250.0
+                };
+            }
+            odd[r * ncols_odd + 4095] = 777.0;
+            odd[r * ncols_odd + 4096] = 777.0;
+            odd[r * ncols_odd + ncols_odd - 1] = 888.0;
+        }
+        let cpu_odd = Tensor::from_vec(odd, (nrows_odd, ncols_odd), &Device::Cpu)?;
+        let TopKOutput {
+            values: ref_ov,
+            indices: ref_oi,
+        } = cpu_odd.topk(k_max)?;
+        let gpu_odd = cpu_odd.to_device(&cuda)?;
+        let TopKOutput {
+            values: gpu_ov,
+            indices: gpu_oi,
+        } = gpu_odd.topk(k_max)?;
+        assert_eq!(
+            gpu_oi.to_vec2::<u32>()?,
+            ref_oi.to_vec2::<u32>()?,
+            "F32 partial-chunk k=128 multiblock topk indices mismatch"
+        );
+        assert_eq!(
+            gpu_ov.to_vec2::<f32>()?,
+            ref_ov.to_vec2::<f32>()?,
+            "F32 partial-chunk k=128 multiblock topk values mismatch"
+        );
+
+        let cpu_f16 = cpu_odd.to_dtype(DType::F16)?;
+        let TopKOutput {
+            values: ref_hv,
+            indices: ref_hi,
+        } = cpu_f16.topk(k_max)?;
+        let gpu_f16 = cpu_f16.to_device(&cuda)?;
+        let TopKOutput {
+            values: gpu_hv,
+            indices: gpu_hi,
+        } = gpu_f16.topk(k_max)?;
+        assert_eq!(
+            gpu_hi.to_vec2::<u32>()?,
+            ref_hi.to_vec2::<u32>()?,
+            "F16 partial-chunk k=128 multiblock topk indices mismatch"
+        );
+        assert_eq!(
+            gpu_hv.to_dtype(DType::F32)?.to_vec2::<f32>()?,
+            ref_hv.to_dtype(DType::F32)?.to_vec2::<f32>()?,
+            "F16 partial-chunk k=128 multiblock topk values mismatch"
         );
 
         Ok(())

@@ -501,6 +501,8 @@ impl CudaDecodeGraphMetadataBuffers {
             query_lens: metadata.query_lens.clone(),
             cu_seqlens_q: metadata.cu_seqlens_q.clone(),
             cu_seqlens_kv: metadata.cu_seqlens_kv.clone(),
+            block_tables_row0_cpu: metadata.block_tables_row0_cpu.clone(),
+            full_block_tables_row0_cpu: metadata.full_block_tables_row0_cpu.clone(),
         }
     }
 }

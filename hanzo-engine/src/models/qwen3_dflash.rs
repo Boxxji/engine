@@ -49,7 +49,9 @@ use hanzo_ml::{DType, Device, Module, Result, Shape, Tensor, D};
 use hanzo_nn::Linear;
 use hanzo_quant::{ShardedSafeTensors, ShardedVarBuilder};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::layers::{linear_no_bias, RmsNorm, RotaryEmbedding, Yarn};
 use crate::speculative::{
@@ -495,51 +497,190 @@ impl CandidateSelector {
         anchor_token: u32,
         temperature: f64,
     ) -> Result<(Vec<u32>, Tensor)> {
+        let (tokens, maybe_rows) =
+            self.walk_inner(hidden, logits, anchor_token, temperature, true)?;
+        let rows = maybe_rows.ok_or_else(|| {
+            hanzo_ml::Error::msg("selector.walk internal error: missing proposal logits")
+        })?;
+        Ok((tokens, rows))
+    }
+
+    fn walk_inner(
+        &self,
+        hidden: &Tensor,
+        logits: &Tensor,
+        anchor_token: u32,
+        temperature: f64,
+        need_logits: bool,
+    ) -> Result<(Vec<u32>, Option<Tensor>)> {
         let device = hidden.device().clone();
         let (slots, vocab) = logits.dims2()?;
         let top_k = self.top_k.min(vocab);
+        if slots == 0 {
+            let empty = if need_logits {
+                Some(Tensor::zeros((0, vocab), DType::F32, &device)?)
+            } else {
+                None
+            };
+            return Ok((Vec::new(), empty));
+        }
 
-        // The walk is host code over each slot's candidates, so the candidates come from a host
-        // partial select over the logit rows; nothing on the device sorts a vocabulary-wide row.
-        let rows_h = logits
-            .contiguous()?
-            .to_dtype(DType::F32)?
-            .to_vec2::<f32>()?;
-        let (candidates, unary): (Vec<Vec<u32>>, Vec<Vec<f32>>) =
-            rows_h.iter().map(|row| top_k_of(row, top_k)).unzip();
-        let gate_hidden = self.hidden_projection.forward(hidden)?; // [slots, rank]
-
-        let mut tokens = Vec::with_capacity(slots);
-        let mut rows = vec![f32::NEG_INFINITY; slots * vocab];
-        let mut previous = anchor_token;
-        for slot in 0..slots {
-            let previous_t = Tensor::from_vec(vec![previous], (1,), &device)?;
-            let gate = self
-                .predecessor_codebook
-                .index_select(&previous_t, 0)?
-                .mul(&gate_hidden.narrow(0, slot, 1)?)?; // [1, rank]
-            let ids_h = &candidates[slot];
-            if ids_h.is_empty() {
-                hanzo_ml::bail!("slot {slot} has no finite logit");
+        // On CUDA, run last-dim top-k on device so we only download [slots, top_k] (~4 KB)
+        // instead of the full [slots, vocab] (~15 MB) logit matrix.
+        let mut cuda_flat_ids: Option<Tensor> = None;
+        let (candidates, unary): (Vec<Vec<u32>>, Vec<Vec<f32>>) = if logits.device().is_cuda()
+            && matches!(logits.dtype(), DType::F32 | DType::BF16 | DType::F16)
+            && top_k > 0
+        {
+            let crate::ops::TopKOutput { values, indices } =
+                crate::ops::TopKLastDimOp::topk(&logits.contiguous()?, top_k)?;
+            let vals_h = values.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+            let ids_h = indices.to_vec2::<u32>()?;
+            let mut cands = Vec::with_capacity(slots);
+            let mut uns = Vec::with_capacity(slots);
+            let mut all_finite = true;
+            for s in 0..slots {
+                let mut sc = Vec::with_capacity(top_k);
+                let mut su = Vec::with_capacity(top_k);
+                for (&id, &v) in ids_h[s].iter().zip(vals_h[s].iter()) {
+                    if v.is_finite() {
+                        sc.push(id);
+                        su.push(v);
+                    } else {
+                        all_finite = false;
+                    }
+                }
+                cands.push(sc);
+                uns.push(su);
             }
-            let ids = Tensor::from_vec(ids_h.clone(), (ids_h.len(),), &device)?;
-            let successors = self.successor_codebook.index_select(&ids, 0)?; // [top_k, rank]
-            let pairwise = gate
-                .matmul(&successors.t()?.contiguous()?)?
+            if all_finite {
+                cuda_flat_ids = Some(indices.flatten_all()?);
+            }
+            (cands, uns)
+        } else {
+            let rows_h = logits
+                .contiguous()?
                 .to_dtype(DType::F32)?
                 .to_vec2::<f32>()?;
-            let scores: Vec<f32> = unary[slot]
-                .iter()
-                .zip(pairwise[0].iter())
-                .map(|(u, p)| u + p)
-                .collect();
-            for (i, &id) in candidates[slot].iter().enumerate() {
-                rows[slot * vocab + id as usize] = scores[i];
+            rows_h.iter().map(|row| top_k_of(row, top_k)).unzip()
+        };
+
+        let gate_hidden = self.hidden_projection.forward(hidden)?; // [slots, rank]
+        let rank = gate_hidden.dim(1)?;
+        let all_full = top_k > 0 && candidates.iter().all(|c| c.len() == top_k);
+        let weighted_succ = if all_full {
+            let flat_ids = match cuda_flat_ids {
+                Some(t) => t,
+                None => {
+                    let flat: Vec<u32> =
+                        candidates.iter().flat_map(|c| c.iter().copied()).collect();
+                    Tensor::from_vec(flat, (slots * top_k,), &device)?
+                }
+            };
+            let succ = self.successor_codebook.index_select(&flat_ids, 0)?; // [slots * top_k, rank]
+            Some(
+                succ.reshape((slots, top_k, rank))?
+                    .broadcast_mul(&gate_hidden.unsqueeze(1)?)?
+                    .transpose(1, 2)?
+                    .contiguous()?, // [slots, rank, top_k]
+            )
+        } else {
+            None
+        };
+
+        let mut tokens = Vec::with_capacity(slots);
+        let mut rows = if need_logits {
+            vec![f32::NEG_INFINITY; slots * vocab]
+        } else {
+            Vec::new()
+        };
+
+        let total_ws = slots.saturating_mul(rank).saturating_mul(top_k);
+        if let Some(ws) = weighted_succ.as_ref().filter(|_| total_ws <= 2_000_000) {
+            let mut pred_ids = Vec::with_capacity(1 + (slots - 1) * top_k);
+            pred_ids.push(anchor_token);
+            for slot in 0..slots - 1 {
+                pred_ids.extend_from_slice(&candidates[slot]);
             }
-            previous = candidates[slot][select_candidate(&scores, temperature)];
-            tokens.push(previous);
+            let pred_t = Tensor::from_vec(pred_ids, (1 + (slots - 1) * top_k,), &device)?;
+            let pred_vecs = self
+                .predecessor_codebook
+                .index_select(&pred_t, 0)?
+                .to_dtype(DType::F32)?
+                .to_vec2::<f32>()?;
+            let ws_flat = ws.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+
+            let mut prev_cand_idx = 0usize;
+            for slot in 0..slots {
+                let ids_h = &candidates[slot];
+                let prev_vec = if slot == 0 {
+                    &pred_vecs[0]
+                } else {
+                    &pred_vecs[1 + (slot - 1) * top_k + prev_cand_idx]
+                };
+                let ws_slot = &ws_flat[slot * rank * top_k..(slot + 1) * rank * top_k];
+                let mut scores = unary[slot].clone();
+                for (r, &pv) in prev_vec.iter().enumerate() {
+                    let row_w = &ws_slot[r * top_k..(r + 1) * top_k];
+                    for (s, &w) in scores.iter_mut().zip(row_w.iter()) {
+                        *s += pv * w;
+                    }
+                }
+                if need_logits {
+                    for (i, &id) in ids_h.iter().enumerate() {
+                        rows[slot * vocab + id as usize] = scores[i];
+                    }
+                }
+                prev_cand_idx = select_candidate(&scores, temperature);
+                tokens.push(ids_h[prev_cand_idx]);
+            }
+        } else {
+            let mut previous = anchor_token;
+            for slot in 0..slots {
+                let ids_h = &candidates[slot];
+                if ids_h.is_empty() {
+                    hanzo_ml::bail!("slot {slot} has no finite logit");
+                }
+                let prev_row = self
+                    .predecessor_codebook
+                    .narrow(0, previous as usize, 1)?
+                    .contiguous()?; // [1, rank]
+                let pairwise: Vec<f32> = if let Some(ref ws) = weighted_succ {
+                    let slot_ws = ws.narrow(0, slot, 1)?.squeeze(0)?; // [rank, top_k]
+                    prev_row
+                        .matmul(&slot_ws)?
+                        .to_dtype(DType::F32)?
+                        .squeeze(0)?
+                        .to_vec1::<f32>()?
+                } else {
+                    let gate = prev_row.mul(&gate_hidden.narrow(0, slot, 1)?)?;
+                    let ids = Tensor::from_vec(ids_h.clone(), (ids_h.len(),), &device)?;
+                    let successors = self.successor_codebook.index_select(&ids, 0)?;
+                    gate.matmul(&successors.t()?.contiguous()?)?
+                        .to_dtype(DType::F32)?
+                        .squeeze(0)?
+                        .to_vec1::<f32>()?
+                };
+                let scores: Vec<f32> = unary[slot]
+                    .iter()
+                    .zip(pairwise.iter())
+                    .map(|(u, p)| u + p)
+                    .collect();
+                if need_logits {
+                    for (i, &id) in ids_h.iter().enumerate() {
+                        rows[slot * vocab + id as usize] = scores[i];
+                    }
+                }
+                previous = ids_h[select_candidate(&scores, temperature)];
+                tokens.push(previous);
+            }
         }
-        Ok((tokens, Tensor::from_vec(rows, (slots, vocab), &device)?))
+        let proposal_logits = if need_logits {
+            Some(Tensor::from_vec(rows, (slots, vocab), &device)?)
+        } else {
+            None
+        };
+        Ok((tokens, proposal_logits))
     }
 }
 
@@ -592,6 +733,42 @@ impl DFlash2Layer {
     }
 }
 
+const DFLASH_CTX_TAIL_FLUSH: usize = 512;
+
+struct DFlashContextSegment {
+    start_pos: usize,
+    end_pos: usize,
+    layer_kv: Vec<(Tensor, Tensor)>,
+}
+
+struct DFlashContextCache {
+    trunk: Option<DFlashContextSegment>,
+    tail: Option<DFlashContextSegment>,
+    last_row_probe: Vec<f32>,
+}
+
+impl DFlashContextCache {
+    fn start_pos(&self) -> usize {
+        if let Some(ref trunk) = self.trunk {
+            trunk.start_pos
+        } else if let Some(ref tail) = self.tail {
+            tail.start_pos
+        } else {
+            0
+        }
+    }
+
+    fn end_pos(&self) -> usize {
+        if let Some(ref tail) = self.tail {
+            tail.end_pos
+        } else if let Some(ref trunk) = self.trunk {
+            trunk.end_pos
+        } else {
+            0
+        }
+    }
+}
+
 /// Native Qwen3 DFlash 2 draft model.
 pub struct Qwen3DFlash2 {
     fc: Linear,
@@ -603,6 +780,8 @@ pub struct Qwen3DFlash2 {
     cfg: DFlash2Config,
     device: Device,
     dtype: DType,
+    ctx_cache: std::sync::Mutex<Option<DFlashContextCache>>,
+    mask_cache: std::sync::Mutex<HashMap<(usize, usize, usize, Option<usize>), Tensor>>,
 }
 
 impl Qwen3DFlash2 {
@@ -669,6 +848,8 @@ impl Qwen3DFlash2 {
             cfg,
             device,
             dtype,
+            ctx_cache: std::sync::Mutex::new(None),
+            mask_cache: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -949,6 +1130,8 @@ impl Qwen3DFlash2 {
             cfg,
             device: device.clone(),
             dtype,
+            ctx_cache: std::sync::Mutex::new(None),
+            mask_cache: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -958,6 +1141,233 @@ impl Qwen3DFlash2 {
         (0..self.layers.len())
             .map(|layer| self.cfg.layer_window(layer))
             .try_fold(0usize, |widest, window| window.map(|w| widest.max(w)))
+    }
+
+    fn probe_row(
+        &self,
+        target_hiddens: &crate::speculative::HiddenWindow,
+        abs_pos: usize,
+    ) -> Result<Vec<f32>> {
+        let Some(first_layer) = target_hiddens.layers.first() else {
+            return Ok(Vec::new());
+        };
+        if abs_pos < target_hiddens.start {
+            return Ok(Vec::new());
+        }
+        let rel = abs_pos - target_hiddens.start;
+        let (rows, cols) = first_layer.dims2()?;
+        if rel >= rows {
+            return Ok(Vec::new());
+        }
+        first_layer
+            .narrow(0, rel, 1)?
+            .narrow(1, 0, cols.min(8))?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()
+    }
+
+    fn project_context_slice(
+        &self,
+        target_hiddens: &crate::speculative::HiddenWindow,
+        slice_start: usize,
+        slice_end: usize,
+    ) -> Result<Vec<(Tensor, Tensor)>> {
+        const CHUNK: usize = 2048;
+        let dev = &self.device;
+        let hd = self.cfg.head_dim;
+        let nkv = self.cfg.num_key_value_heads;
+        let eps = self.cfg.rms_norm_eps as f32;
+        let n_layers = self.layers.len();
+        let mut layer_ks: Vec<Vec<Tensor>> = vec![Vec::new(); n_layers];
+        let mut layer_vs: Vec<Vec<Tensor>> = vec![Vec::new(); n_layers];
+
+        let mut c_start = slice_start;
+        while c_start < slice_end {
+            let c_end = (c_start + CHUNK).min(slice_end);
+            let c_len = c_end - c_start;
+            let ctx_parts = target_hiddens
+                .rows(c_start, c_end)?
+                .iter()
+                .map(|t| t.to_device(dev)?.to_dtype(self.dtype))
+                .collect::<Result<Vec<_>>>()?;
+            let ctx_refs: Vec<&Tensor> = ctx_parts.iter().collect();
+            let ctx_cat = Tensor::cat(&ctx_refs, D::Minus1)?; // [c_len, num_fused * hidden]
+            let tctx = self.hidden_norm.forward(&self.fc.forward(&ctx_cat)?)?; // [c_len, hidden]
+            drop(ctx_cat);
+            drop(ctx_parts);
+
+            let pos: Vec<u32> = (c_start as u32..c_end as u32).collect();
+            let pos_t = Tensor::from_vec(pos, (c_len,), dev)?;
+            let (cos_ctx, sin_ctx) = self.rope_cos_sin(&pos_t)?;
+
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                let k_ctx = layer.k_proj.forward(&tctx)?.reshape((c_len, nkv, hd))?;
+                let k_ctx =
+                    hanzo_nn::ops::rms_norm(&k_ctx.contiguous()?, layer.k_norm.weight(), eps)?;
+                let k_ctx = k_ctx.transpose(0, 1)?.contiguous()?; // [nkv, c_len, hd]
+                let k_ctx = apply_rope(&k_ctx, &cos_ctx, &sin_ctx)?;
+
+                let v_ctx = layer
+                    .v_proj
+                    .forward(&tctx)?
+                    .reshape((c_len, nkv, hd))?
+                    .transpose(0, 1)?
+                    .contiguous()?; // [nkv, c_len, hd]
+                layer_ks[layer_idx].push(k_ctx);
+                layer_vs[layer_idx].push(v_ctx);
+            }
+            c_start = c_end;
+        }
+
+        let mut out = Vec::with_capacity(n_layers);
+        for (ks, vs) in layer_ks.into_iter().zip(layer_vs.into_iter()) {
+            let k_full = if ks.len() == 1 {
+                ks.into_iter().next().unwrap()
+            } else {
+                let refs: Vec<&Tensor> = ks.iter().collect();
+                Tensor::cat(&refs, 1)?
+            };
+            let v_full = if vs.len() == 1 {
+                vs.into_iter().next().unwrap()
+            } else {
+                let refs: Vec<&Tensor> = vs.iter().collect();
+                Tensor::cat(&refs, 1)?
+            };
+            out.push((k_full, v_full));
+        }
+        Ok(out)
+    }
+
+    fn resolve_context_kv(
+        &self,
+        target_hiddens: &crate::speculative::HiddenWindow,
+        ctx_start: usize,
+        ctx_end: usize,
+    ) -> Result<Vec<DFlashContextSegment>> {
+        let mut guard = self
+            .ctx_cache
+            .lock()
+            .map_err(|_| hanzo_ml::Error::msg("dflash ctx_cache lock poisoned"))?;
+        if ctx_end <= ctx_start {
+            *guard = None;
+            return Ok(Vec::new());
+        }
+
+        let clone_segments = |cache: &DFlashContextCache| -> Vec<DFlashContextSegment> {
+            let mut segs = Vec::with_capacity(2);
+            if let Some(ref trunk) = cache.trunk {
+                segs.push(DFlashContextSegment {
+                    start_pos: trunk.start_pos,
+                    end_pos: trunk.end_pos,
+                    layer_kv: trunk.layer_kv.clone(),
+                });
+            }
+            if let Some(ref tail) = cache.tail {
+                segs.push(DFlashContextSegment {
+                    start_pos: tail.start_pos,
+                    end_pos: tail.end_pos,
+                    layer_kv: tail.layer_kv.clone(),
+                });
+            }
+            segs
+        };
+
+        if let Some(cache) = guard.as_mut() {
+            let cached_start = cache.start_pos();
+            let cached_end = cache.end_pos();
+            let can_extend = cached_start <= ctx_start
+                && ctx_start <= cached_end
+                && cached_end <= ctx_end
+                && cached_end > 0
+                && self
+                    .probe_row(target_hiddens, cached_end - 1)
+                    .map(|p| p == cache.last_row_probe)
+                    .unwrap_or(false);
+            if can_extend {
+                if ctx_start > cached_start {
+                    if let Some(ref mut trunk) = cache.trunk {
+                        if ctx_start < trunk.end_pos {
+                            let trim = ctx_start - trunk.start_pos;
+                            let kept = trunk.end_pos - ctx_start;
+                            for (k_c, v_c) in &mut trunk.layer_kv {
+                                *k_c = k_c.narrow(1, trim, kept)?;
+                                *v_c = v_c.narrow(1, trim, kept)?;
+                            }
+                            trunk.start_pos = ctx_start;
+                        } else {
+                            cache.trunk = None;
+                        }
+                    }
+                    if let Some(ref mut tail) = cache.tail {
+                        if ctx_start > tail.start_pos && ctx_start < tail.end_pos {
+                            let trim = ctx_start - tail.start_pos;
+                            let kept = tail.end_pos - ctx_start;
+                            for (k_c, v_c) in &mut tail.layer_kv {
+                                *k_c = k_c.narrow(1, trim, kept)?;
+                                *v_c = v_c.narrow(1, trim, kept)?;
+                            }
+                            tail.start_pos = ctx_start;
+                        } else if ctx_start >= tail.end_pos {
+                            cache.tail = None;
+                        }
+                    }
+                }
+                if ctx_end > cached_end {
+                    let delta_kv =
+                        self.project_context_slice(target_hiddens, cached_end, ctx_end)?;
+                    match cache.tail.as_mut() {
+                        Some(tail) => {
+                            for ((k_c, v_c), (k_d, v_d)) in tail.layer_kv.iter_mut().zip(delta_kv) {
+                                *k_c = Tensor::cat(&[&*k_c, &k_d], 1)?;
+                                *v_c = Tensor::cat(&[&*v_c, &v_d], 1)?;
+                            }
+                            tail.end_pos = ctx_end;
+                        }
+                        None => {
+                            cache.tail = Some(DFlashContextSegment {
+                                start_pos: cached_end,
+                                end_pos: ctx_end,
+                                layer_kv: delta_kv,
+                            });
+                        }
+                    }
+                    cache.last_row_probe = self.probe_row(target_hiddens, ctx_end - 1)?;
+                    if cache
+                        .tail
+                        .as_ref()
+                        .is_some_and(|tail| tail.end_pos - tail.start_pos >= DFLASH_CTX_TAIL_FLUSH)
+                    {
+                        let tail = cache.tail.take().unwrap();
+                        if let Some(trunk) = cache.trunk.as_mut() {
+                            for ((k_c, v_c), (k_d, v_d)) in
+                                trunk.layer_kv.iter_mut().zip(tail.layer_kv)
+                            {
+                                *k_c = Tensor::cat(&[&*k_c, &k_d], 1)?;
+                                *v_c = Tensor::cat(&[&*v_c, &v_d], 1)?;
+                            }
+                            trunk.end_pos = tail.end_pos;
+                        } else {
+                            cache.trunk = Some(tail);
+                        }
+                    }
+                }
+                return Ok(clone_segments(cache));
+            }
+        }
+
+        let layer_kv = self.project_context_slice(target_hiddens, ctx_start, ctx_end)?;
+        let last_row_probe = self.probe_row(target_hiddens, ctx_end - 1)?;
+        *guard = Some(DFlashContextCache {
+            trunk: Some(DFlashContextSegment {
+                start_pos: ctx_start,
+                end_pos: ctx_end,
+                layer_kv,
+            }),
+            tail: None,
+            last_row_probe,
+        });
+        Ok(clone_segments(guard.as_ref().unwrap()))
     }
 
     /// Draft one block: `block_size - 1` tokens from one forward.
@@ -984,6 +1394,35 @@ impl Qwen3DFlash2 {
         lm_head: &TargetLmHead<'_>,
         temperature: f64,
     ) -> Result<(Tensor, Tensor)> {
+        let (tokens, maybe_logits) = self.draft_block_inner(
+            target_hiddens,
+            anchor_token,
+            anchor_pos,
+            embed,
+            lm_head,
+            temperature,
+            true,
+        )?;
+        let logits = maybe_logits.ok_or_else(|| {
+            hanzo_ml::Error::msg("draft_block internal error: missing proposal logits")
+        })?;
+        let tokens_t = Tensor::from_vec(tokens, (self.cfg.block_size() - 1,), &self.device)?;
+        Ok((tokens_t, logits))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draft_block_inner(
+        &self,
+        target_hiddens: &crate::speculative::HiddenWindow,
+        anchor_token: u32,
+        anchor_pos: usize,
+        embed: &TargetTokenEmbedder<'_>,
+        lm_head: &TargetLmHead<'_>,
+        temperature: f64,
+        need_logits: bool,
+    ) -> Result<(Vec<u32>, Option<Tensor>)> {
+        let prof = std::env::var_os("HANZO_DFLASH_PROFILE").is_some();
+        let t_total = Instant::now();
         let dev = &self.device;
         let bs = self.cfg.block_size();
 
@@ -1001,33 +1440,16 @@ impl Qwen3DFlash2 {
             )));
         }
 
-        // 1. Fuse: concat the selected target hiddens along the feature dim, project
-        //    through `fc`, normalise. This is the whole context the draft attends to.
-        //
-        //    Each layer's window bounds how far back a slot can see, so a context row older
-        //    than the widest window is masked for every query in every layer and contributes
-        //    exactly nothing. Dropping those rows before the fuse makes a draft cost
-        //    O(window) rather than O(context) — at a 100K-token prefix, the difference
-        //    between a draft and a second prefill. A full-attention layer sees everything,
-        //    and then nothing is dropped.
-        //
-        //    Rows at or past the anchor are never attended either, so the usable context is
-        //    `[ctx_start, ctx_end)` with `ctx_end` clamped to the anchor. Every fused layer
-        //    covers the same positions, so one range slices them all.
+        // 1. Resolve cached context K/V across draft rounds (only projecting newly accepted
+        //    delta tokens on rounds 2..N).
+        let t0 = Instant::now();
         let held = target_hiddens.start..target_hiddens.end()?;
         let std::ops::Range {
             start: ctx_start,
             end: ctx_end,
         } = context_range(self.reach(), held, anchor_pos);
-        let ctx_parts = target_hiddens
-            .rows(ctx_start, ctx_end)?
-            .iter()
-            .map(|t| t.to_device(dev)?.to_dtype(self.dtype))
-            .collect::<Result<Vec<_>>>()?;
-        let ctx_refs: Vec<&Tensor> = ctx_parts.iter().collect();
-        let ctx_cat = Tensor::cat(&ctx_refs, D::Minus1)?; // [ctx_len, num_fused * hidden]
-        let ctx_len = ctx_cat.dim(0)?;
-        let tctx = self.hidden_norm.forward(&self.fc.forward(&ctx_cat)?)?; // [ctx_len, hidden]
+        let ctx_kv = self.resolve_context_kv(target_hiddens, ctx_start, ctx_end)?;
+        let ms_ctx = t0.elapsed().as_secs_f64() * 1e3;
 
         // 2. Seed the block: [anchor, MASK, MASK, ...], embedded through the target.
         let mut ids = Vec::with_capacity(bs);
@@ -1039,44 +1461,98 @@ impl Qwen3DFlash2 {
         let ids_t = Tensor::from_vec(ids, (1, bs), dev)?;
         let mut hstate = as_2d(&embed(&ids_t)?)?.to_dtype(self.dtype)?; // [bs, hidden]
 
-        // 3. RoPE tables: draft positions for q, context+draft positions for k.
+        // 3. RoPE tables for the draft block positions.
         let draft_pos: Vec<u32> = (0..bs as u32).map(|i| anchor_pos as u32 + i).collect();
-        let mut full_pos: Vec<u32> = (ctx_start as u32..(ctx_start + ctx_len) as u32).collect();
-        full_pos.extend_from_slice(&draft_pos);
         let draft_pos_t = Tensor::from_vec(draft_pos, (bs,), dev)?;
-        let full_pos_t = Tensor::from_vec(full_pos, (ctx_len + bs,), dev)?;
         let (cos_draft, sin_draft) = self.rope_cos_sin(&draft_pos_t)?;
-        let (cos_full, sin_full) = self.rope_cos_sin(&full_pos_t)?;
 
-        // 4. One mask per distinct window. Every layer of the published checkpoint is
-        //    `sliding_attention` with the same width, so this builds exactly one and
-        //    the rest are refcount bumps.
-        let mut masks: Vec<Tensor> = Vec::with_capacity(self.layers.len());
-        for layer in 0..self.layers.len() {
-            let window = self.cfg.layer_window(layer);
-            let mask = match (0..layer).find(|&earlier| self.cfg.layer_window(earlier) == window) {
-                Some(earlier) => masks[earlier].clone(),
-                None => block_mask(
-                    ctx_start,
-                    ctx_len,
+        // 4. Per-layer window slicing and mask construction (memoized by window + cached).
+        let t_mask = Instant::now();
+        let mut masks: Vec<Option<Tensor>> = Vec::with_capacity(self.layers.len());
+        let mut layer_starts: Vec<usize> = Vec::with_capacity(self.layers.len());
+        for layer_idx in 0..self.layers.len() {
+            let window = self.cfg.layer_window(layer_idx);
+            let layer_ctx_start = match window {
+                Some(w) => anchor_pos
+                    .saturating_sub(w.saturating_sub(1))
+                    .max(ctx_start)
+                    .min(ctx_end),
+                None => ctx_start,
+            };
+            let layer_ctx_len = ctx_end.saturating_sub(layer_ctx_start);
+            layer_starts.push(layer_ctx_start);
+
+            let mask = if window.is_none() && ctx_end <= anchor_pos {
+                None
+            } else if let Some(earlier) = (0..layer_idx)
+                .find(|&e| self.cfg.layer_window(e) == window && layer_starts[e] == layer_ctx_start)
+            {
+                masks[earlier].clone()
+            } else if ctx_end <= anchor_pos {
+                let key = (anchor_pos - layer_ctx_start, layer_ctx_len, bs, window);
+                let mut guard = self
+                    .mask_cache
+                    .lock()
+                    .map_err(|_| hanzo_ml::Error::msg("dflash mask_cache lock poisoned"))?;
+                if let Some(cached) = guard.get(&key) {
+                    Some(cached.clone())
+                } else {
+                    let m = block_mask(
+                        layer_ctx_start,
+                        layer_ctx_len,
+                        bs,
+                        anchor_pos,
+                        window,
+                        &self.device,
+                        self.dtype,
+                    )?;
+                    if guard.len() >= 16 {
+                        guard.clear();
+                    }
+                    guard.insert(key, m.clone());
+                    Some(m)
+                }
+            } else {
+                Some(block_mask(
+                    layer_ctx_start,
+                    layer_ctx_len,
                     bs,
                     anchor_pos,
                     window,
                     &self.device,
                     self.dtype,
-                )?,
+                )?)
             };
             masks.push(mask);
         }
+        let ms_mask = t_mask.elapsed().as_secs_f64() * 1e3;
 
         // 5. Backbone. Each sublayer is convolved on the way in and on the way out,
         //    with the taps predicted once from the sublayer's input.
-        for (layer, mask) in self.layers.iter().zip(masks.iter()) {
+        let t_layers = Instant::now();
+        for (layer_idx, (layer, mask)) in self.layers.iter().zip(masks.iter()).enumerate() {
             let residual = hstate;
             let normed = layer.input_layernorm.forward(&residual)?;
             let (normed, attention_taps) = layer.attention_conv.prepare(&normed)?;
+            let need_start = layer_starts[layer_idx];
+            let mut layer_ctx_segs: Vec<(Tensor, Tensor)> = Vec::with_capacity(ctx_kv.len());
+            for seg in &ctx_kv {
+                let s0 = need_start.max(seg.start_pos);
+                let s1 = ctx_end.min(seg.end_pos);
+                if s1 > s0 {
+                    let (ref k_c, ref v_c) = seg.layer_kv[layer_idx];
+                    let off = s0 - seg.start_pos;
+                    let len = s1 - s0;
+                    layer_ctx_segs.push((k_c.narrow(1, off, len)?, v_c.narrow(1, off, len)?));
+                }
+            }
             let attn = self.attention(
-                layer, &normed, &tctx, &cos_draft, &sin_draft, &cos_full, &sin_full, mask,
+                layer,
+                &normed,
+                &layer_ctx_segs,
+                &cos_draft,
+                &sin_draft,
+                mask.as_ref(),
             )?;
             let attn = layer.attention_conv.finish(&attn, &attention_taps)?;
             hstate = residual.add(&attn)?;
@@ -1091,12 +1567,14 @@ impl Qwen3DFlash2 {
             hstate = residual.add(&mlp)?;
         }
         let hstate = self.norm.forward(&hstate)?; // [bs, hidden]
+        let ms_layers = t_layers.elapsed().as_secs_f64() * 1e3;
 
         // 6. Slot 0 carries the anchor and is never a prediction; decode the rest
         //    through the target's head.
+        let t_head = Instant::now();
         let predicted = hstate.narrow(0, 1, bs - 1)?.contiguous()?; // [bs - 1, hidden]
         let logits = lm_head(&predicted)?;
-        let logits = as_2d(&logits)?.to_dtype(DType::F32)?; // [bs - 1, vocab]
+        let logits = as_2d(&logits)?; // [bs - 1, vocab]
         let vocab = logits.dim(D::Minus1)?;
         if vocab > self.cfg.vocab_size {
             return Err(hanzo_ml::Error::msg(format!(
@@ -1104,36 +1582,51 @@ impl Qwen3DFlash2 {
                 self.cfg.vocab_size
             )));
         }
+        let ms_head = t_head.elapsed().as_secs_f64() * 1e3;
 
         // 7. Walk the selector for a block whose slots agree with each other.
-        let (tokens, proposal_logits) =
-            self.selector
-                .walk(&predicted, &logits, anchor_token, temperature)?;
+        let t_walk = Instant::now();
+        let (tokens, proposal_logits) = self.selector.walk_inner(
+            &predicted,
+            &logits,
+            anchor_token,
+            temperature,
+            need_logits,
+        )?;
+        let ms_walk = t_walk.elapsed().as_secs_f64() * 1e3;
+        if prof {
+            let ms_tot = t_total.elapsed().as_secs_f64() * 1e3;
+            eprintln!(
+                "[dflash-prof] ctx={} bs={} tot={:.2}ms (ctx_kv={:.2} mask={:.2} layers={:.2} head={:.2} walk={:.2})",
+                ctx_end - ctx_start,
+                bs,
+                ms_tot,
+                ms_ctx,
+                ms_mask,
+                ms_layers,
+                ms_head,
+                ms_walk
+            );
+        }
 
-        let tokens_t = Tensor::from_vec(tokens, (bs - 1,), dev)?;
-        Ok((tokens_t, proposal_logits))
+        Ok((tokens, proposal_logits))
     }
 
     // --- internals -------------------------------------------------------
 
     /// DFlash attention for one layer. `x`: block hidden `[bs, hidden]`;
-    /// `tctx`: fused context `[ctx_len, hidden]`. Queries are the block only;
-    /// keys/values span `[context ‖ block]`.
+    /// `ctx_kv`: cached `(k_ctx_roped, v_ctx)` segments of shape `[nkv, seg_len, hd]`.
     #[allow(clippy::too_many_arguments)]
     fn attention(
         &self,
         layer: &DFlash2Layer,
         x: &Tensor,
-        tctx: &Tensor,
+        ctx_kv: &[(Tensor, Tensor)],
         cos_draft: &Tensor,
         sin_draft: &Tensor,
-        cos_full: &Tensor,
-        sin_full: &Tensor,
-        mask: &Tensor,
+        mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let bs = x.dim(0)?;
-        let ctx_len = tctx.dim(0)?;
-        let kl = ctx_len + bs;
         let hd = self.cfg.head_dim;
         let nh = self.cfg.num_attention_heads;
         let nkv = self.cfg.num_key_value_heads;
@@ -1146,31 +1639,77 @@ impl Qwen3DFlash2 {
         let q = q.transpose(0, 1)?.contiguous()?; // [nh, bs, hd]
         let q = apply_rope(&q, cos_draft, sin_draft)?;
 
-        // Keys/values: [fused context ‖ block].
-        let k_ctx = layer.k_proj.forward(tctx)?;
-        let k_noise = layer.k_proj.forward(x)?;
-        let k = Tensor::cat(&[&k_ctx, &k_noise], 0)?.reshape((kl, nkv, hd))?;
-        let k = hanzo_nn::ops::rms_norm(&k.contiguous()?, layer.k_norm.weight(), eps)?;
-        let k = k.transpose(0, 1)?.contiguous()?; // [nkv, kl, hd]
-        let k = apply_rope(&k, cos_full, sin_full)?;
-        let k = repeat_kv(&k, nrep)?; // [nh, kl, hd]
+        // Keys/values: [cached context segments ‖ block].
+        let k_noise = layer.k_proj.forward(x)?.reshape((bs, nkv, hd))?;
+        let k_noise = hanzo_nn::ops::rms_norm(&k_noise.contiguous()?, layer.k_norm.weight(), eps)?;
+        let k_noise = k_noise.transpose(0, 1)?.contiguous()?; // [nkv, bs, hd]
+        let k_noise = apply_rope(&k_noise, cos_draft, sin_draft)?;
 
-        let v_ctx = layer.v_proj.forward(tctx)?;
-        let v_noise = layer.v_proj.forward(x)?;
-        let v = Tensor::cat(&[&v_ctx, &v_noise], 0)?
-            .reshape((kl, nkv, hd))?
+        let v_noise = layer
+            .v_proj
+            .forward(x)?
+            .reshape((bs, nkv, hd))?
             .transpose(0, 1)?
-            .contiguous()?; // [nkv, kl, hd]
-        let v = repeat_kv(&v, nrep)?; // [nh, kl, hd]
+            .contiguous()?; // [nkv, bs, hd]
 
+        // GQA-reshaped attention avoids concatenating full K/V context caches and avoids
+        // expanding KV heads `nrep`x with `repeat_kv`.
         let scale = 1.0 / (hd as f64).sqrt();
-        let scores = q
-            .matmul(&k.transpose(1, 2)?.contiguous()?)? // [nh, bs, kl]
-            .affine(scale, 0.0)?;
-        let scores = scores.broadcast_add(&mask.unsqueeze(0)?)?;
+        let q_gqa = q.reshape((nkv, nrep * bs, hd))?;
+        let s_noise = q_gqa.matmul(&k_noise.transpose(1, 2)?)?; // [nkv, nrep * bs, bs]
+        let mut s_parts: Vec<Tensor> = Vec::with_capacity(ctx_kv.len() + 1);
+        let mut ctx_len = 0usize;
+        for (k_ctx, _v_ctx) in ctx_kv {
+            let seg_len = k_ctx.dim(1)?;
+            if seg_len > 0 {
+                s_parts.push(q_gqa.matmul(&k_ctx.transpose(1, 2)?)?); // [nkv, nrep * bs, seg_len]
+                ctx_len += seg_len;
+            }
+        }
+        let scores = if ctx_len > 0 {
+            s_parts.push(s_noise);
+            let s_refs: Vec<&Tensor> = s_parts.iter().collect();
+            let s = Tensor::cat(&s_refs, 2)?;
+            s.reshape((nh, bs, ctx_len + bs))?.affine(scale, 0.0)?
+        } else {
+            s_noise.reshape((nh, bs, bs))?.affine(scale, 0.0)?
+        };
+        let scores = match mask {
+            Some(m) => scores.broadcast_add(&m.unsqueeze(0)?)?,
+            None => scores,
+        };
         let probs = hanzo_nn::ops::softmax_last_dim(&scores)?;
-        let out = probs.matmul(&v.contiguous()?)?; // [nh, bs, hd]
-        let out = out.transpose(0, 1)?.contiguous()?.reshape((bs, nh * hd))?;
+        let probs_gqa = probs.reshape((nkv, nrep * bs, ctx_len + bs))?;
+        let out_gqa = if ctx_len > 0 {
+            let mut acc: Option<Tensor> = None;
+            let mut offset = 0usize;
+            for (_k_ctx, v_ctx) in ctx_kv {
+                let seg_len = v_ctx.dim(1)?;
+                if seg_len == 0 {
+                    continue;
+                }
+                let p_seg = probs_gqa.narrow(2, offset, seg_len)?.contiguous()?;
+                let term = p_seg.matmul(v_ctx)?;
+                acc = Some(match acc {
+                    Some(prev) => prev.add(&term)?,
+                    None => term,
+                });
+                offset += seg_len;
+            }
+            let p_noise = probs_gqa.narrow(2, ctx_len, bs)?.contiguous()?;
+            let noise_term = p_noise.matmul(&v_noise)?;
+            match acc {
+                Some(prev) => prev.add(&noise_term)?,
+                None => noise_term,
+            }
+        } else {
+            probs_gqa.matmul(&v_noise)?
+        };
+        let out = out_gqa
+            .reshape((nh, bs, hd))?
+            .transpose(0, 1)?
+            .contiguous()?
+            .reshape((bs, nh * hd))?;
         layer.o_proj.forward(&out)
     }
 
@@ -1289,6 +1828,7 @@ fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
 }
 
 /// GQA key/value expansion (repeat_interleave): `[nkv, L, d]` → `[nkv*nrep, L, d]`.
+#[allow(dead_code)]
 fn repeat_kv(x: &Tensor, nrep: usize) -> Result<Tensor> {
     if nrep == 1 {
         return Ok(x.clone());
@@ -1662,11 +2202,15 @@ impl SpeculativeProposer for DFlash2Proposer {
         // Argmax walk. The proposal carries no distribution, so the verifier accepts a draft only
         // when its own sample matches it, which is exact at any temperature; the p/q ratio test
         // would need the drafts drawn from the logits.
-        let (tokens_t, _) =
-            self.draft
-                .draft_block(hiddens, anchor_token, anchor_pos, &embed, &lm_head, 0.0)?;
-
-        let tokens: Vec<u32> = tokens_t.to_vec1::<u32>()?;
+        let (tokens, _) = self.draft.draft_block_inner(
+            hiddens,
+            anchor_token,
+            anchor_pos,
+            &embed,
+            &lm_head,
+            0.0,
+            false,
+        )?;
         Ok(SpeculativeProposalBatch::new(vec![
             SpeculativeProposal::new(tokens),
         ]))
@@ -2154,6 +2698,198 @@ mod tests {
         assert_eq!(logits.dims(), &[2, vocab]);
         for row in logits.to_vec2::<f32>()? {
             assert!(row.iter().any(|v| v.is_finite()));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_dflash_selector_and_gqa_attention_parity() -> Result<()> {
+        let cuda_dev = Device::new_cuda(0)?;
+        let cpu_dev = Device::Cpu;
+        let (vocab, rank, hidden, slots, top_k) = (128usize, 8usize, 16usize, 4usize, 6usize);
+
+        let proj_w = Tensor::randn(0f32, 0.2f32, (rank, hidden), &cpu_dev)?;
+        let pred_cb = Tensor::randn(0f32, 0.2f32, (vocab, rank), &cpu_dev)?;
+        let succ_cb = Tensor::randn(0f32, 0.2f32, (vocab, rank), &cpu_dev)?;
+        let hidden_cpu = Tensor::randn(0f32, 0.5f32, (slots, hidden), &cpu_dev)?;
+        let logits_cpu = Tensor::randn(0f32, 2.0f32, (slots, vocab), &cpu_dev)?;
+
+        let sel_cpu = CandidateSelector {
+            hidden_projection: Linear::new(proj_w.clone(), None),
+            predecessor_codebook: pred_cb.clone(),
+            successor_codebook: succ_cb.clone(),
+            top_k,
+        };
+        let (cpu_tokens, cpu_rows) = sel_cpu.walk(&hidden_cpu, &logits_cpu, 7, 0.0)?;
+
+        let sel_cuda = CandidateSelector {
+            hidden_projection: Linear::new(proj_w.to_device(&cuda_dev)?, None),
+            predecessor_codebook: pred_cb.to_device(&cuda_dev)?,
+            successor_codebook: succ_cb.to_device(&cuda_dev)?,
+            top_k,
+        };
+        let hidden_cuda = hidden_cpu.to_device(&cuda_dev)?;
+        let logits_cuda = logits_cpu.to_device(&cuda_dev)?;
+        let (cuda_tokens, cuda_rows) = sel_cuda.walk(&hidden_cuda, &logits_cuda, 7, 0.0)?;
+        assert_eq!(cuda_tokens, cpu_tokens);
+
+        let (no_logit_tokens, no_logits) =
+            sel_cuda.walk_inner(&hidden_cuda, &logits_cuda, 7, 0.0, false)?;
+        assert_eq!(no_logit_tokens, cpu_tokens);
+        assert!(no_logits.is_none());
+
+        let cpu_v = cpu_rows.flatten_all()?.to_vec1::<f32>()?;
+        let cuda_v = cuda_rows
+            .to_device(&cpu_dev)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        for i in 0..cpu_v.len() {
+            if cpu_v[i].is_infinite() {
+                assert!(cuda_v[i].is_infinite() && cuda_v[i].is_sign_negative());
+            } else {
+                assert!(
+                    (cpu_v[i] - cuda_v[i]).abs() < 1e-4,
+                    "selector walk logit mismatch at {i}: {} vs {}",
+                    cpu_v[i],
+                    cuda_v[i]
+                );
+            }
+        }
+
+        // Compare GQA-reshaped DFlash2 attention (with narrowed ctx_kv) against repeat_kv reference.
+        let cfg: DFlash2Config = serde_json::from_str(
+            r#"{
+              "vocab_size": 128, "hidden_size": 16, "intermediate_size": 32,
+              "num_hidden_layers": 1, "num_attention_heads": 4, "num_key_value_heads": 1,
+              "head_dim": 4, "max_position_embeddings": 64, "rms_norm_eps": 1e-6,
+              "rope_parameters": {"rope_theta": 10000.0},
+              "dflash_config": {
+                "target_layer_ids": [0], "mask_token_id": 1, "block_size": 4,
+                "conv_group_size": 16, "conv_kernel_size": 2,
+                "selector_rank": 8, "selector_top_k": 6
+              }
+            }"#,
+        )
+        .map_err(|e| hanzo_ml::Error::msg(e.to_string()))?;
+        let make_lin = |out_d: usize, in_d: usize| -> Result<Linear> {
+            Ok(Linear::new(
+                Tensor::randn(0f32, 0.2f32, (out_d, in_d), &cuda_dev)?,
+                None,
+            ))
+        };
+        let make_conv = || -> Result<BlockConv> {
+            Ok(BlockConv {
+                base_kernel: Tensor::zeros((2, 2, 16), DType::F32, &cuda_dev)?,
+                kernel_projection: make_lin(4, 16)?,
+                kernel_size: 2,
+                group_size: 16,
+                groups: 1,
+            })
+        };
+        let layer = DFlash2Layer {
+            q_proj: make_lin(16, 16)?,
+            k_proj: make_lin(4, 16)?,
+            v_proj: make_lin(4, 16)?,
+            o_proj: make_lin(16, 16)?,
+            q_norm: RmsNorm::from_w(Tensor::ones(4, DType::F32, &cuda_dev)?, 1e-6)?,
+            k_norm: RmsNorm::from_w(Tensor::ones(4, DType::F32, &cuda_dev)?, 1e-6)?,
+            input_layernorm: RmsNorm::from_w(Tensor::ones(16, DType::F32, &cuda_dev)?, 1e-6)?,
+            post_attention_layernorm: RmsNorm::from_w(
+                Tensor::ones(16, DType::F32, &cuda_dev)?,
+                1e-6,
+            )?,
+            gate_proj: make_lin(32, 16)?,
+            up_proj: make_lin(32, 16)?,
+            down_proj: make_lin(16, 32)?,
+            attention_conv: make_conv()?,
+            mlp_conv: make_conv()?,
+        };
+        let model = Qwen3DFlash2 {
+            fc: make_lin(16, 16)?,
+            hidden_norm: RmsNorm::from_w(Tensor::ones(16, DType::F32, &cuda_dev)?, 1e-6)?,
+            layers: vec![layer],
+            norm: RmsNorm::from_w(Tensor::ones(16, DType::F32, &cuda_dev)?, 1e-6)?,
+            selector: sel_cuda,
+            rotary: RotaryEmbedding::new_yarn(1e4, 4, 64, None, &cuda_dev, true, DType::F32)?,
+            cfg,
+            device: cuda_dev.clone(),
+            dtype: DType::F32,
+            ctx_cache: std::sync::Mutex::new(None),
+            mask_cache: std::sync::Mutex::new(HashMap::new()),
+        };
+        let x = Tensor::randn(0f32, 0.3f32, (4, 16), &cuda_dev)?;
+        let k_big = Tensor::randn(0f32, 0.3f32, (1, 16, 4), &cuda_dev)?;
+        let v_big = Tensor::randn(0f32, 0.3f32, (1, 16, 4), &cuda_dev)?;
+        // Narrowed context slice (off = 6, len = 10) to verify strided cuBLAS handling.
+        let k_ctx = k_big.narrow(1, 6, 10)?;
+        let v_ctx = v_big.narrow(1, 6, 10)?;
+        let pos = Tensor::from_vec(vec![16u32, 17, 18, 19], (4,), &cuda_dev)?;
+        let (cos_d, sin_d) = model.rope_cos_sin(&pos)?;
+        let mask = block_mask(6, 10, 4, 16, Some(12), &cuda_dev, DType::F32)?;
+        let got = model.attention(
+            &model.layers[0],
+            &x,
+            &[(k_ctx.clone(), v_ctx.clone())],
+            &cos_d,
+            &sin_d,
+            Some(&mask),
+        )?;
+
+        // Explicit repeat_kv + Tensor::cat reference.
+        let l = &model.layers[0];
+        let q = apply_rope(
+            &hanzo_nn::ops::rms_norm(
+                &l.q_proj.forward(&x)?.reshape((4, 4, 4))?.contiguous()?,
+                l.q_norm.weight(),
+                1e-6,
+            )?
+            .transpose(0, 1)?
+            .contiguous()?,
+            &cos_d,
+            &sin_d,
+        )?;
+        let kn = apply_rope(
+            &hanzo_nn::ops::rms_norm(
+                &l.k_proj.forward(&x)?.reshape((4, 1, 4))?.contiguous()?,
+                l.k_norm.weight(),
+                1e-6,
+            )?
+            .transpose(0, 1)?
+            .contiguous()?,
+            &cos_d,
+            &sin_d,
+        )?;
+        let vn = l
+            .v_proj
+            .forward(&x)?
+            .reshape((4, 1, 4))?
+            .transpose(0, 1)?
+            .contiguous()?;
+        let k_cat = repeat_kv(&Tensor::cat(&[&k_ctx, &kn], 1)?, 4)?;
+        let v_cat = repeat_kv(&Tensor::cat(&[&v_ctx, &vn], 1)?, 4)?;
+        let ref_scores = q
+            .matmul(&k_cat.transpose(1, 2)?.contiguous()?)?
+            .affine(0.5, 0.0)?
+            .broadcast_add(&mask.unsqueeze(0)?)?;
+        let ref_probs = hanzo_nn::ops::softmax_last_dim(&ref_scores)?;
+        let ref_out = l.o_proj.forward(
+            &ref_probs
+                .matmul(&v_cat.contiguous()?)?
+                .transpose(0, 1)?
+                .contiguous()?
+                .reshape((4, 16))?,
+        )?;
+
+        let got_v = got.flatten_all()?.to_vec1::<f32>()?;
+        let ref_v = ref_out.flatten_all()?.to_vec1::<f32>()?;
+        for i in 0..got_v.len() {
+            assert!(
+                (got_v[i] - ref_v[i]).abs() < 1e-4,
+                "gqa attention mismatch at {i}: {} vs {}",
+                got_v[i],
+                ref_v[i]
+            );
         }
         Ok(())
     }
