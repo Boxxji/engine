@@ -144,6 +144,12 @@ pub trait SpeculativeProposer {
     /// long-running server doesn't leak. Default no-op: proposers that hold no per-seq state
     /// (e.g. MTP) need not implement it.
     fn retain_seqs(&mut self, _live: &[usize]) {}
+
+    /// True when the adaptive gate has stood down for `seq_id`, letting the target pause
+    /// hidden-state capture and re-enable single-token decode graphs.
+    fn is_paused_for_seq(&self, _seq_id: Option<usize>) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

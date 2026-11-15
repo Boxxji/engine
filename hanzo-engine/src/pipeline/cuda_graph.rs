@@ -508,6 +508,10 @@ impl CudaDecodeGraphMetadataBuffers {
 }
 
 pub(crate) fn cuda_decode_graphs_enabled() -> bool {
+    #[cfg(feature = "cuda")]
+    if hanzo_ml::quantized::cuda::cuda_profile_enabled() {
+        return false;
+    }
     crate::perf_flags::cuda_graphs_enabled()
 }
 
