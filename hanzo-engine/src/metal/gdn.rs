@@ -681,21 +681,22 @@ mod tests {
         (out, st.iter().map(|&x| x as f32).collect())
     }
 
-    fn inputs(
-        rng: &mut Lcg,
-        (bh, s, kd, vd): (usize, usize, usize, usize),
-    ) -> [Vec<f32>; 6] {
+    fn inputs(rng: &mut Lcg, (bh, s, kd, vd): (usize, usize, usize, usize)) -> [Vec<f32>; 6] {
         let mut k: Vec<f32> = (0..bh * s * kd).map(|_| rng.unit() - 0.5).collect();
         for row in k.chunks_mut(kd) {
             let n = row.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
             row.iter_mut().for_each(|x| *x /= n);
         }
         let scale = 1.0 / (kd as f32).sqrt();
-        let q = (0..bh * s * kd).map(|_| (rng.unit() - 0.5) * scale).collect();
+        let q = (0..bh * s * kd)
+            .map(|_| (rng.unit() - 0.5) * scale)
+            .collect();
         let v = (0..bh * s * vd).map(|_| rng.unit() * 2.0 - 1.0).collect();
         let g = (0..bh * s).map(|_| -(0.01 + 0.5 * rng.unit())).collect();
         let beta = (0..bh * s).map(|_| 0.1 + 0.8 * rng.unit()).collect();
-        let st = (0..bh * kd * vd).map(|_| (rng.unit() - 0.5) * 0.1).collect();
+        let st = (0..bh * kd * vd)
+            .map(|_| (rng.unit() - 0.5) * 0.1)
+            .collect();
         [q, k, v, g, beta, st]
     }
 
@@ -709,7 +710,8 @@ mod tests {
             let [q, k, v, g, beta, st] = inputs(&mut rng, dims);
             let (want_out, want_st) = reference(&q, &k, &v, &g, &beta, &st, dims);
             let (bh, s, kd, vd) = dims;
-            let t = |x: &Vec<f32>, shape: &[usize]| Tensor::from_vec(x.clone(), shape, &dev).unwrap();
+            let t =
+                |x: &Vec<f32>, shape: &[usize]| Tensor::from_vec(x.clone(), shape, &dev).unwrap();
             let mut state = t(&st, &[bh, kd, vd]);
             let out = chunked_gated_delta_rule_recurrence_metal(
                 &t(&q, &[bh, s, kd]),
@@ -723,7 +725,10 @@ mod tests {
             let got_out: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
             let got_st: Vec<f32> = state.flatten_all().unwrap().to_vec1().unwrap();
             let err = |a: &[f32], b: &[f32]| {
-                a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max)
+                a.iter()
+                    .zip(b)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0f32, f32::max)
             };
             let (eo, es) = (err(&got_out, &want_out), err(&got_st, &want_st));
             println!("seq={s:4}  max|out err|={eo:.2e}  max|state err|={es:.2e}");
