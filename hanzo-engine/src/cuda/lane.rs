@@ -153,7 +153,7 @@ pub(crate) mod tests {
 
     /// A CUDA device with cudarc event tracking off, as graph capture and Branch need.
     pub(crate) fn device() -> Device {
-        let dev = Device::new_cuda(0).unwrap();
+        let dev = Device::new_cuda_with_stream(0).unwrap();
         if let Device::Cuda(d) = &dev {
             unsafe { d.cuda_stream().context().disable_event_tracking() };
         }
@@ -246,6 +246,27 @@ pub(crate) mod tests {
     /// bitwise.
     #[test]
     fn gate_matches_reference() {
+        if !std::env::args().any(|a| a == "--exact")
+            && std::env::var_os("HANZO_CUDA_CAPTURE_ISOLATED").is_none()
+        {
+            let exe = std::env::current_exe().unwrap();
+            let out = std::process::Command::new(exe)
+                .env("HANZO_CUDA_CAPTURE_ISOLATED", "1")
+                .args([
+                    "--exact",
+                    "cuda::lane::tests::gate_matches_reference",
+                    "--nocapture",
+                ])
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "isolated gate_matches_reference failed:\n{stdout}\n{stderr}"
+            );
+            return;
+        }
         let dev = device();
         let main = Lane::new(stream(&dev)).unwrap();
         let side = Lane::new(stream(&dev).context().new_stream().unwrap()).unwrap();

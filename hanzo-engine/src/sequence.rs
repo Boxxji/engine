@@ -1187,6 +1187,63 @@ impl Sequence {
         (group.total_draft_toks, group.total_draft_accepted)
     }
 
+    /// Counts the start of a speculative verification round before tokens emit.
+    pub(crate) fn begin_speculative_round(&self) {
+        let mut group = get_mut_group!(self);
+        group.execution_trace.speculative_rounds += 1;
+    }
+
+    /// Counts one token emitted during speculative verification before completion logging can fire.
+    pub(crate) fn record_speculative_committed_token(&self) {
+        let mut group = get_mut_group!(self);
+        group.execution_trace.speculative_committed_tokens += 1;
+    }
+
+    /// Counts one plain single-token decode step (either unspeculated or post-stand-down).
+    pub(crate) fn record_plain_decode_step(&self) {
+        let mut group = get_mut_group!(self);
+        group.execution_trace.plain_decode_steps += 1;
+    }
+
+    /// Records the active speculative draft block size when it changes.
+    pub(crate) fn record_draft_block_size(&self, block_size: usize) {
+        if block_size == 0 {
+            return;
+        }
+        let mut group = get_mut_group!(self);
+        if group.execution_trace.draft_block_sizes.last() != Some(&block_size) {
+            group.execution_trace.draft_block_sizes.push(block_size);
+        }
+    }
+
+    /// Records the adaptive gate's stand-down reason for this request (first transition wins).
+    pub(crate) fn record_speculative_stand_down(&self, reason: &str) {
+        let mut group = get_mut_group!(self);
+        if group.execution_trace.stand_down_reason.is_none() {
+            group.execution_trace.stand_down_reason = Some(reason.to_string());
+        }
+    }
+
+    /// Attributes CUDA graph and LSA activity from the just-completed target forward to this group.
+    pub(crate) fn record_forward_step_telemetry(
+        &self,
+        telemetry: ForwardStepTelemetry,
+        lsa_active: bool,
+    ) {
+        let mut group = get_mut_group!(self);
+        let trace = &mut group.execution_trace;
+        trace.lsa_active |= lsa_active;
+        trace.cuda_decode_graph_captures += usize::from(telemetry.cuda_decode_graph_capture);
+        trace.cuda_decode_graph_replays += usize::from(telemetry.cuda_decode_graph_replay);
+        trace.cuda_prefill_graph_captures += usize::from(telemetry.cuda_prefill_graph_capture);
+        trace.cuda_prefill_graph_replays += usize::from(telemetry.cuda_prefill_graph_replay);
+    }
+
+    /// Snapshot of per-request execution telemetry accumulated on this sequence's group.
+    pub(crate) fn execution_trace(&self) -> RequestExecutionTrace {
+        get_mut_group!(self).execution_trace.clone()
+    }
+
     pub fn responder(&self) -> Sender<Response> {
         self.responder.clone()
     }
@@ -1643,6 +1700,53 @@ impl Sequence {
     pub fn set_tool_grammar_active(&mut self, active: bool) {
         self.tool_grammar_active = active;
     }
+
+    #[doc(hidden)]
+    pub fn record_error_terminal_trace(&self) {
+        self.update_time_info();
+        let (should_log, usage, trace) = {
+            let mut group = get_mut_group!(self);
+            let should_log = !std::mem::replace(&mut group.trace_logged, true);
+            (should_log, group.get_usage(), group.execution_trace.clone())
+        };
+        if should_log {
+            let structured = matches!(self.recognizer, SequenceRecognizer::Llguidance(_))
+                && !self.is_tool_grammar_active();
+            crate::engine::ledger::record_with_trace(
+                &usage,
+                None,
+                structured,
+                &trace,
+                *self.id(),
+                crate::engine::ledger::TerminalStatus::Error,
+            );
+        }
+    }
+}
+
+/// Per-forward telemetry captured by a pipeline for the just-completed `forward_inputs` call.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ForwardStepTelemetry {
+    pub cuda_decode_graph_capture: bool,
+    pub cuda_decode_graph_replay: bool,
+    pub cuda_prefill_graph_capture: bool,
+    pub cuda_prefill_graph_replay: bool,
+}
+
+/// Per-request execution telemetry recording adaptive speculation transitions,
+/// sparse attention engagement, and CUDA graph capture/replay counts.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RequestExecutionTrace {
+    pub lsa_active: bool,
+    pub speculative_rounds: usize,
+    pub speculative_committed_tokens: usize,
+    pub plain_decode_steps: usize,
+    pub draft_block_sizes: Vec<usize>,
+    pub stand_down_reason: Option<String>,
+    pub cuda_decode_graph_captures: usize,
+    pub cuda_decode_graph_replays: usize,
+    pub cuda_prefill_graph_captures: usize,
+    pub cuda_prefill_graph_replays: usize,
 }
 
 pub struct SequenceGroup {
@@ -1657,6 +1761,7 @@ pub struct SequenceGroup {
     pub total_prompt_time: u128,
     pub total_time: u128,
     pub total_completion_time: u128,
+    pub execution_trace: RequestExecutionTrace,
     choices: Vec<Choice>,
     image_choices: Vec<ImageChoice>,
     speech_pcms: Vec<(Arc<Vec<f32>>, usize, usize)>, // (pcm, rate, channels)
@@ -1674,6 +1779,7 @@ pub struct SequenceGroup {
     // latch permanently open and re-fire on every subsequent finish, and a chat
     // group refused with a model error sends nothing after it.
     done_sent: bool,
+    pub(crate) trace_logged: bool,
 }
 
 impl SequenceGroup {
@@ -1702,12 +1808,14 @@ impl SequenceGroup {
             total_prompt_time: 0,
             total_time: 0,
             total_completion_time: 0,
+            execution_trace: RequestExecutionTrace::default(),
             chat_streaming_chunks: Vec::new(),
             completion_streaming_chunks: Vec::new(),
             is_streaming,
             is_chat,
             best_of,
             done_sent: false,
+            trace_logged: false,
         }
     }
 

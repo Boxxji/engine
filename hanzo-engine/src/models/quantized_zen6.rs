@@ -1550,9 +1550,33 @@ pub(crate) mod tests {
 
     /// The loader's per-layer estimate is what loading the tiny model on CUDA allocates: the
     /// default mempool's used bytes after the load, less before, within allocator rounding.
+    /// Runs in a fresh subprocess because CUDA's default mempool is shared across all test threads
+    /// in the parent binary, which otherwise perturbs `after - before` during parallel `cargo test`.
     #[test]
     #[cfg(feature = "cuda")]
     fn loader_estimate_equals_allocation() -> Result<()> {
+        const ISOLATED_ENV: &str = "HANZO_ZEN6_MEMPOOL_ISOLATED";
+        if std::env::var_os(ISOLATED_ENV).is_none() {
+            let exe = std::env::current_exe().map_err(hanzo_ml::Error::msg)?;
+            let mod_suffix = module_path!()
+                .split_once("::")
+                .map_or(module_path!(), |(_, rest)| rest);
+            let test_name = format!("{mod_suffix}::loader_estimate_equals_allocation");
+            let out = std::process::Command::new(exe)
+                .env(ISOLATED_ENV, "1")
+                .args(["--exact", &test_name, "--nocapture"])
+                .output()
+                .map_err(hanzo_ml::Error::msg)?;
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "isolated {test_name} failed (status {:?}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                out.status.code()
+            );
+            return Ok(());
+        }
+
         use hanzo_ml::backend::BackendDevice;
         use hanzo_ml::cuda_backend::cudarc::driver::sys;
         let Ok(dev) = Device::new_cuda(0) else {

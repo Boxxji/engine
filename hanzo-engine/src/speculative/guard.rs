@@ -244,8 +244,9 @@ impl super::proposer::SpeculativeProposer for GuardedDraft {
             ]));
         }
         let mut cooled = false;
-        for &seq_id in ctx.seq_ids {
+        for (&seq_id, seq) in ctx.seq_ids.iter().zip(ctx.sequences.iter()) {
             if !self.guard.check_or_tick_cooldown(seq_id) {
+                seq.record_speculative_stand_down("adaptive_guard_cooldown");
                 cooled = true;
             }
         }

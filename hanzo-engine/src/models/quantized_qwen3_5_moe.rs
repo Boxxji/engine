@@ -3407,13 +3407,32 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn cuda_qwen35_stand_down_partial_rewind_kv_gdn_and_cuda_graph_parity() -> Result<()> {
+        if !std::env::args().any(|a| a == "--exact")
+            && std::env::var_os("HANZO_CUDA_CAPTURE_ISOLATED").is_none()
+        {
+            let exe = std::env::current_exe().map_err(hanzo_ml::Error::wrap)?;
+            let out = std::process::Command::new(exe)
+                .env("HANZO_CUDA_CAPTURE_ISOLATED", "1")
+                .args([
+                    "--exact",
+                    "models::quantized_qwen3_5_moe::tests::cuda_qwen35_stand_down_partial_rewind_kv_gdn_and_cuda_graph_parity",
+                    "--nocapture",
+                ])
+                .output()
+                .map_err(hanzo_ml::Error::wrap)?;
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "isolated cuda_qwen35 capture test failed:\n{stdout}\n{stderr}"
+            );
+            return Ok(());
+        }
         use crate::pipeline::cuda_graph::{
-            disable_event_tracking_for_capture, end_cuda_capture_discard,
-            restore_event_tracking_after_capture, CudaDecodeGraphMetadataBuffers, CudaGraphHandle,
+            capture_cuda_graph_with_output, CudaDecodeGraphMetadataBuffers,
         };
         use crate::utils::model_config::FromGGUF;
         use crate::DeviceMapSetting;
-        use hanzo_ml::cuda_backend::cudarc::driver::sys;
         use hanzo_ml::{IndexOp, Var};
 
         const Q_HIDDEN: usize = 64;
@@ -3429,7 +3448,10 @@ mod tests {
         const BLOCK_SIZE: usize = 16;
         const NUM_BLOCKS: usize = 4;
 
-        let dev = Device::new_cuda(0)?;
+        let dev = Device::new_cuda_with_stream(0)?;
+        if let Device::Cuda(d) = &dev {
+            unsafe { d.disable_event_tracking() };
+        }
         let conv_dim = 2 * Q_GDN_HEADS * Q_GDN_DIM + Q_GDN_HEADS * Q_GDN_DIM;
         let mut rng = StdRng::seed_from_u64(0x5157_3501);
         let mut specs: Vec<(String, Vec<usize>, Vec<f32>, GgmlDType)> = Vec::new();
@@ -3870,33 +3892,15 @@ mod tests {
                 CudaDecodeGraphMetadataBuffers::new(&step7_meta, &[7], BLOCK_SIZE)?;
             let graph_input_ids = graph_input_var.as_detached_tensor();
 
-            let stream = cuda_dev.cuda_stream();
-            let restore_ev = disable_event_tracking_for_capture(&stream);
-            stream
-                .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
-                .map_err(|e| hanzo_ml::Error::msg(e.to_string()))?;
-            let graph_logits = match spec_model.forward(
-                &graph_input_ids,
-                &[7],
-                vec![(0, 1)],
-                Some((spec_kv.clone(), &rebound_meta)),
-            ) {
-                Ok(l) => l,
-                Err(err) => {
-                    end_cuda_capture_discard(&stream);
-                    restore_event_tracking_after_capture(&stream, restore_ev);
-                    return Err(err);
-                }
-            };
-            let graph = match CudaGraphHandle::end_capture(&stream) {
-                Ok(Some(g)) => g,
-                other => {
-                    restore_event_tracking_after_capture(&stream, restore_ev);
-                    hanzo_ml::bail!("expected captured CUDA graph, got {:?}", other.err());
-                }
-            };
-            restore_event_tracking_after_capture(&stream, restore_ev);
-            graph.upload()?;
+            let (graph, graph_logits) =
+                capture_cuda_graph_with_output(&dev, &warmup_logits, || {
+                    spec_model.forward(
+                        &graph_input_ids,
+                        &[7],
+                        vec![(0, 1)],
+                        Some((spec_kv.clone(), &rebound_meta)),
+                    )
+                })?;
             (graph_input_var, meta_buffers, graph_logits, graph)
         };
 

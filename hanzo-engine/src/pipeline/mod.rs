@@ -896,6 +896,68 @@ fn announce_forward<P: Pipeline + ?Sized>(
     }
 }
 
+/// Lock-free single-forward telemetry bitmask set inside `forward_inputs` and consumed by
+/// `finish_forward_step` in `Pipeline::step`.
+#[derive(Debug, Default)]
+pub(crate) struct AtomicForwardStepTelemetry(std::sync::atomic::AtomicU8);
+
+impl AtomicForwardStepTelemetry {
+    const DECODE_CAPTURE: u8 = 1 << 0;
+    const DECODE_REPLAY: u8 = 1 << 1;
+    const PREFILL_CAPTURE: u8 = 1 << 2;
+    const PREFILL_REPLAY: u8 = 1 << 3;
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn record_decode_capture(&self) {
+        self.0
+            .fetch_or(Self::DECODE_CAPTURE, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn record_decode_replay(&self) {
+        self.0
+            .fetch_or(Self::DECODE_REPLAY, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn record_prefill_capture(&self) {
+        self.0
+            .fetch_or(Self::PREFILL_CAPTURE, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn record_prefill_replay(&self) {
+        self.0
+            .fetch_or(Self::PREFILL_REPLAY, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn take(&self) -> crate::sequence::ForwardStepTelemetry {
+        let bits = self.0.swap(0, std::sync::atomic::Ordering::Relaxed);
+        crate::sequence::ForwardStepTelemetry {
+            cuda_decode_graph_capture: bits & Self::DECODE_CAPTURE != 0,
+            cuda_decode_graph_replay: bits & Self::DECODE_REPLAY != 0,
+            cuda_prefill_graph_capture: bits & Self::PREFILL_CAPTURE != 0,
+            cuda_prefill_graph_replay: bits & Self::PREFILL_REPLAY != 0,
+        }
+    }
+}
+
+fn finish_forward_step<P: Pipeline + ?Sized>(
+    pipeline: &P,
+    input_seqs: &[&mut Sequence],
+    seq_indices: &[usize],
+) {
+    let telemetry = pipeline.take_forward_step_telemetry();
+    let lsa_cfg = crate::attention::LsaConfig::global();
+    for &idx in seq_indices {
+        let seq = &input_seqs[idx];
+        let lsa_active = lsa_cfg
+            .as_ref()
+            .is_some_and(|cfg| cfg.active_for_seq_len(seq.get_toks().len()));
+        seq.record_forward_step_telemetry(telemetry, lsa_active);
+    }
+}
+
 #[async_trait::async_trait]
 pub trait Pipeline:
     Send
@@ -915,6 +977,11 @@ pub trait Pipeline:
     /// Names the sequences the next `forward_inputs` call runs. A target that keeps
     /// per-sequence speculative state attributes it by these ids; the default ignores them.
     fn note_forward_sequences(&self, _seq_ids: &[usize]) {}
+
+    /// Consumes telemetry recorded by the most recent `forward_inputs` call.
+    fn take_forward_step_telemetry(&self) -> crate::sequence::ForwardStepTelemetry {
+        crate::sequence::ForwardStepTelemetry::default()
+    }
 
     fn attach_speculative(
         &mut self,
@@ -1035,6 +1102,7 @@ pub trait Pipeline:
                     let raw_logits = self.forward_inputs(inputs, return_raw_logits)?;
                     let end = Instant::now();
                     exec_duration += end.duration_since(start);
+                    finish_forward_step(self, input_seqs, &seq_indices);
 
                     for (logit_idx, seq_idx) in seq_indices.into_iter().enumerate() {
                         if let ForwardInputsResult::RawLogits { logits } = &raw_logits {
@@ -1145,6 +1213,11 @@ pub trait Pipeline:
                                 )
                                 .await?
                         {
+                            if !is_prompt && !return_raw_logits {
+                                for seq in input_seqs.iter() {
+                                    seq.record_plain_decode_step();
+                                }
+                            }
                             self.sample_causal_gen(
                                 input_seqs,
                                 logits,
@@ -1462,6 +1535,7 @@ pub trait Pipeline:
                         let raw_logits = self.forward_inputs(inputs, return_raw_logits)?;
                         let end = Instant::now();
                         exec_duration += end.duration_since(start);
+                        finish_forward_step(self, input_seqs, &seq_indices);
 
                         if is_prompt && has_hybrid {
                             let hybrid_cache = self.cache().hybrid();
@@ -1600,6 +1674,11 @@ pub trait Pipeline:
                                 )
                                 .await?
                         {
+                            if !is_prompt && !return_raw_logits {
+                                for seq in input_seqs.iter() {
+                                    seq.record_plain_decode_step();
+                                }
+                            }
                             self.sample_causal_gen(
                                 input_seqs,
                                 logits,

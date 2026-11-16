@@ -50,6 +50,7 @@ pub async fn finish_verified_step<P: Pipeline>(
     };
 
     if let Some(anchor) = anchor_to_emit {
+        seq.record_plain_decode_step();
         finish_or_add_toks_to_seq(pipeline, prefix_cacher, seq, anchor, eos_tok, true).await?;
         if matches!(seq.getstate(), SequenceState::Done(_)) {
             seq.clear_staged_speculative_tokens();
@@ -57,6 +58,7 @@ pub async fn finish_verified_step<P: Pipeline>(
         }
     }
     seq.record_drafts(proposal.len(), 0);
+    seq.begin_speculative_round();
 
     // Speculative sampling needs the drafts' distribution and a free sampler. A greedy or
     // grammar-constrained sequence, and any token the engine writes itself (a think close), is
@@ -81,6 +83,7 @@ pub async fn finish_verified_step<P: Pipeline>(
         if is_draft {
             accepted += 1;
             seq.record_drafts(0, 1);
+            seq.record_speculative_committed_token();
             finish_or_add_toks_to_seq(pipeline, prefix_cacher, seq, emitted, eos_tok, true).await?;
             if matches!(seq.getstate(), SequenceState::Done(_)) {
                 seq.clear_staged_speculative_tokens();
@@ -89,6 +92,7 @@ pub async fn finish_verified_step<P: Pipeline>(
             continue;
         }
         let token = emitted.token;
+        seq.record_speculative_committed_token();
         finish_or_add_toks_to_seq(pipeline, prefix_cacher, seq, emitted, eos_tok, true).await?;
         let continuation = if matches!(seq.getstate(), SequenceState::Done(_)) {
             seq.clear_staged_speculative_tokens();
@@ -111,6 +115,7 @@ pub async fn finish_verified_step<P: Pipeline>(
         _ => sample_sequence(row, seq, return_logprobs, rng.clone(), false, false, false).await?,
     };
     let token = continuation.token;
+    seq.record_speculative_committed_token();
     finish_or_add_toks_to_seq(pipeline, prefix_cacher, seq, continuation, eos_tok, true).await?;
     let continuation = if matches!(seq.getstate(), SequenceState::Done(_)) {
         seq.clear_staged_speculative_tokens();

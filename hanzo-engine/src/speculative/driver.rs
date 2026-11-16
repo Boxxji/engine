@@ -192,6 +192,7 @@ where
         )
         .await?;
         let sampled_token = anchor.token;
+        seq.record_plain_decode_step();
         finish_or_add_toks_to_seq(target, prefix_cacher, seq, anchor, eos_tok, true).await?;
         if speculating(seq) {
             active_indices.push(idx);
@@ -414,6 +415,9 @@ where
     // varies per round. Reject only an empty or over-long draft.
     for (idx, proposal) in active_indices.iter().zip(proposal_batch.proposals) {
         if (1..=proposal_len).contains(&proposal.tokens.len()) {
+            if seqs[*idx].execution_trace().draft_block_sizes.is_empty() {
+                seqs[*idx].record_draft_block_size(proposal.tokens.len());
+            }
             seqs[*idx].set_staged_speculative(proposal.tokens, proposal.logits);
         } else {
             seqs[*idx].clear_staged_speculative_tokens();
