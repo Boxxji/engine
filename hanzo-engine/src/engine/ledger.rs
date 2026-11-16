@@ -115,24 +115,119 @@ pub fn totals() -> Totals {
     COUNTERS.read()
 }
 
+/// Terminal lifecycle outcome for a request logged to the ledger.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum TerminalStatus {
+    #[default]
+    Completed,
+    Canceled,
+    Error,
+}
+
+impl TerminalStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Canceled => "canceled",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// Process-lifetime identifier (`<pid_hex>-<boot_nanos_hex>`) disambiguating `seq=<id>` across
+/// worker restarts or multi-worker log aggregation.
+pub(crate) fn run_id() -> &'static str {
+    static RUN_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    RUN_ID.get_or_init(|| {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        format!("{pid:x}-{:08x}", nanos as u32)
+    })
+}
+
+pub(crate) fn instance_id() -> &'static str {
+    static INSTANCE_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    INSTANCE_ID.get_or_init(|| {
+        std::env::var("HANZO_INSTANCE_ID")
+            .ok()
+            .map(|s| s.trim().replace(char::is_whitespace, "_"))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "local".to_string())
+    })
+}
+
+fn current_engine_slot() -> usize {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::thread::ThreadId;
+
+    static SLOTS: OnceLock<Mutex<HashMap<ThreadId, usize>>> = OnceLock::new();
+    let map = SLOTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    let next = guard.len();
+    *guard.entry(std::thread::current().id()).or_insert(next)
+}
+
 /// Logs the backwards-compatible `serve_api:` ledger line alongside a structured
 /// `serve_trace:` line separating speculative verify rounds from stood-down plain steps,
-/// active draft block sizes, LSA activation, adaptive stand-down reason, and CUDA graph hits.
+/// active draft block sizes, LSA activation, adaptive stand-down reason, CUDA graph hits,
+/// and terminal lifecycle status.
+///
+/// Both lines carry `inst=<instance_id> run=<run_id>-e<slot> seq=<id>`. Under concurrency,
+/// multi-engine routing, or across worker restarts, lines pair uniquely by `(inst, run, seq)`.
 pub(crate) fn record_with_trace(
     usage: &Usage,
     drafter: Option<&str>,
     structured: bool,
     trace: &crate::sequence::RequestExecutionTrace,
+    seq_id: usize,
+    status: TerminalStatus,
 ) {
-    COUNTERS.add(usage, structured);
-    tracing::info!("{}", line(usage, drafter));
-    tracing::info!("{}", trace_line(usage, drafter, trace));
+    if matches!(status, TerminalStatus::Completed) {
+        COUNTERS.add(usage, structured);
+    }
+    let inst = instance_id();
+    let rid = format!("{}-e{}", run_id(), current_engine_slot());
+    tracing::info!(
+        "{} inst={inst} run={rid} seq={seq_id}",
+        line(usage, drafter)
+    );
+    tracing::info!(
+        "{}",
+        with_identity(
+            &trace_line_with_status(usage, drafter, trace, status),
+            inst,
+            &rid,
+            seq_id
+        )
+    );
 }
 
+/// `serve_trace: inst=<inst> run=<run_id> seq=<id> mode=...`: composite identity first.
+pub(crate) fn with_identity(trace_line: &str, inst: &str, rid: &str, seq_id: usize) -> String {
+    match trace_line.strip_prefix("serve_trace: ") {
+        Some(rest) => format!("serve_trace: inst={inst} run={rid} seq={seq_id} {rest}"),
+        None => format!("{trace_line} inst={inst} run={rid} seq={seq_id}"),
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn trace_line(
     usage: &Usage,
     drafter: Option<&str>,
     trace: &crate::sequence::RequestExecutionTrace,
+) -> String {
+    trace_line_with_status(usage, drafter, trace, TerminalStatus::Completed)
+}
+
+pub(crate) fn trace_line_with_status(
+    usage: &Usage,
+    drafter: Option<&str>,
+    trace: &crate::sequence::RequestExecutionTrace,
+    status: TerminalStatus,
 ) -> String {
     let used_spec = usage.draft_tokens > 0 || trace.speculative_rounds > 0;
     let spec_label = if used_spec {
@@ -187,7 +282,7 @@ pub(crate) fn trace_line(
         "serve_trace: mode={mode} bs={bs} spec_rounds={} spec_committed={} plain_steps={} \
          drafted={} accepted={} spec_accept={spec_accept_pct:.1}% spec_commit={spec_commit:.2}/round \
          cuda_decode_graph=capture:{},replay:{} cuda_prefill_graph=capture:{},replay:{} \
-         prefill_ms={prefill_ms:.1} decode_ms={decode_ms:.1} stand_down={stand_down}",
+         prefill_ms={prefill_ms:.1} decode_ms={decode_ms:.1} stand_down={stand_down} status={}",
         trace.speculative_rounds,
         trace.speculative_committed_tokens,
         trace.plain_decode_steps,
@@ -197,6 +292,7 @@ pub(crate) fn trace_line(
         trace.cuda_decode_graph_replays,
         trace.cuda_prefill_graph_captures,
         trace.cuda_prefill_graph_replays,
+        status.as_str(),
     )
 }
 
@@ -443,6 +539,68 @@ mod tests {
             dense.contains("mode=dense bs=none spec_rounds=0 "),
             "got: {dense}"
         );
-        assert!(dense.ends_with("stand_down=none"), "got: {dense}");
+        assert!(
+            dense.ends_with("stand_down=none status=completed"),
+            "got: {dense}"
+        );
+    }
+
+    /// Both lines carry `(run, seq)` and terminal status; the tagged `serve_api` line still reads
+    /// as `bench-serving.py` expects (its pattern is unanchored at the end).
+    #[test]
+    fn ledger_lines_carry_identity_status_and_stay_bench_compatible() {
+        use super::TerminalStatus;
+        use crate::sequence::RequestExecutionTrace;
+
+        let u = Usage {
+            draft_tokens: 8,
+            draft_accepted: 4,
+            ..usage(10_000, 4_000, 11)
+        };
+        let inst = super::instance_id();
+        let rid = format!("{}-e0", super::run_id());
+        assert!(!inst.is_empty() && !rid.is_empty());
+        let api = format!(
+            "{} inst={inst} run={rid} seq={}",
+            line(&u, Some("dflash")),
+            42
+        );
+        assert!(
+            api.ends_with(&format!(" inst={inst} run={rid} seq=42")),
+            "got: {api}"
+        );
+        assert_eq!(fields(&api)[0], "dflash");
+        assert_eq!(fields(&api)[7], "4000");
+
+        let tr = super::with_identity(
+            &super::trace_line(&u, Some("dflash"), &RequestExecutionTrace::default()),
+            inst,
+            &rid,
+            42,
+        );
+        assert!(
+            tr.starts_with(&format!("serve_trace: inst={inst} run={rid} seq=42 mode=")),
+            "got: {tr}"
+        );
+        assert!(
+            tr.ends_with("stand_down=none status=completed"),
+            "got: {tr}"
+        );
+
+        let canceled = super::trace_line_with_status(
+            &u,
+            None,
+            &RequestExecutionTrace::default(),
+            TerminalStatus::Canceled,
+        );
+        assert!(canceled.ends_with("status=canceled"), "got: {canceled}");
+
+        let errored = super::trace_line_with_status(
+            &u,
+            None,
+            &RequestExecutionTrace::default(),
+            TerminalStatus::Error,
+        );
+        assert!(errored.ends_with("status=error"), "got: {errored}");
     }
 }

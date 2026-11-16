@@ -489,6 +489,7 @@ fn first_diff_char(a: &str, b: &str) -> Option<usize> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    hanzo_engine::initialize_logging();
     let (model_path, model_dir, model_file) = resolve_model_path()?;
     anyhow::ensure!(
         model_path.is_file(),

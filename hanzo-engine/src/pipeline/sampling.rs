@@ -48,30 +48,60 @@ fn parse_streaming_text_and_tool_calls(
     parse_text_and_tool_calls(raw_text.as_str(), matcher)
 }
 
+fn status_for_stop_reason(
+    reason: crate::sequence::StopReason,
+) -> crate::engine::ledger::TerminalStatus {
+    if matches!(reason, crate::sequence::StopReason::Canceled) {
+        crate::engine::ledger::TerminalStatus::Canceled
+    } else {
+        crate::engine::ledger::TerminalStatus::Completed
+    }
+}
+
 /// Reads usage + execution trace under one `SequenceGroup` lock, releases the lock before
-/// entering the ledger, and records the completed request (`serve_api:` + `serve_trace:`).
+/// entering the ledger, and records the terminal request event once (`serve_api:` + `serve_trace:`).
+#[cfg(test)]
 fn record_group_finish(
     drafter: Option<crate::speculative::SpeculativeAttachInfo>,
     seq: &Sequence,
     clear_group_totals: bool,
 ) -> crate::Usage {
-    let (usage, trace) = {
+    record_group_finish_with_status(
+        drafter,
+        seq,
+        clear_group_totals,
+        crate::engine::ledger::TerminalStatus::Completed,
+    )
+}
+
+fn record_group_finish_with_status(
+    drafter: Option<crate::speculative::SpeculativeAttachInfo>,
+    seq: &Sequence,
+    clear_group_totals: bool,
+    status: crate::engine::ledger::TerminalStatus,
+) -> crate::Usage {
+    let (should_log, usage, trace) = {
         let mut group = seq.get_mut_group();
+        let should_log = !std::mem::replace(&mut group.trace_logged, true);
         let usage = group.get_usage();
         if clear_group_totals {
             group.total_prompt_toks = 0;
             group.total_toks = 0;
         }
-        (usage, group.execution_trace.clone())
+        (should_log, usage, group.execution_trace.clone())
     };
-    let structured = matches!(seq.recognizer, SequenceRecognizer::Llguidance(_))
-        && !seq.is_tool_grammar_active();
-    crate::engine::ledger::record_with_trace(
-        &usage,
-        drafter.as_ref().map(|d| d.name()),
-        structured,
-        &trace,
-    );
+    if should_log {
+        let structured = matches!(seq.recognizer, SequenceRecognizer::Llguidance(_))
+            && !seq.is_tool_grammar_active();
+        crate::engine::ledger::record_with_trace(
+            &usage,
+            drafter.as_ref().map(|d| d.name()),
+            structured,
+            &trace,
+            *seq.id(),
+            status,
+        );
+    }
     usage
 }
 
@@ -286,19 +316,59 @@ pub(crate) async fn finish_or_add_toks_to_seq(
                 }
             }
 
-            // Send usage on final chunk.
-            let usage_opt = if is_done.is_some() {
-                Some(record_group_finish(this.drafter(), seq, true))
+            // Send usage on final chunk, recording terminal status after delivery check.
+            let final_snapshot = if let Some(reason) = is_done {
+                seq.update_time_info();
+                let (should_log, usage, trace) = {
+                    let mut group = seq.get_mut_group();
+                    let should_log = !std::mem::replace(&mut group.trace_logged, true);
+                    let usage = group.get_usage();
+                    group.total_prompt_toks = 0;
+                    group.total_toks = 0;
+                    (should_log, usage, group.execution_trace.clone())
+                };
+                Some((reason, should_log, usage, trace))
             } else {
                 None
             };
+            let usage_opt = final_snapshot.as_ref().map(|(_, _, u, _)| u.clone());
 
-            if seq
+            let send_failed = seq
                 .get_mut_group()
                 .maybe_send_streaming_response(seq, this.name().clone(), usage_opt)
                 .await
-                .is_err()
-            {
+                .is_err();
+
+            if let Some((reason, should_log, usage, trace)) = final_snapshot {
+                if should_log {
+                    let status = if send_failed {
+                        crate::engine::ledger::TerminalStatus::Canceled
+                    } else {
+                        status_for_stop_reason(reason)
+                    };
+                    let structured = matches!(seq.recognizer, SequenceRecognizer::Llguidance(_))
+                        && !seq.is_tool_grammar_active();
+                    crate::engine::ledger::record_with_trace(
+                        &usage,
+                        this.drafter().as_ref().map(|d| d.name()),
+                        structured,
+                        &trace,
+                        *seq.id(),
+                        status,
+                    );
+                }
+            }
+
+            if send_failed {
+                if is_done.is_none() {
+                    seq.update_time_info();
+                    record_group_finish_with_status(
+                        this.drafter(),
+                        seq,
+                        true,
+                        crate::engine::ledger::TerminalStatus::Canceled,
+                    );
+                }
                 // If we can't send the response, cancel the sequence
                 seq.set_state(crate::sequence::SequenceState::Done(
                     crate::sequence::StopReason::Canceled,
@@ -472,7 +542,12 @@ pub(crate) async fn finish_or_add_toks_to_seq(
 
             // Ensure timing info is synced to group before sending response
             seq.update_time_info();
-            record_group_finish(this.drafter(), seq, false);
+            let non_stream_status = if declined {
+                crate::engine::ledger::TerminalStatus::Error
+            } else {
+                status_for_stop_reason(reason)
+            };
+            record_group_finish_with_status(this.drafter(), seq, false, non_stream_status);
 
             let mut group = seq.get_mut_group();
             if group.is_chat {
@@ -898,7 +973,10 @@ mod tests {
             );
             seq.record_drafts(7, 2);
             seq.record_draft_block_size(8);
-            seq.record_speculative_round(3);
+            seq.begin_speculative_round();
+            for _ in 0..3 {
+                seq.record_speculative_committed_token();
+            }
             seq.record_speculative_stand_down("slower_than_plain_probe");
             seq.record_plain_decode_step();
             seq.record_forward_step_telemetry(
@@ -926,6 +1004,7 @@ mod tests {
             &non_stream.execution_trace(),
         );
         assert!(trace_str.contains("mode=dflash->dense"));
+        assert!(trace_str.contains("spec_rounds=1 spec_committed=3 plain_steps=1"));
         assert!(trace_str.contains("cuda_decode_graph=capture:1,replay:0"));
         assert!(trace_str.contains("stand_down=slower_than_plain_probe"));
 

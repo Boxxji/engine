@@ -78,6 +78,7 @@ macro_rules! handle_seq_error_stateaware_ok {
                 {
                     tracing::warn!("Receiver disconnected");
                 }
+                $seq.record_error_terminal_trace();
                 $seq.set_state(SequenceState::Error);
                 return Ok(());
             }
@@ -220,6 +221,7 @@ macro_rules! handle_pipeline_forward_error {
                 }
                 for seq in $seq_slice.iter_mut() {
                     // Step 3: Set state - This cannot be done in Step 2 as `group` is locking the refcell
+                    seq.record_error_terminal_trace();
                     seq.set_state(SequenceState::Error);
                 }
 

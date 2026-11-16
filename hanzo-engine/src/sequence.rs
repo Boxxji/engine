@@ -1187,11 +1187,16 @@ impl Sequence {
         (group.total_draft_toks, group.total_draft_accepted)
     }
 
-    /// Counts one completed speculative verification round and its committed tokens.
-    pub(crate) fn record_speculative_round(&self, committed_tokens: usize) {
+    /// Counts the start of a speculative verification round before tokens emit.
+    pub(crate) fn begin_speculative_round(&self) {
         let mut group = get_mut_group!(self);
         group.execution_trace.speculative_rounds += 1;
-        group.execution_trace.speculative_committed_tokens += committed_tokens;
+    }
+
+    /// Counts one token emitted during speculative verification before completion logging can fire.
+    pub(crate) fn record_speculative_committed_token(&self) {
+        let mut group = get_mut_group!(self);
+        group.execution_trace.speculative_committed_tokens += 1;
     }
 
     /// Counts one plain single-token decode step (either unspeculated or post-stand-down).
@@ -1695,6 +1700,28 @@ impl Sequence {
     pub fn set_tool_grammar_active(&mut self, active: bool) {
         self.tool_grammar_active = active;
     }
+
+    #[doc(hidden)]
+    pub fn record_error_terminal_trace(&self) {
+        self.update_time_info();
+        let (should_log, usage, trace) = {
+            let mut group = get_mut_group!(self);
+            let should_log = !std::mem::replace(&mut group.trace_logged, true);
+            (should_log, group.get_usage(), group.execution_trace.clone())
+        };
+        if should_log {
+            let structured = matches!(self.recognizer, SequenceRecognizer::Llguidance(_))
+                && !self.is_tool_grammar_active();
+            crate::engine::ledger::record_with_trace(
+                &usage,
+                None,
+                structured,
+                &trace,
+                *self.id(),
+                crate::engine::ledger::TerminalStatus::Error,
+            );
+        }
+    }
 }
 
 /// Per-forward telemetry captured by a pipeline for the just-completed `forward_inputs` call.
@@ -1752,6 +1779,7 @@ pub struct SequenceGroup {
     // latch permanently open and re-fire on every subsequent finish, and a chat
     // group refused with a model error sends nothing after it.
     done_sent: bool,
+    pub(crate) trace_logged: bool,
 }
 
 impl SequenceGroup {
@@ -1787,6 +1815,7 @@ impl SequenceGroup {
             is_chat,
             best_of,
             done_sent: false,
+            trace_logged: false,
         }
     }
 

@@ -264,9 +264,6 @@ where
         )
         .await?;
         let accepted_all = outcome.accepted_drafts == outcome.proposed_drafts;
-        let committed_tokens =
-            outcome.accepted_drafts + usize::from(outcome.continuation_token.is_some());
-        seq.record_speculative_round(committed_tokens);
         super::stats::record_verify(outcome.accepted_drafts, outcome.proposed_drafts);
         tracing::debug!(
             seq_id = *seq.id(),
