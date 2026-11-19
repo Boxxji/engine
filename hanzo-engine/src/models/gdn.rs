@@ -400,6 +400,9 @@ pub fn gated_delta_rule_recurrence(
     if gdn_force_portable() {
         return recurrence_portable(q, k, v, g, beta, state);
     }
+    if let Some(out) = hanzo_ml::gdn::try_recurrence(q, k, v, g, beta, state, true)? {
+        return Ok(out);
+    }
     #[cfg(feature = "cuda")]
     if state.device().is_cuda() {
         return recurrence_cuda(q, k, v, g, beta, state);
@@ -1003,7 +1006,11 @@ impl GatedDeltaNet {
         let v = v.reshape((batch_size, seq_len, self.num_v_heads, self.head_v_dim))?;
 
         // 4. Compute beta and g
-        let (beta, g) = {
+        let (beta, g) = if let Some(pair) =
+            hanzo_ml::gdn::try_gating(&b, &a, &self.a_log, &self.dt_bias)?
+        {
+            pair
+        } else {
             #[cfg(feature = "cuda")]
             {
                 if b.device().is_cuda() {
@@ -1110,6 +1117,14 @@ impl GatedDeltaNet {
     fn causal_conv1d_update(&self, x: &Tensor, cache: &mut GdnLayerCache) -> Result<Tensor> {
         let (_batch, seq_len, _conv_dim) = x.dims3()?;
 
+        if seq_len == 1 {
+            if let Some(out) =
+                hanzo_ml::gdn::try_conv1d_step(x, &self.conv1d_weight, &mut cache.conv_state)?
+            {
+                return Ok(out);
+            }
+        }
+
         // Native Vulkan single decode step: conv_state stays in VRAM, no per-token readback.
         if x.device().is_vulkan() && x.dtype() == DType::F32 && x.dim(0)? == 1 && x.dim(1)? == 1 {
             let weight = self
@@ -1195,6 +1210,18 @@ impl GatedDeltaNet {
     /// Full sequence causal conv1d for prefill.
     fn causal_conv1d_full(&self, x: &Tensor, cache: &mut GdnLayerCache) -> Result<Tensor> {
         let (batch_size, seq_len, conv_dim) = x.dims3()?;
+        if hanzo_ml::quantized::dsl::gdn_impl() == hanzo_ml::quantized::dsl::QkImpl::Dsl {
+            let x_raw_t = x.transpose(1, 2)?.contiguous()?;
+            if let Some((out_t, new_state)) = hanzo_ml::gdn::try_conv1d_stateful(
+                &x_raw_t,
+                &self.conv1d_weight,
+                &cache.conv_state,
+                cache.seqlen_offset > 0,
+            )? {
+                cache.conv_state = new_state;
+                return out_t.transpose(1, 2)?.contiguous();
+            }
+        }
         // The full kernel has no conv_state argument and zero-pads its left edge, which is right
         // only at the start of a sequence. A continuation (a later prefill chunk, or a speculative
         // replay) must see the previous tokens, so splice them on and drop their outputs after.

@@ -464,6 +464,26 @@ impl Sdpa {
             return sinks_attn(q, k, v, sinks, mask_tensor, flash_params, sdpa_params);
         }
 
+        // Canonical DSL FlashAttention (gated behind HANZO_FLASH_IMPL=dsl; legacy default).
+        if matches!(mask, AttentionMask::None | AttentionMask::CausalFlash)
+            && flash_params.is_none_or(|p| p.cumulative_seqlens_q.is_empty())
+            && hanzo_ml::quantized::dsl::flash_impl() == hanzo_ml::quantized::dsl::QkImpl::Dsl
+        {
+            let explicitly_noncausal = flash_params.is_some_and(|p| !p.causal);
+            let is_causal = matches!(mask, AttentionMask::CausalFlash)
+                || (!explicitly_noncausal && q.rank() == 4 && q.dim(2)? > 1);
+            let cfg = hanzo_ml::flash_attn::FlashAttnConfig {
+                scale: sdpa_params.softmax_scale,
+                softcap: sdpa_params.softcap.unwrap_or(0.0),
+                causal_mode: u32::from(is_causal),
+                sliding_window: sdpa_params.sliding_window.unwrap_or(0),
+                q_offset_override: 0,
+            };
+            if let Some(out) = hanzo_ml::flash_attn::try_flash_attn_contiguous(q, k, v, cfg)? {
+                return Ok(out);
+            }
+        }
+
         // Vulkan decode fast-path: one fused kernel replaces repeat_kv + QK^T bmm + softmax + *V bmm
         // + contiguous glue. Plain causal/no-mask single-query only; else falls through to eager.
         #[cfg(feature = "vulkan")]

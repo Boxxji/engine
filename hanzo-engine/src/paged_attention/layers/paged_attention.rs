@@ -1129,6 +1129,55 @@ impl PagedAttention {
             }
         }
 
+        if attention_backend == AttentionBackendKind::Standard
+            && alibi_slopes.is_none()
+            && sdpa_params.sinks.is_none()
+            && self.k_scale.is_none()
+            && self.v_scale.is_none()
+            && hanzo_ml::quantized::dsl::flash_impl() == hanzo_ml::quantized::dsl::QkImpl::Dsl
+        {
+            if let (Some(kc), Some(vc), Some(bt_t), Some(cl_t)) = (
+                key_cache.as_ref(),
+                value_cache.as_ref(),
+                resolve_block_tables(&dev),
+                resolve_context_lens(&dev),
+            ) {
+                if kc.rank() == 5 && vc.rank() == 4 {
+                    let x_vec = kc.dim(4)?;
+                    let bt_u32 = if bt_t.dtype() == DType::U32 {
+                        bt_t.clone()
+                    } else {
+                        bt_t.to_dtype(DType::U32)?
+                    };
+                    let cl_u32 = if cl_t.dtype() == DType::U32 {
+                        cl_t.clone()
+                    } else {
+                        cl_t.to_dtype(DType::U32)?
+                    };
+                    let q_4d = query.reshape((batch_size, attention_heads, 1, head_size))?;
+                    let cfg = hanzo_ml::flash_attn::FlashAttnConfig {
+                        scale: sdpa_params.softmax_scale,
+                        softcap: sdpa_params.softcap.unwrap_or(0.0),
+                        causal_mode: 1,
+                        sliding_window: sdpa_params.sliding_window.unwrap_or(0),
+                        q_offset_override: 0,
+                    };
+                    if let Some(out) = hanzo_ml::flash_attn::try_flash_attn_paged(
+                        &q_4d,
+                        kc,
+                        vc,
+                        &bt_u32,
+                        &cl_u32,
+                        key_value_heads,
+                        hanzo_ml::flash_attn::KvCacheLayout::EngineStandard5D4D { x_vec },
+                        cfg,
+                    )? {
+                        return out.reshape(query.shape());
+                    }
+                }
+            }
+        }
+
         let res = paged_attention(
             &query,
             self.k_scale.as_ref(),

@@ -11,6 +11,7 @@ use crate::{
 
 mod full_cache;
 mod hybrid_cache;
+mod hybrid_contract;
 mod rotating_cache;
 mod single_cache;
 
@@ -19,6 +20,7 @@ pub use hybrid_cache::{
     HybridCache, HybridCacheConfig, HybridLayerCache, HybridLayerType, RecurrentLayerConfig,
     RecurrentStatePool, RecurrentStateSnapshot, RecurrentTrail,
 };
+pub use hybrid_contract::{HybridRequestBinding, HybridStateCheckpoint, HybridStateContract};
 pub use rotating_cache::{RotatingCache, RotatingCacheSnapshot};
 pub use single_cache::{SingleCache, SingleCacheSnapshot};
 
