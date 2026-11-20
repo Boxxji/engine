@@ -83,7 +83,6 @@ impl TryFrom<u8> for AfqGroupSize {
     }
 }
 
-#[cfg(feature = "cuda")]
 const MAX_CUDA_FWHT_BLOCK: usize = 8192;
 
 fn cpu_fwht_blocks(
@@ -147,13 +146,12 @@ fn fwht_typed(
     if last_dim == 0 || !last_dim.is_multiple_of(block) {
         hanzo_ml::bail!("fwht expects last dim ({last_dim}) divisible by block ({block})");
     }
-    #[cfg(feature = "cuda")]
-    if x.device().is_cuda() && block <= MAX_CUDA_FWHT_BLOCK {
+    if (2..=MAX_CUDA_FWHT_BLOCK).contains(&block) {
         let xin = match x.dtype() {
             DType::F32 | DType::F16 | DType::BF16 => Cow::Borrowed(x),
             _ => Cow::Owned(x.to_dtype(DType::F32)?),
         };
-        let out = hanzo_ml::quantized::cuda::hadamard_fwht(xin.as_ref(), Some(signs), block, inverse)?;
+        let out = hanzo_ml::quantized::hadamard_fwht(xin.as_ref(), Some(signs), block, inverse)?;
         return if out.dtype() != out_dtype {
             out.to_dtype(out_dtype)
         } else {

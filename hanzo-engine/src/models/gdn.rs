@@ -74,6 +74,7 @@ impl RmsNormGated {
 
     /// Build directly from an already-materialized weight (e.g. a dequantized GGUF tensor).
     pub fn from_weight(weight: Tensor, eps: f64) -> Self {
+        let weight = weight.to_dtype(DType::F32).unwrap_or(weight);
         Self {
             weight,
             eps,
@@ -104,13 +105,13 @@ impl RmsNormGated {
         let dtype = x.dtype();
         let x = x.to_dtype(DType::F32)?.contiguous()?;
         let gate = gate.to_dtype(DType::F32)?;
-        let gate = match self.act {
-            Act::Silu => hanzo_nn::ops::silu(&gate)?,
-            Act::Sigmoid => sigmoid(&gate)?,
-        };
         let weight = self.weight.to_dtype(DType::F32)?;
         let normed = hanzo_nn::ops::rms_norm(&x, &weight, self.eps as f32)?;
-        normed.broadcast_mul(&gate)?.to_dtype(dtype)
+        let out = match self.act {
+            Act::Silu => crate::ops::mul_and_act(&gate, &normed, crate::layers::Activation::Silu)?,
+            Act::Sigmoid => normed.broadcast_mul(&sigmoid(&gate)?)?,
+        };
+        out.to_dtype(dtype)
     }
 }
 
@@ -465,6 +466,9 @@ fn recurrence_flatten(
     let bh = b * nh;
     let scale = 1.0 / (kd as f64).sqrt();
     let seq_dim = |t: &Tensor, d: usize| -> Result<Tensor> {
+        if s == 1 {
+            return t.to_dtype(DType::F32)?.contiguous()?.reshape((bh, 1, d));
+        }
         t.transpose(1, 2)?
             .contiguous()?
             .to_dtype(DType::F32)?
@@ -472,6 +476,9 @@ fn recurrence_flatten(
             .contiguous()
     };
     let scalar = |t: &Tensor| -> Result<Tensor> {
+        if s == 1 {
+            return t.to_dtype(DType::F32)?.contiguous()?.reshape((bh, 1));
+        }
         t.to_dtype(DType::F32)?
             .transpose(1, 2)?
             .contiguous()?
@@ -506,6 +513,9 @@ fn recurrence_unflatten(
     *state = state_flat
         .reshape((b, nh, kd, vd))?
         .to_dtype(state.dtype())?;
+    if s == 1 {
+        return out_bh.reshape((b, 1, nh, vd))?.to_dtype(q.dtype());
+    }
     out_bh
         .reshape((b, nh, s, vd))?
         .transpose(1, 2)?

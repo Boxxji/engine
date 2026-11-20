@@ -1119,6 +1119,7 @@ impl TryFrom<GgmlDType> for IsqType {
             | GgmlDType::TQ2_0
             | GgmlDType::NVFP4
             | GgmlDType::Q1_0
+            | GgmlDType::Q2_0
             | GgmlDType::PQ2_0
             | GgmlDType::PTQ1_0
             | GgmlDType::I32 => {
@@ -1306,6 +1307,20 @@ pub trait QuantMethod: Send + Sync + Debug + QuantizedSerde {
     /// Used by Metal fused QKV / gate-up paths.
     fn afq_inner(&self) -> Option<crate::afq::AfqInner<'_>> {
         None
+    }
+
+    /// True when this layer can consume a pre-quantized `IqQ8Activation` on CUDA.
+    fn supports_shared_iq_q8(&self) -> bool {
+        false
+    }
+
+    /// Matmul against a shared `IqQ8Activation`, writing `out_dtype`.
+    fn forward_iq_q8_dtype(
+        &self,
+        _q8: &hanzo_ml::quantized::IqQ8Activation,
+        _out_dtype: DType,
+    ) -> Result<Tensor> {
+        hanzo_ml::bail!("{} does not support shared IqQ8Activation", self.name())
     }
 
     /// If a quantized method, return the activation dtype.
