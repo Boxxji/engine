@@ -394,82 +394,123 @@ impl HadamardMeta {
     }
 }
 
-/// Precomputed normalized Sylvester-Walsh-Hadamard operator `H_B` + per-width `±1` signs on one `Device`.
+#[cfg(feature = "cuda")]
+const MAX_CUDA_FWHT_BLOCK: usize = 8192;
+
+fn cpu_fwht_blocks(
+    data: &mut [f32],
+    width: usize,
+    block: usize,
+    signs: Option<&[f32]>,
+    inverse: bool,
+) {
+    let scale = 1.0f32 / (block as f32).sqrt();
+    for row in data.chunks_exact_mut(width) {
+        if !inverse {
+            if let Some(s) = signs {
+                for (v, &sv) in row.iter_mut().zip(s.iter()) {
+                    *v *= sv;
+                }
+            }
+        }
+        for blk in row.chunks_exact_mut(block) {
+            let mut stride = 1usize;
+            while stride < block {
+                let step = stride * 2;
+                let mut base = 0usize;
+                while base < block {
+                    for j in 0..stride {
+                        let a = blk[base + j];
+                        let b = blk[base + j + stride];
+                        blk[base + j] = a + b;
+                        blk[base + j + stride] = a - b;
+                    }
+                    base += step;
+                }
+                stride = step;
+            }
+            for v in blk.iter_mut() {
+                *v *= scale;
+            }
+        }
+        if inverse {
+            if let Some(s) = signs {
+                for (v, &sv) in row.iter_mut().zip(s.iter()) {
+                    *v *= sv;
+                }
+            }
+        }
+    }
+}
+
 pub(crate) struct DeviceHadamard {
     block_size: usize,
     explicit_signs: bool,
-    h_b: Tensor,
     signs: HashMap<usize, Tensor>,
+    signs_host: HashMap<usize, Vec<f32>>,
 }
 
 impl DeviceHadamard {
     pub(crate) fn new(meta: &HadamardMeta, device: &Device) -> Result<Self> {
         let b = meta.block_size;
-        let scale = 1.0f32 / (b as f32).sqrt();
-        let mut h_data = vec![0.0f32; b * b];
-        for r in 0..b {
-            let row = &mut h_data[r * b..(r + 1) * b];
-            for (c, slot) in row.iter_mut().enumerate() {
-                *slot = if ((r & c).count_ones() & 1) == 0 {
-                    scale
-                } else {
-                    -scale
-                };
-            }
+        if b == 0 || !b.is_power_of_two() {
+            hanzo_ml::bail!("Hadamard block_size must be a power of two, got {b}");
         }
-        let h_b = Tensor::from_vec(h_data, (b, b), device)?;
         let mut signs = HashMap::with_capacity(meta.signs.len());
+        let mut signs_host = HashMap::with_capacity(meta.signs.len());
         for (&width, vals) in &meta.signs {
             signs.insert(width, Tensor::from_vec(vals.clone(), width, device)?);
+            signs_host.insert(width, vals.clone());
         }
         Ok(Self {
             block_size: b,
             explicit_signs: meta.explicit_signs,
-            h_b,
             signs,
+            signs_host,
         })
     }
 
-    /// Forward activation fold `T(x) = ((x * signs).reshape(-1, B) @ H_B).reshape_as(x)`.
-    pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    pub(crate) fn signs_for(&self, width: usize) -> Result<Option<&Tensor>> {
+        if let Some(s) = self.signs.get(&width) {
+            Ok(Some(s))
+        } else if self.explicit_signs {
+            hanzo_ml::bail!("Missing Hadamard sign vector for width {width}");
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn transform(&self, x: &Tensor, apply_signs: bool, inverse: bool) -> Result<Tensor> {
         let orig_dtype = x.dtype();
         let orig_shape = x.shape().clone();
         let Some(&width) = orig_shape.dims().last() else {
-            hanzo_ml::bail!("Hadamard forward expects rank >= 1");
+            hanzo_ml::bail!("Hadamard transform expects rank >= 1");
         };
-        if !width.is_multiple_of(self.block_size) {
+        if width == 0 || !width.is_multiple_of(self.block_size) {
             hanzo_ml::bail!(
-                "Hadamard forward width {width} is not divisible by block_size {}",
+                "Hadamard width {width} is not divisible by block_size {}",
                 self.block_size
             );
         }
-        let signs = if let Some(s) = self.signs.get(&width) {
-            Some(s)
-        } else if self.explicit_signs {
-            hanzo_ml::bail!("Missing Hadamard sign vector for width {width}");
+        let signs = if apply_signs {
+            self.signs_for(width)?
         } else {
             None
         };
         #[cfg(feature = "cuda")]
-        if x.device().is_cuda() && self.block_size.is_power_of_two() && self.block_size <= 8192 {
+        if x.device().is_cuda() && self.block_size <= MAX_CUDA_FWHT_BLOCK {
             return prof::timed(x.device(), &prof::HADAMARD_NS, || {
-                hanzo_ml::quantized::cuda::hadamard_fwht(x, signs, self.block_size, false)
+                hanzo_ml::quantized::cuda::hadamard_fwht(x, signs, self.block_size, inverse)
             });
         }
-        let xf = if orig_dtype == DType::F32 {
-            x.clone()
+        let mut data = x.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        let signs_slice = if apply_signs {
+            self.signs_host.get(&width).map(Vec::as_slice)
         } else {
-            x.to_dtype(DType::F32)?
+            None
         };
-        let xf = match signs {
-            Some(s) => xf.broadcast_mul(s)?,
-            None => xf,
-        };
-        let rows = orig_shape.elem_count() / self.block_size;
-        let out = xf
-            .reshape((rows, self.block_size))?
-            .matmul(&self.h_b)?
-            .reshape(orig_shape)?;
+        cpu_fwht_blocks(&mut data, width, self.block_size, signs_slice, inverse);
+        let out = Tensor::from_vec(data, orig_shape, x.device())?;
         if orig_dtype == DType::F32 {
             Ok(out)
         } else {
@@ -477,51 +518,16 @@ impl DeviceHadamard {
         }
     }
 
-    /// Inverse lookup fold `T^{-1}(u) = (u.reshape(-1, B) @ H_B).reshape_as(u) * signs`.
+    pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.transform(x, true, false)
+    }
+
+    pub(crate) fn forward_presigned(&self, x: &Tensor) -> Result<Tensor> {
+        self.transform(x, false, false)
+    }
+
     pub(crate) fn inverse(&self, u: &Tensor) -> Result<Tensor> {
-        let orig_dtype = u.dtype();
-        let orig_shape = u.shape().clone();
-        let Some(&width) = orig_shape.dims().last() else {
-            hanzo_ml::bail!("Hadamard inverse expects rank >= 1");
-        };
-        if !width.is_multiple_of(self.block_size) {
-            hanzo_ml::bail!(
-                "Hadamard inverse width {width} is not divisible by block_size {}",
-                self.block_size
-            );
-        }
-        let signs = if let Some(s) = self.signs.get(&width) {
-            Some(s)
-        } else if self.explicit_signs {
-            hanzo_ml::bail!("Missing Hadamard sign vector for width {width}");
-        } else {
-            None
-        };
-        #[cfg(feature = "cuda")]
-        if u.device().is_cuda() && self.block_size.is_power_of_two() && self.block_size <= 8192 {
-            return prof::timed(u.device(), &prof::HADAMARD_NS, || {
-                hanzo_ml::quantized::cuda::hadamard_fwht(u, signs, self.block_size, true)
-            });
-        }
-        let uf = if orig_dtype == DType::F32 {
-            u.clone()
-        } else {
-            u.to_dtype(DType::F32)?
-        };
-        let rows = orig_shape.elem_count() / self.block_size;
-        let out = uf
-            .reshape((rows, self.block_size))?
-            .matmul(&self.h_b)?
-            .reshape(orig_shape)?;
-        let out = match signs {
-            Some(s) => out.broadcast_mul(s)?,
-            None => out,
-        };
-        if orig_dtype == DType::F32 {
-            Ok(out)
-        } else {
-            out.to_dtype(orig_dtype)
-        }
+        self.transform(u, true, true)
     }
 }
 
@@ -940,6 +946,7 @@ pub(crate) struct DenseMlp {
     gate_had: Option<Arc<DeviceHadamard>>,
     up_had: Option<Arc<DeviceHadamard>>,
     down_had: Option<Arc<DeviceHadamard>>,
+    presigned_input: bool,
 }
 
 impl DenseMlp {
@@ -955,6 +962,7 @@ impl DenseMlp {
             gate_had: None,
             up_had: None,
             down_had: None,
+            presigned_input: false,
         })
     }
 
@@ -974,8 +982,21 @@ impl DenseMlp {
         self
     }
 
+    pub(crate) fn input_hadamard_for_norm_fold(&self) -> Option<&Arc<DeviceHadamard>> {
+        if self.gate_had.is_some() && self.up_had.is_some() {
+            self.gate_had.as_ref()
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn set_presigned_input(&mut self) {
+        self.presigned_input = true;
+    }
+
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let xs_rot = match self.gate_had.as_ref().or(self.up_had.as_ref()) {
+            Some(had) if self.presigned_input => Some(had.forward_presigned(xs)?),
             Some(had) => Some(had.forward(xs)?),
             None => None,
         };
@@ -1040,6 +1061,7 @@ pub(crate) struct GatedFullAttention {
     k_had: Option<Arc<DeviceHadamard>>,
     v_had: Option<Arc<DeviceHadamard>>,
     o_had: Option<Arc<DeviceHadamard>>,
+    presigned_input: bool,
 }
 
 impl GatedFullAttention {
@@ -1102,6 +1124,7 @@ impl GatedFullAttention {
             k_had: None,
             v_had: None,
             o_had: None,
+            presigned_input: false,
         })
     }
 
@@ -1125,6 +1148,18 @@ impl GatedFullAttention {
         self.v_had = pick("attn_v.weight");
         self.o_had = pick("attn_output.weight");
         self
+    }
+
+    pub(crate) fn input_hadamard_for_norm_fold(&self) -> Option<&Arc<DeviceHadamard>> {
+        if self.q_had.is_some() && self.k_had.is_some() && self.v_had.is_some() {
+            self.q_had.as_ref()
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn set_presigned_input(&mut self) {
+        self.presigned_input = true;
     }
 
     /// The attention of one full-attention block at `prefix`. `paged_attn` is `None` for a block
@@ -1170,6 +1205,7 @@ impl GatedFullAttention {
             k_had: None,
             v_had: None,
             o_had: None,
+            presigned_input: false,
         })
     }
 
@@ -1233,6 +1269,7 @@ impl GatedFullAttention {
             .or(self.k_had.as_ref())
             .or(self.v_had.as_ref())
         {
+            Some(had) if self.presigned_input => Some(had.forward_presigned(x)?),
             Some(had) => Some(had.forward(x)?),
             None => None,
         };
@@ -1720,100 +1757,94 @@ impl QGatedDeltaNet {
         let mixed_qkv = store(mixed_qkv)?;
         note("conv", &mixed_qkv);
 
-        // 3-8 on ROCm: one launch from the conv output to the gated norm's output. A forward that
-        // keeps a trail steps the recurrence per position below instead.
         #[cfg(feature = "rocm")]
-        if mixed_qkv.device().is_rocm()
+        let use_rocm_mixer = mixed_qkv.device().is_rocm()
             && cache.trail.is_none()
             && self.head_k_dim == 128
-            && self.head_v_dim == 128
-        {
-            let f32s = |t: &Tensor| t.to_dtype(DType::F32)?.contiguous();
-            let y = hanzo_ml::rocm_backend::gdn_mixer_rocm(
-                &mixed_qkv,
-                &f32s(&a)?,
-                &f32s(&b)?,
-                &f32s(&z.reshape((batch_size, seq_len, self.value_dim))?)?,
-                &self.a,
-                &self.dt_bias,
-                &self.norm.weight,
-                &cache.recurrent_state,
-                self.num_k_heads,
-                self.norm.eps() as f32,
-                self.norm.gates_with_sigmoid(),
-            )?;
-            cache.seqlen_offset += seq_len;
-            return self.out_proj.forward(&y)?.to_dtype(rd);
-        }
+            && self.head_v_dim == 128;
+        #[cfg(not(feature = "rocm"))]
+        let use_rocm_mixer = false;
 
-        let q = mixed_qkv.narrow(D::Minus1, 0, self.key_dim)?;
-        let k = mixed_qkv.narrow(D::Minus1, self.key_dim, self.key_dim)?;
-        let v = mixed_qkv.narrow(D::Minus1, self.key_dim * 2, self.value_dim)?;
-        let q = q.reshape((batch_size, seq_len, self.num_k_heads, self.head_k_dim))?;
-        let k = k.reshape((batch_size, seq_len, self.num_k_heads, self.head_k_dim))?;
-        let v = v.reshape((batch_size, seq_len, self.num_v_heads, self.head_v_dim))?;
-
-        // 4. beta = sigmoid(b); g = -exp(A_log) * softplus(a + dt_bias), softplus as the served
-        //    kernel forms it (identity past 20).
-        let beta = sigmoid(&b)?;
-        let dt_bias = self
-            .dt_bias
-            .to_dtype(DType::F32)?
-            .unsqueeze(0)?
-            .unsqueeze(0)?;
-        let xa = a.broadcast_add(&dt_bias)?;
-        let sp = {
-            let pos = (xa.clone() + (xa.neg()?.exp()? + 1.0)?.log()?)?;
-            let neg = (xa.exp()? + 1.0)?.log()?;
-            let zero = xa.zeros_like()?;
-            let sp = xa.gt(&zero)?.where_cond(&pos, &neg)?;
-            xa.le(20.0)?.where_cond(&sp, &xa)?
-        };
-        let g = self
-            .a
-            .to_dtype(DType::F32)?
-            .unsqueeze(0)?
-            .unsqueeze(0)?
-            .broadcast_mul(&sp)?;
-        note("g", &g);
-        note("beta", &beta);
-
-        // 5. Tile q, k to the V-head count: V head j reads key head j % num_k_heads.
-        let (q, k) = if v_per_group > 1 {
-            let tile = |t: &Tensor| {
-                t.unsqueeze(2)?.repeat((1, 1, v_per_group, 1, 1))?.reshape((
-                    batch_size,
-                    seq_len,
-                    self.num_v_heads,
-                    self.head_k_dim,
-                ))
-            };
-            (tile(&q)?, tile(&k)?)
+        let y = if use_rocm_mixer {
+            #[cfg(feature = "rocm")]
+            {
+                let f32s = |t: &Tensor| t.to_dtype(DType::F32)?.contiguous();
+                let y = hanzo_ml::rocm_backend::gdn_mixer_rocm(
+                    &mixed_qkv,
+                    &f32s(&a)?,
+                    &f32s(&b)?,
+                    &f32s(&z.reshape((batch_size, seq_len, self.value_dim))?)?,
+                    &self.a,
+                    &self.dt_bias,
+                    &self.norm.weight,
+                    &cache.recurrent_state,
+                    self.num_k_heads,
+                    self.norm.eps() as f32,
+                    self.norm.gates_with_sigmoid(),
+                )?;
+                cache.seqlen_offset += seq_len;
+                y
+            }
+            #[cfg(not(feature = "rocm"))]
+            {
+                unreachable!()
+            }
         } else {
-            (q, k)
+            let q = mixed_qkv.narrow(D::Minus1, 0, self.key_dim)?;
+            let k = mixed_qkv.narrow(D::Minus1, self.key_dim, self.key_dim)?;
+            let v = mixed_qkv.narrow(D::Minus1, self.key_dim * 2, self.value_dim)?;
+            let q = q.reshape((batch_size, seq_len, self.num_k_heads, self.head_k_dim))?;
+            let k = k.reshape((batch_size, seq_len, self.num_k_heads, self.head_k_dim))?;
+            let v = v.reshape((batch_size, seq_len, self.num_v_heads, self.head_v_dim))?;
+
+            let beta = sigmoid(&b)?;
+            let dt_bias = self.dt_bias.unsqueeze(0)?.unsqueeze(0)?;
+            let xa = a.broadcast_add(&dt_bias)?;
+            let sp = {
+                let pos = (xa.clone() + (xa.neg()?.exp()? + 1.0)?.log()?)?;
+                let neg = (xa.exp()? + 1.0)?.log()?;
+                let zero = xa.zeros_like()?;
+                let sp = xa.gt(&zero)?.where_cond(&pos, &neg)?;
+                xa.le(20.0)?.where_cond(&sp, &xa)?
+            };
+            let g = self.a.unsqueeze(0)?.unsqueeze(0)?.broadcast_mul(&sp)?;
+            note("g", &g);
+            note("beta", &beta);
+
+            let (q, k) = if v_per_group > 1 {
+                let tile = |t: &Tensor| {
+                    t.unsqueeze(2)?.repeat((1, 1, v_per_group, 1, 1))?.reshape((
+                        batch_size,
+                        seq_len,
+                        self.num_v_heads,
+                        self.head_k_dim,
+                    ))
+                };
+                (tile(&q)?, tile(&k)?)
+            } else {
+                (q, k)
+            };
+
+            let q = store(l2_norm(&q, L2_NORM_EPS)?)?;
+            let k = store(l2_norm(&k, L2_NORM_EPS)?)?;
+            note("q", &q);
+            note("k", &k);
+            note("v", &v);
+
+            let y = store(cache.recurrence(&q, &k, &v, &g, &beta)?)?;
+            note("core", &y);
+            cache.seqlen_offset += seq_len;
+
+            let z_shape = z.shape().clone();
+            let y = y.reshape(((), self.head_v_dim))?;
+            let z = z.reshape(((), self.head_v_dim))?;
+            let y = store(self.norm.forward(&y, &z)?)?;
+            let y = y
+                .reshape(z_shape)?
+                .reshape((batch_size, seq_len, self.value_dim))?;
+            note("normed", &y);
+            y
         };
-
-        // 6. L2-normalize q and k, one rounding.
-        let q = store(l2_norm(&q, L2_NORM_EPS)?)?;
-        let k = store(l2_norm(&k, L2_NORM_EPS)?)?;
-        note("q", &q);
-        note("k", &k);
-        note("v", &v);
-
-        // 7. Recurrent gated delta rule in f32; its output is stored.
-        let y = store(cache.recurrence(&q, &k, &v, &g, &beta)?)?;
-        note("core", &y);
-        cache.seqlen_offset += seq_len;
-
-        // 8. Gated RMSNorm with z (stored), then the output projection.
-        let z_shape = z.shape().clone();
-        let y = y.reshape(((), self.head_v_dim))?;
-        let z = z.reshape(((), self.head_v_dim))?;
-        let y = store(self.norm.forward(&y, &z)?)?;
-        let y = y
-            .reshape(z_shape)?
-            .reshape((batch_size, seq_len, self.value_dim))?;
-        note("normed", &y);
 
         // When `ssm_out.weight` was Hadamard-folded in HF grouped V-head order (`gdn_v_grouped`),
         // transpose tiled `[batch, seq, v_per_group, num_k_heads, head_v_dim]` back to grouped
@@ -2046,6 +2077,27 @@ pub(crate) struct DecoderLayer {
 }
 
 impl DecoderLayer {
+    pub(crate) fn with_folded_norm_signs(mut self, hidden_size: usize) -> Result<Self> {
+        if let LayerImpl::FullAttention(ref mut attn) = self.layer_impl {
+            if let Some(had) = attn.input_hadamard_for_norm_fold().cloned() {
+                if let Some(signs) = had.signs_for(hidden_size)? {
+                    self.input_layernorm = self.input_layernorm.mul_weight(signs)?;
+                }
+                attn.set_presigned_input();
+            }
+        }
+        if let MoeOrMlp::Mlp(ref mut dense) = self.mlp {
+            if let Some(had) = dense.input_hadamard_for_norm_fold().cloned() {
+                if let Some(signs) = had.signs_for(hidden_size)? {
+                    self.post_attention_layernorm =
+                        self.post_attention_layernorm.mul_weight(signs)?;
+                }
+                dense.set_presigned_input();
+            }
+        }
+        Ok(self)
+    }
+
     /// This block's MRoPE cos/sin for `[3, batch, seq]` position ids.
     pub(crate) fn rotary_cos_sin(
         &self,
@@ -2267,6 +2319,8 @@ impl PropsGGUF {
 pub struct ModelWeights {
     tok_embeddings: TokEmbedding,
     embed_hadamard: Option<Arc<DeviceHadamard>>,
+    hadamard_meta: Option<HadamardMeta>,
+    root_hadamard: Option<Arc<DeviceHadamard>>,
     layers: Vec<DecoderLayer>,
     layer_types: Vec<LayerType>,
     norm: QRmsNorm,
@@ -2481,13 +2535,18 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 MoeOrMlp::Mlp(dense)
             };
 
-            layers.push(DecoderLayer {
-                layer_impl,
-                input_layernorm,
-                post_attention_layernorm,
-                mlp,
-            });
+            layers.push(
+                DecoderLayer {
+                    layer_impl,
+                    input_layernorm,
+                    post_attention_layernorm,
+                    mlp,
+                }
+                .with_folded_norm_signs(props.embedding_length)?,
+            );
         }
+
+        let root_hadamard = hadamards.get(&device.location()).cloned();
 
         // Pipeline hybrid cache (recurrent pool for GDN layers + KV cache for attention layers).
         let pipeline_layer_types: Vec<HybridLayerType> = layer_types
@@ -2517,6 +2576,8 @@ impl ModelConfig::FromGGUF for ModelWeights {
         Ok(Self {
             tok_embeddings,
             embed_hadamard,
+            hadamard_meta,
+            root_hadamard,
             layers,
             layer_types,
             norm,
@@ -2774,6 +2835,17 @@ impl ModelWeights {
 
     pub(crate) fn compute_dtype(&self) -> DType {
         self.dtype
+    }
+
+    pub(crate) fn hadamard_for_mtp(&self) -> Option<(&Arc<DeviceHadamard>, &HadamardMeta)> {
+        match (&self.root_hadamard, &self.hadamard_meta) {
+            (Some(had), Some(hm)) => Some((had, hm)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn has_embed_hadamard(&self) -> bool {
+        self.embed_hadamard.is_some()
     }
 
     /// Stash the final-norm hidden state and positions of each forward for the MTP head.
@@ -3213,6 +3285,9 @@ mod tests {
                 QuantMethodConfig::Unquantized(Linear::new(tensor(name)?, None)),
             )?))
         };
+        let dt_bias = tensor("ssm_dt.bias")?;
+        let dt_bias_f32 = dt_bias.to_dtype(DType::F32)?.contiguous()?;
+        let neg_exp_a = a_log.to_dtype(DType::F32)?.exp()?.neg()?.contiguous()?;
         let twin = GatedDeltaNet {
             in_proj: GdnInProj::Split {
                 qkv: dense("attn_qkv.weight")?,
@@ -3221,8 +3296,10 @@ mod tests {
                 a: dense("ssm_alpha.weight")?,
             },
             conv1d_weight: tensor("ssm_conv1d.weight")?.unsqueeze(1)?,
-            dt_bias: tensor("ssm_dt.bias")?,
+            dt_bias,
+            dt_bias_f32,
             a_log,
+            neg_exp_a,
             norm: RmsNormGated::from_weight(tensor("ssm_norm.weight")?, f64::from(EPS)),
             out_proj: dense("ssm_out.weight")?,
             num_k_heads: GDN_HEADS,
@@ -3986,6 +4063,97 @@ mod tests {
             conv_diff < 1e-2 && rec_diff < 1e-2,
             "final Qwen3.5 GDN state mismatch after stand-down+graph: conv={conv_diff}, rec={rec_diff}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn qwen35_rmsnorm_sign_folding_is_bit_exact() -> Result<()> {
+        let mut devices = vec![Device::Cpu];
+        #[cfg(feature = "cuda")]
+        if let Ok(cuda_dev) = Device::new_cuda(0) {
+            devices.push(cuda_dev);
+        }
+
+        for dev in devices {
+            for &block in &[1024usize, 4096] {
+                let width = block;
+                let sign_vals: Vec<i32> = (0..width)
+                    .map(|i| if (i * 11 + 5) % 2 == 0 { 1 } else { -1 })
+                    .collect();
+                let mut kv = HashMap::new();
+                kv.insert(
+                    "prism.hadamard.version".into(),
+                    gguf_file::Value::U32(1),
+                );
+                kv.insert(
+                    "prism.hadamard.block_size".into(),
+                    gguf_file::Value::U32(block as u32),
+                );
+                kv.insert(
+                    "prism.hadamard.transform".into(),
+                    gguf_file::Value::String("normalized-sylvester-walsh-hadamard".into()),
+                );
+                kv.insert(
+                    "prism.hadamard.axis".into(),
+                    gguf_file::Value::String("input-last-dimension".into()),
+                );
+                kv.insert(
+                    "prism.hadamard.sign_mode".into(),
+                    gguf_file::Value::String("explicit".into()),
+                );
+                kv.insert(
+                    "prism.hadamard.sign_widths".into(),
+                    gguf_file::Value::Array(vec![gguf_file::Value::I32(width as i32)]),
+                );
+                kv.insert(
+                    "prism.hadamard.sign_values".into(),
+                    gguf_file::Value::Array(
+                        sign_vals.iter().map(|&v| gguf_file::Value::I8(v as i8)).collect(),
+                    ),
+                );
+                kv.insert(
+                    "prism.hadamard.weight_names".into(),
+                    gguf_file::Value::Array(vec![gguf_file::Value::String(
+                        "blk.0.ffn_gate.weight".into(),
+                    )]),
+                );
+
+                let hm = HadamardMeta::from_gguf_metadata(&kv)?.unwrap();
+                let had = DeviceHadamard::new(&hm, &dev)?;
+                let signs = had.signs_for(width)?.unwrap();
+
+                let norm_w_vals: Vec<f32> = (0..width)
+                    .map(|i| 0.75 + ((i as f32) * 0.013).sin() * 0.4)
+                    .collect();
+                let norm = QRmsNorm::from_weight(
+                    Tensor::from_vec(norm_w_vals, (width,), &dev)?,
+                    1e-6,
+                );
+                let signed_norm = norm.mul_weight(signs)?;
+
+                let x_vals: Vec<f32> = (0..(2 * width))
+                    .map(|i| ((i as f32) * 0.021 - 1.1).cos())
+                    .collect();
+                let x_f32 = Tensor::from_vec(x_vals, (2, width), &dev)?;
+
+                let dtypes: &[DType] = if dev.is_cuda() {
+                    &[DType::F32, DType::F16, DType::BF16]
+                } else {
+                    &[DType::F32]
+                };
+                for &dt in dtypes {
+                    let x = x_f32.to_dtype(dt)?;
+                    let unfolded = had.forward(&norm.forward(&x)?)?;
+                    let folded = had.forward_presigned(&signed_norm.forward(&x)?)?;
+                    let u_v = unfolded.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+                    let f_v = folded.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+                    assert_eq!(
+                        u_v, f_v,
+                        "sign-folded RMSNorm + FWHT must be IEEE-754 bit-exact (block={block}, dt={dt:?}, dev={dev:?})"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 }

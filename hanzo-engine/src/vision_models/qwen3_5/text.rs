@@ -546,28 +546,30 @@ impl Qwen3_5TextModel {
             )
             .is_err();
 
+        let mut cfg = cfg.clone();
+        if let Some(ref mut qcfg) = cfg.quantization_config {
+            qcfg.with_afq_module_specs(&cfg.modules);
+        }
+        let cfg = &cfg;
+
         let vb_embed = mapper.set_nm_device(vb_m.pp("embed_tokens"), false);
-        let embed_tokens = if let Some((bits, group_size)) = cfg
-            .quantization_config
-            .as_ref()
-            .and_then(|q| q.afq_at(&vb_embed.prefix()))
-            .filter(|_| vb_embed.contains_tensor("scales"))
-        {
-            TextEmbedding::Afq(hanzo_quant::AfqLayer::afq_linear_typed(
-                cfg.hidden_size,
-                cfg.vocab_size,
-                bits,
-                group_size,
-                false,
-                vb_embed,
-            )?)
-        } else {
-            TextEmbedding::Dense(layers::embedding(
+        let embed_tokens = match cfg.quantization_config.as_ref() {
+            Some(q)
+                if q.afq_at(&vb_embed.prefix()).is_some() && vb_embed.contains_tensor("scales") =>
+            {
+                TextEmbedding::Afq(hanzo_quant::AfqLayer::afq_embed(
+                    cfg.vocab_size,
+                    cfg.hidden_size,
+                    q,
+                    vb_embed,
+                )?)
+            }
+            _ => TextEmbedding::Dense(layers::embedding(
                 cfg.vocab_size,
                 cfg.hidden_size,
                 vb_embed,
                 &cfg.quantization_config,
-            )?)
+            )?),
         };
 
         let layer_types = cfg.layer_types();
@@ -784,9 +786,12 @@ impl Qwen3_5TextModel {
         visual_pos_masks: Option<&Tensor>,
         deepstack_visual_embeds: Option<&[Tensor]>,
     ) -> Result<Tensor> {
+        let b_sz = xs.dim(0)?;
         let mut hybrid_cache = self.cache.hybrid();
         let trail = hybrid_cache.records_trail(xs.dim(1)?);
         let state_indices = hybrid_cache.state_indices().cloned();
+        let state_indices_host: Option<Vec<u32>> =
+            hybrid_cache.state_indices_host().map(|s| s.to_vec());
         if self
             .layer_types
             .iter()
@@ -865,12 +870,37 @@ impl Qwen3_5TextModel {
                 }
                 LayerType::LinearAttention => {
                     if let Some(HybridLayerCache::Recurrent(pool)) = hybrid_cache.get_mut(i) {
-                        let indices = state_indices.as_ref().expect(
-                            "checked above: linear-attention layers require recurrent indices",
-                        );
-                        xs = forward_pooled(pool, PoolSlots::Many(indices), i, trail, |cache| {
-                            layer.forward_linear(&xs, cache)
-                        })?;
+                        if b_sz == 1 {
+                            if let Some(slot) =
+                                state_indices_host.as_ref().and_then(|s| s.first().copied())
+                            {
+                                let slots = PoolSlots::One {
+                                    slot: slot as usize,
+                                    offset: seqlen_offsets.first().copied().unwrap_or(0),
+                                };
+                                xs = forward_pooled(pool, slots, i, trail, |cache| {
+                                    layer.forward_linear(&xs, cache)
+                                })?;
+                            } else {
+                                let indices = state_indices.as_ref().expect(
+                                    "checked above: linear-attention layers require recurrent indices",
+                                );
+                                xs = forward_pooled(
+                                    pool,
+                                    PoolSlots::Many(indices),
+                                    i,
+                                    trail,
+                                    |cache| layer.forward_linear(&xs, cache),
+                                )?;
+                            }
+                        } else {
+                            let indices = state_indices.as_ref().expect(
+                                "checked above: linear-attention layers require recurrent indices",
+                            );
+                            xs = forward_pooled(pool, PoolSlots::Many(indices), i, trail, |cache| {
+                                layer.forward_linear(&xs, cache)
+                            })?;
+                        }
                     } else {
                         hanzo_ml::bail!(
                             "Hybrid cache layer {i} is not recurrent for a linear-attention layer."
