@@ -3374,8 +3374,11 @@ dependencies = [
 name = "hanzo-engine-ffi"
 version = "0.1.0"
 dependencies = [
+ "either",
  "hanzo-engine",
  "hanzo-server-core",
+ "indexmap 2.14.0",
+ "serde_json",
  "tokio",
 ]
 

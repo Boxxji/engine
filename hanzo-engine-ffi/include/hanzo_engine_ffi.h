@@ -49,7 +49,28 @@ int32_t hanzo_ffi_unload(const uint8_t *name, size_t name_len);
  * Errors: -1 bad args, -2 engine unavailable, -3 list failed. */
 int32_t hanzo_ffi_list(uint8_t **out, size_t *out_len);
 
-/* Release a buffer from hanzo_ffi_infer or hanzo_ffi_list. */
+/* Called once per generated text piece. Return non-zero to stop generating. */
+typedef int32_t (*hanzo_ffi_token_cb)(const uint8_t *text, size_t len, void *ctx);
+
+/* Chat on model `model` (NULL/empty = default), streaming. `messages` is a JSON
+ * array of {"role": "...", "content": "..."}, rendered with the model's own chat
+ * template. `on_token` receives each text piece as it is generated; at most
+ * `max_tokens` are produced (0 = 1024). On return *usage / *usage_len hold a JSON
+ * object {prompt_tokens, completion_tokens, prompt_tok_per_sec, tok_per_sec,
+ * seconds} (release with hanzo_ffi_free; NULL if the run was cut short).
+ * Blocks the calling thread. Returns 0 when generation ended (model, max_tokens
+ * or callback). Errors: -1 bad args, -2 engine unavailable, -3 failed. */
+int32_t hanzo_ffi_chat(const uint8_t *model, size_t model_len,
+                       const uint8_t *messages, size_t messages_len,
+                       uint32_t max_tokens,
+                       hanzo_ffi_token_cb on_token, void *ctx,
+                       uint8_t **usage, size_t *usage_len);
+
+/* Why the last failing call failed: UTF-8 text in a fresh buffer (*out may be NULL
+ * when nothing has failed). Release with hanzo_ffi_free. Returns 0. */
+int32_t hanzo_ffi_error(uint8_t **out, size_t *out_len);
+
+/* Release a buffer from hanzo_ffi_infer, hanzo_ffi_chat, hanzo_ffi_list or hanzo_ffi_error. */
 void hanzo_ffi_free(uint8_t *ptr, size_t len);
 
 /* Release a buffer from hanzo_ffi_embed. */

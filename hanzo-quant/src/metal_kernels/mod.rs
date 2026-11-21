@@ -38,7 +38,7 @@ pub enum MetalKernelError {
     LockError(String),
     #[error("Error while loading function: {0:?}")]
     LoadFunctionError(String),
-    #[error("Failed to create pipeline")]
+    #[error("Failed to create pipeline: {0}")]
     FailedToCreatePipeline(String),
     #[error("dtype mismatch, got {got:?}, expected {expected:?}")]
     DTypeMismatch { expected: Vec<DType>, got: DType },
@@ -362,7 +362,7 @@ impl Kernels {
         let func = self.load_function(device, &name, constants.as_ref())?;
         let pipeline = device
             .new_compute_pipeline_state_with_function(&func)
-            .map_err(|e| MetalKernelError::FailedToCreatePipeline(e.to_string()))?;
+            .map_err(|e| MetalKernelError::FailedToCreatePipeline(format!("{name}: {e}")))?;
         pipelines.insert((name, constants), pipeline.clone());
         Ok(pipeline)
     }

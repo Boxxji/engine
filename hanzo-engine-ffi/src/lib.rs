@@ -17,10 +17,23 @@
 
 #![allow(clippy::doc_lazy_continuation, clippy::doc_overindented_list_items)]
 
-use std::ffi::c_int;
+use std::ffi::{c_int, c_void};
 use std::sync::OnceLock;
 
+use either::Either;
+use hanzo_engine::{
+    MessageContent, NormalRequest, Request, RequestMessage, Response, SamplingParams,
+};
 use hanzo_server_core::server::{load_model_at_runtime, ModelConfig, ServerBuilder};
+use indexmap::IndexMap;
+
+/// Why the last call failed, for [`hanzo_ffi_error`].
+static LAST_ERROR: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+fn fail<T>(e: String) -> Result<T, String> {
+    *LAST_ERROR.lock().unwrap_or_else(|p| p.into_inner()) = e.clone();
+    Err(e)
+}
 
 /// Lazy one-time multi-model engine build. `Ok(())` once registered.
 fn ensure_engine() -> Result<(), String> {
@@ -45,7 +58,11 @@ fn ensure_engine() -> Result<(), String> {
         let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
         let hanzo = rt
             .block_on(builder.build())
-            .map_err(|e| format!("engine build failed: {e}"))?;
+            .map_err(|e| format!("engine build failed: {e:#}"));
+        let hanzo = match hanzo {
+            Ok(h) => h,
+            Err(e) => return fail(e),
+        };
         hanzo_engine::register_engine(hanzo);
         Ok(())
     })
@@ -280,6 +297,174 @@ pub unsafe extern "C" fn hanzo_ffi_list(out: *mut *mut u8, out_len: *mut usize) 
     std::mem::forget(bytes);
     *out = ptr;
     *out_len = len;
+    0
+}
+
+/// Called once per generated text piece. Return non-zero to stop generating.
+pub type TokenCallback = extern "C" fn(text: *const u8, len: usize, ctx: *mut c_void) -> c_int;
+
+/// Chat on model `model` (NUL/empty = default), streaming. `messages` is a JSON
+/// array of `{"role": "...", "content": "..."}`, rendered with the model's own
+/// chat template. `on_token` receives each text piece as it is generated; at
+/// most `max_tokens` are produced (0 = 1024). On return `*usage` / `*usage_len`
+/// hold a JSON object `{prompt_tokens, completion_tokens, prompt_tok_per_sec,
+/// tok_per_sec, seconds}` (free with [`hanzo_ffi_free`]; null if the run was
+/// cut before the engine reported it).
+///
+/// Returns 0 when generation ended, by the model, by `max_tokens` or by the
+/// callback. Errors: -1 bad args, -2 engine unavailable, -3 generation failed.
+///
+/// # Safety
+/// Pointers must be valid for their lengths; `usage`/`usage_len` writable or
+/// null; `ctx` is passed to `on_token` untouched. Blocks the calling thread.
+#[no_mangle]
+pub unsafe extern "C" fn hanzo_ffi_chat(
+    model: *const u8,
+    model_len: usize,
+    messages: *const u8,
+    messages_len: usize,
+    max_tokens: u32,
+    on_token: Option<TokenCallback>,
+    ctx: *mut c_void,
+    usage: *mut *mut u8,
+    usage_len: *mut usize,
+) -> c_int {
+    let Some(on_token) = on_token else { return -1 };
+    if messages.is_null() {
+        return -1;
+    }
+    let Ok(turns) = serde_json::from_slice::<Vec<serde_json::Value>>(std::slice::from_raw_parts(
+        messages,
+        messages_len,
+    )) else {
+        return -1;
+    };
+    let mut chat: Vec<IndexMap<String, MessageContent>> = Vec::with_capacity(turns.len());
+    for t in &turns {
+        let (Some(role), Some(content)) = (
+            t.get("role").and_then(|v| v.as_str()),
+            t.get("content").and_then(|v| v.as_str()),
+        ) else {
+            return -1;
+        };
+        let mut m: IndexMap<String, MessageContent> = IndexMap::new();
+        m.insert("role".to_string(), Either::Left(role.to_string()));
+        m.insert("content".to_string(), Either::Left(content.to_string()));
+        chat.push(m);
+    }
+    if chat.is_empty() {
+        return -1;
+    }
+    if ensure_engine().is_err() {
+        return -2;
+    }
+    let Some(hanzo) = hanzo_engine::engine_handle() else {
+        return -2;
+    };
+    let name = model_str(model, model_len);
+    let model_id = if name.is_empty() || name == "default" {
+        None
+    } else {
+        Some(name)
+    };
+
+    let mut sampling = SamplingParams::deterministic();
+    sampling.temperature = Some(0.7);
+    sampling.top_k = Some(40);
+    sampling.top_p = Some(0.9);
+    sampling.max_len = Some(if max_tokens == 0 { 1024 } else { max_tokens as usize });
+    let request = RequestMessage::Chat {
+        messages: chat,
+        enable_thinking: Some(false),
+        reasoning_effort: None,
+        preserve_thinking: None,
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let mut req = NormalRequest::new_simple(request, sampling, tx, 0, None, None);
+    req.is_streaming = true;
+    req.model_id = model_id;
+    if hanzo.send_request(Request::Normal(Box::new(req))).is_err() {
+        return -2;
+    }
+
+    let mut report: Option<String> = None;
+    loop {
+        match rx.blocking_recv() {
+            Some(Response::Chunk(chunk)) => {
+                if let Some(text) = chunk.choices.first().and_then(|c| c.delta.content.as_deref()) {
+                    if !text.is_empty() && on_token(text.as_ptr(), text.len(), ctx) != 0 {
+                        // Dropping the receiver ends the request on the engine side.
+                        break;
+                    }
+                }
+                if let Some(u) = chunk.usage {
+                    report = Some(
+                        serde_json::json!({
+                            "prompt_tokens": u.prompt_tokens,
+                            "completion_tokens": u.completion_tokens,
+                            "prompt_tok_per_sec": u.avg_prompt_tok_per_sec,
+                            "tok_per_sec": u.avg_compl_tok_per_sec,
+                            "seconds": u.total_time_sec,
+                        })
+                        .to_string(),
+                    );
+                }
+                if chunk.choices.first().is_some_and(|c| c.finish_reason.is_some()) && report.is_some() {
+                    break;
+                }
+            }
+            Some(Response::Done(_)) | None => break,
+            Some(Response::ModelError(msg, _)) => {
+                let _: Result<(), String> = fail(msg);
+                return -3;
+            }
+            Some(Response::ValidationError(e)) | Some(Response::InternalError(e)) => {
+                let _: Result<(), String> = fail(e.to_string());
+                return -3;
+            }
+            Some(_) => {
+                let _: Result<(), String> = fail("unexpected engine response".to_string());
+                return -3;
+            }
+        }
+    }
+    if !usage.is_null() && !usage_len.is_null() {
+        match report {
+            Some(r) => {
+                let mut bytes = r.into_bytes();
+                bytes.shrink_to_fit();
+                *usage_len = bytes.len();
+                *usage = bytes.as_mut_ptr();
+                std::mem::forget(bytes);
+            }
+            None => {
+                *usage = std::ptr::null_mut();
+                *usage_len = 0;
+            }
+        }
+    }
+    0
+}
+
+/// Why the last failing call failed, as UTF-8 text in a fresh buffer written to
+/// `*out` / `*out_len` (free with [`hanzo_ffi_free`]); empty if nothing has failed.
+///
+/// # Safety
+/// `out`/`out_len` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn hanzo_ffi_error(out: *mut *mut u8, out_len: *mut usize) -> c_int {
+    if out.is_null() || out_len.is_null() {
+        return -1;
+    }
+    let mut bytes = LAST_ERROR.lock().unwrap_or_else(|p| p.into_inner()).clone().into_bytes();
+    bytes.shrink_to_fit();
+    *out_len = bytes.len();
+    if bytes.is_empty() {
+        *out = std::ptr::null_mut();
+    } else {
+        *out = bytes.as_mut_ptr();
+        std::mem::forget(bytes);
+    }
     0
 }
 

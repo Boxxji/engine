@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Build the Hanzo engine FFI cdylib with the right native backend for THIS host.
 # One script, every platform: macOS (Metal/Accelerate), Linux (CUDA/ROCm/CPU).
+# iOS: HANZO_FFI_TARGET=aarch64-apple-ios (device) or aarch64-apple-ios-sim (simulator) builds the Metal
+# staticlib an app links (apps/mobile/modules/hanzo-engine/build.sh wraps both into an xcframework).
 # CI (arcd, one job per <org>-<os>-<arch>) runs this on each platform; locally it
 # auto-picks. Override with HANZO_FFI_FEATURES.
 set -euo pipefail
@@ -27,12 +29,19 @@ if [ -z "$FEATURES" ]; then
   esac
 fi
 
-echo "==> hanzo-engine-ffi  os=$OS arch=$ARCH features=[${FEATURES:-cpu}]"
-if [ -n "$FEATURES" ]; then
-  cargo build --release -p hanzo-engine-ffi --features "$FEATURES"
-else
-  cargo build --release -p hanzo-engine-ffi
-fi
+TARGET="${HANZO_FFI_TARGET:-}"
+case "$TARGET" in
+  aarch64-apple-ios|aarch64-apple-ios-sim)
+    SDK=iphoneos; [ "$TARGET" = aarch64-apple-ios-sim ] && SDK=iphonesimulator
+    export SDKROOT="$(xcrun --sdk $SDK --show-sdk-path)" IPHONEOS_DEPLOYMENT_TARGET=18.0
+    FEATURES="${HANZO_FFI_FEATURES:-metal}"
+    ;;
+  "") ;;
+  *) echo "unsupported HANZO_FFI_TARGET: $TARGET" >&2; exit 2 ;;
+esac
+
+echo "==> hanzo-engine-ffi  os=$OS arch=$ARCH target=${TARGET:-host} features=[${FEATURES:-cpu}]"
+cargo build --release -p hanzo-engine-ffi ${FEATURES:+--features "$FEATURES"} ${TARGET:+--target "$TARGET"}
 
 echo "==> artifacts:"
-ls -lh target/release/libhanzo_engine_ffi.* 2>/dev/null || true
+ls -lh "${CARGO_TARGET_DIR:-target}/${TARGET}/release/"libhanzo_engine_ffi.* 2>/dev/null || true

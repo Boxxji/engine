@@ -192,12 +192,29 @@ fn main() -> Result<(), String> {
         TvOS,
     }
 
+    /// The iOS simulator runs AIR built for its own platform, not the device's.
+    fn ios_simulator() -> bool {
+        env::var("TARGET").is_ok_and(|t| t.ends_with("-sim"))
+    }
+
     impl Platform {
         fn sdk(&self) -> &str {
             match self {
                 Platform::MacOS => "macosx",
+                Platform::Ios if ios_simulator() => "iphonesimulator",
                 Platform::Ios => "iphoneos",
                 Platform::TvOS => "appletvos",
+            }
+        }
+
+        /// The oldest OS the library must load on. Without it the toolchain stamps the SDK's own
+        /// version (Xcode 27 emits AIR v2.9 for iOS 27.2), which an iOS 26 device cannot load.
+        fn min_os(&self) -> Option<&str> {
+            match self {
+                Platform::MacOS => None,
+                Platform::Ios if ios_simulator() => Some("-mios-simulator-version-min=18.0"),
+                Platform::Ios => Some("-mios-version-min=18.0"),
+                Platform::TvOS => Some("-mtvos-version-min=18.0"),
             }
         }
 
@@ -231,6 +248,7 @@ fn main() -> Result<(), String> {
             .arg(platform.sdk())
             .arg("metal")
             .arg(format!("-std={}", platform.metal_std()))
+            .args(platform.min_os())
             .arg(format!("-working-directory={working_directory}"))
             .arg("-Wall")
             .arg("-Wextra")
@@ -275,7 +293,11 @@ fn main() -> Result<(), String> {
         };
         let metallib = out_dir.join(lib_name);
         let mut compile_metallib_cmd = Command::new("xcrun");
-        compile_metallib_cmd.arg("metal").arg("-o").arg(&metallib);
+        compile_metallib_cmd
+            .arg("metal")
+            .args(platform.min_os())
+            .arg("-o")
+            .arg(&metallib);
 
         for metal_file in METAL_SOURCES {
             compile_metallib_cmd.arg(out_dir.join(format!("{metal_file}.air")));
