@@ -15,9 +15,7 @@ use std::collections::HashMap;
 
 use hanzo_ml::{Result, Tensor};
 
-use super::{
-    HybridCache, HybridLayerCache, KvCacheSnapshot, RecurrentStateSnapshot,
-};
+use super::{HybridCache, HybridLayerCache, KvCacheSnapshot, RecurrentStateSnapshot};
 
 /// Immutable, deep-copied snapshot of a request's complete hybrid execution state.
 #[derive(Debug, Clone)]
@@ -61,7 +59,9 @@ impl HybridStateContract {
             return Ok(existing.recurrent_slot);
         }
         let Some(slot) = self.cache.allocate_seq() else {
-            hanzo_ml::bail!("HybridStateContract: failed to allocate recurrent slot for req {request_id}");
+            hanzo_ml::bail!(
+                "HybridStateContract: failed to allocate recurrent slot for req {request_id}"
+            );
         };
         self.bindings.insert(
             request_id,
@@ -109,7 +109,9 @@ impl HybridStateContract {
             .get(&request_id)
             .ok_or_else(|| hanzo_ml::Error::Msg(format!("unknown request_id {request_id}")))?;
 
-        let raw_rec = self.cache.snapshot_recurrent_state(binding.recurrent_slot)?;
+        let raw_rec = self
+            .cache
+            .snapshot_recurrent_state(binding.recurrent_slot)?;
         let mut recurrent_snapshots = Vec::with_capacity(raw_rec.len());
         for snap in raw_rec {
             recurrent_snapshots.push(RecurrentStateSnapshot {
@@ -340,11 +342,7 @@ mod tests {
             .zip(&bv)
             .map(|(x, y)| (x - y).abs())
             .fold(0.0f32, f32::max);
-        let max_mag = bv
-            .iter()
-            .map(|y| y.abs())
-            .fold(0.0f32, f32::max)
-            .max(1e-6);
+        let max_mag = bv.iter().map(|y| y.abs()).fold(0.0f32, f32::max).max(1e-6);
         Ok(max_diff / max_mag)
     }
 
@@ -380,15 +378,21 @@ mod tests {
                 .get_mut(0)
                 .and_then(HybridLayerCache::as_recurrent_pool_mut)
                 .expect("layer 0 recurrent");
-            forward_pooled(pool, PoolSlots::Many(&slot_t), 0, record_trail, |cache: &mut GdnLayerCache| {
-                cache.trail_conv(conv_in)?;
-                let seq_len = conv_in.dim(1)?;
-                let window = Tensor::cat(&[&cache.conv_state, &conv_in.transpose(1, 2)?], 2)?;
-                cache.conv_state = window.narrow(2, seq_len, conv_k)?.contiguous()?;
-                let y = cache.recurrence(q, k, v, g, beta)?;
-                cache.seqlen_offset += seq_len;
-                Ok(y)
-            })?
+            forward_pooled(
+                pool,
+                PoolSlots::Many(&slot_t),
+                0,
+                record_trail,
+                |cache: &mut GdnLayerCache| {
+                    cache.trail_conv(conv_in)?;
+                    let seq_len = conv_in.dim(1)?;
+                    let window = Tensor::cat(&[&cache.conv_state, &conv_in.transpose(1, 2)?], 2)?;
+                    cache.conv_state = window.narrow(2, seq_len, conv_k)?.contiguous()?;
+                    let y = cache.recurrence(q, k, v, g, beta)?;
+                    cache.seqlen_offset += seq_len;
+                    Ok(y)
+                },
+            )?
         };
 
         // Layer 1: Attention KV cache + SDPA
@@ -455,8 +459,10 @@ mod tests {
         let q_stream = seeded(&[1, total_seq, n_heads, kd], 12, 0.3, dev)?.to_dtype(dtype)?;
         let k_stream = seeded(&[1, total_seq, n_heads, kd], 13, 0.3, dev)?.to_dtype(dtype)?;
         let v_stream = seeded(&[1, total_seq, n_heads, vd], 14, 0.3, dev)?.to_dtype(dtype)?;
-        let g_stream = (seeded(&[1, total_seq, n_heads], 15, 0.25, dev)? - 0.35)?.to_dtype(dtype)?;
-        let b_stream = ((seeded(&[1, total_seq, n_heads], 16, 0.4, dev)? + 1.0)? * 0.5)?.to_dtype(dtype)?;
+        let g_stream =
+            (seeded(&[1, total_seq, n_heads], 15, 0.25, dev)? - 0.35)?.to_dtype(dtype)?;
+        let b_stream =
+            ((seeded(&[1, total_seq, n_heads], 16, 0.4, dev)? + 1.0)? * 0.5)?.to_dtype(dtype)?;
         let aq_stream = seeded(&[1, n_heads, total_seq, kd], 17, 0.3, dev)?.to_dtype(dtype)?;
         let ak_stream = seeded(&[1, n_kv, total_seq, kd], 18, 0.3, dev)?.to_dtype(dtype)?;
         let av_stream = seeded(&[1, n_kv, total_seq, kd], 19, 0.3, dev)?.to_dtype(dtype)?;
@@ -549,19 +555,8 @@ mod tests {
         let ver_av = Tensor::cat(&[&av_stream.narrow(2, 4, 2)?, &bad_av], 2)?.contiguous()?;
 
         let _ = hybrid_forward_step(
-            &mut spec,
-            1,
-            &ver_conv,
-            &ver_q,
-            &ver_k,
-            &ver_v,
-            &ver_g,
-            &ver_b,
-            &ver_aq,
-            &ver_ak,
-            &ver_av,
-            true,
-            block_size,
+            &mut spec, 1, &ver_conv, &ver_q, &ver_k, &ver_v, &ver_g, &ver_b, &ver_aq, &ver_ak,
+            &ver_av, true, block_size,
         )?;
         assert_eq!(spec.binding(1).unwrap().context_len, 8);
 
@@ -573,8 +568,14 @@ mod tests {
         // Request 2 (forked at len=4) must remain completely untouched at offset 4!
         let (fork_conv, fork_rec, fork_off) = spec.inspect_recurrent_layer(2, 0)?;
         assert_eq!(fork_off, 4);
-        assert_eq!(rel_err(&fork_conv, &ckpt_4.recurrent_snapshots[0].conv_state)?, 0.0);
-        assert_eq!(rel_err(&fork_rec, &ckpt_4.recurrent_snapshots[0].recurrent_state)?, 0.0);
+        assert_eq!(
+            rel_err(&fork_conv, &ckpt_4.recurrent_snapshots[0].conv_state)?,
+            0.0
+        );
+        assert_eq!(
+            rel_err(&fork_rec, &ckpt_4.recurrent_snapshots[0].recurrent_state)?,
+            0.0
+        );
 
         // Decode true token 6 after speculative rollback and assert parity with ground truth!
         let (yg6, ya6) = hybrid_forward_step(
@@ -614,8 +615,17 @@ mod tests {
         let fresh_slot = spec.allocate_request(99)?;
         let (c0, r0, o0) = spec.inspect_recurrent_layer(99, 0)?;
         assert_eq!(o0, 0);
-        assert!(c0.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?.iter().all(|&x| x == 0.0));
-        assert!(r0.flatten_all()?.to_vec1::<f32>()?.iter().all(|&x| x == 0.0));
+        assert!(c0
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?
+            .iter()
+            .all(|&x| x == 0.0));
+        assert!(r0
+            .flatten_all()?
+            .to_vec1::<f32>()?
+            .iter()
+            .all(|&x| x == 0.0));
         let _ = fresh_slot;
 
         dsl::set_gdn_impl(QkImpl::Legacy);
@@ -634,6 +644,143 @@ mod tests {
         let dev = Device::new_cuda(0)?;
         run_hybrid_contract_lifecycle(&dev, DType::F32, true)?;
         run_hybrid_contract_lifecycle(&dev, DType::BF16, true)?;
+        Ok(())
+    }
+
+    #[test]
+    fn hybrid_single_seq_kv_headroom_zero_copy() -> Result<()> {
+        // Guards against the 32K `copy3d_bf16` regression: cloning a `KvCache` across
+        // `HybridCacheManager::clone_in_cache`/`clone_out_cache` for a single active sequence must
+        // preserve `capacity_seq_len` headroom so `append()` writes in-place without reallocating.
+        let dev = Device::Cpu;
+        let mut seq_kv = super::super::KvCache::new_normal(2, 4096, 256);
+        let k0 = Tensor::zeros((1, 4, 100, 16), DType::F32, &dev)?;
+        let v0 = Tensor::zeros((1, 4, 100, 16), DType::F32, &dev)?;
+        let _ = seq_kv.append(&k0, &v0)?;
+
+        let cap_before = match &seq_kv {
+            super::super::KvCache::Normal { k, .. } => k.capacity_seq_len,
+            _ => unreachable!(),
+        };
+        assert!(cap_before > 100, "initial append must allocate headroom");
+
+        // Simulate 16 decode steps of clone_in -> append(1 token) -> clone_out.
+        for step in 1..=16usize {
+            let mut active = seq_kv.clone();
+            let k1 = Tensor::full(step as f32, (1, 4, 1, 16), &dev)?;
+            let v1 = Tensor::full(step as f32, (1, 4, 1, 16), &dev)?;
+            let (k_out, _) = active.append(&k1, &v1)?;
+            assert_eq!(k_out.dim(2)?, 100 + step);
+            seq_kv = active.clone();
+        }
+        let (len_after, cap_after) = match &seq_kv {
+            super::super::KvCache::Normal { k, .. } => (k.current_seq_len, k.capacity_seq_len),
+            _ => unreachable!(),
+        };
+        assert_eq!(len_after, 116);
+        assert_eq!(
+            cap_after, cap_before,
+            "single-seq clone_in/out must preserve capacity_seq_len without reallocating"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hybrid_single_to_multi_to_single_concurrency_and_cancellation() -> Result<()> {
+        // Exercises the full lifecycle across single-seq zero-copy -> 2-seq batched cat/chunk ->
+        // cancellation of seq B -> single-seq resume of seq A -> fresh seq C with empty cache:
+        // verifies zero cross-request buffer aliasing and zero stale data leakage.
+        let dev = Device::Cpu;
+        let mut seq_a = super::super::KvCache::new_normal(2, 4096, 64);
+        let mut seq_b = super::super::KvCache::new_normal(2, 4096, 64);
+
+        let ka0 = Tensor::full(1.0f32, (1, 2, 4, 8), &dev)?;
+        let va0 = Tensor::full(10.0f32, (1, 2, 4, 8), &dev)?;
+        seq_a.append(&ka0, &va0)?;
+        let kb0 = Tensor::full(2.0f32, (1, 2, 4, 8), &dev)?;
+        let vb0 = Tensor::full(20.0f32, (1, 2, 4, 8), &dev)?;
+        seq_b.append(&kb0, &vb0)?;
+
+        // Phase 1: single-seq A zero-copy clone_in -> append -> clone_out
+        let mut active = seq_a.clone();
+        let ka1 = Tensor::full(3.0f32, (1, 2, 1, 8), &dev)?;
+        let va1 = Tensor::full(30.0f32, (1, 2, 1, 8), &dev)?;
+        active.append(&ka1, &va1)?;
+        seq_a = active.clone();
+        // Match B to len=5 before concurrent batch step
+        let kb1 = Tensor::full(4.0f32, (1, 2, 1, 8), &dev)?;
+        let vb1 = Tensor::full(40.0f32, (1, 2, 1, 8), &dev)?;
+        seq_b.append(&kb1, &vb1)?;
+
+        // Phase 2: concurrent 2-seq batch [A, B] (cat -> append -> chunk split)
+        let batch_k = Tensor::cat(&[&seq_a.k()?.unwrap(), &seq_b.k()?.unwrap()], 0)?;
+        let batch_v = Tensor::cat(&[&seq_a.v()?.unwrap(), &seq_b.v()?.unwrap()], 0)?;
+        let mut batched = super::super::KvCache::new_normal(2, 4096, 64);
+        if let super::super::KvCache::Normal { k, v } = &mut batched {
+            k.all_data = Some(batch_k);
+            k.current_seq_len = 5;
+            k.capacity_seq_len = 5;
+            v.all_data = Some(batch_v);
+            v.current_seq_len = 5;
+            v.capacity_seq_len = 5;
+        }
+        let step_k = Tensor::cat(
+            &[
+                &Tensor::full(5.0f32, (1, 2, 1, 8), &dev)?,
+                &Tensor::full(6.0f32, (1, 2, 1, 8), &dev)?,
+            ],
+            0,
+        )?;
+        let step_v = Tensor::cat(
+            &[
+                &Tensor::full(50.0f32, (1, 2, 1, 8), &dev)?,
+                &Tensor::full(60.0f32, (1, 2, 1, 8), &dev)?,
+            ],
+            0,
+        )?;
+        batched.append(&step_k, &step_v)?;
+        let k_chunks = batched.k()?.unwrap().chunk(2, 0)?;
+        let v_chunks = batched.v()?.unwrap().chunk(2, 0)?;
+        if let super::super::KvCache::Normal { k, v } = &mut seq_a {
+            k.all_data = Some(k_chunks[0].contiguous()?);
+            k.current_seq_len = 6;
+            k.capacity_seq_len = 6;
+            v.all_data = Some(v_chunks[0].contiguous()?);
+            v.current_seq_len = 6;
+            v.capacity_seq_len = 6;
+        }
+        if let super::super::KvCache::Normal { k, v } = &mut seq_b {
+            k.all_data = Some(k_chunks[1].contiguous()?);
+            k.current_seq_len = 6;
+            k.capacity_seq_len = 6;
+            v.all_data = Some(v_chunks[1].contiguous()?);
+            v.current_seq_len = 6;
+            v.capacity_seq_len = 6;
+        }
+
+        // Phase 3: cancel seq B, resume single-seq A zero-copy
+        drop(seq_b);
+        active = seq_a.clone();
+        active.append(
+            &Tensor::full(7.0f32, (1, 2, 1, 8), &dev)?,
+            &Tensor::full(70.0f32, (1, 2, 1, 8), &dev)?,
+        )?;
+        seq_a = active.clone();
+        let a_vals: Vec<f32> = seq_a
+            .k()?
+            .unwrap()
+            .narrow(1, 0, 1)?
+            .narrow(3, 0, 1)?
+            .flatten_all()?
+            .to_vec1()?;
+        assert_eq!(a_vals, vec![1.0, 1.0, 1.0, 1.0, 3.0, 5.0, 7.0]);
+
+        // Phase 4: fresh seq C with empty slot must reset active cache (no stale leak from A)
+        active.reset();
+        assert_eq!(active.current_seq_len(), 0);
+        assert!(active.k()?.is_none());
+        // Seq A's saved cache remains completely intact after active.reset()
+        assert_eq!(seq_a.current_seq_len(), 7);
         Ok(())
     }
 

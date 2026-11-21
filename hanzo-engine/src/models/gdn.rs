@@ -1006,54 +1006,53 @@ impl GatedDeltaNet {
         let v = v.reshape((batch_size, seq_len, self.num_v_heads, self.head_v_dim))?;
 
         // 4. Compute beta and g
-        let (beta, g) = if let Some(pair) =
-            hanzo_ml::gdn::try_gating(&b, &a, &self.a_log, &self.dt_bias)?
-        {
-            pair
-        } else {
-            #[cfg(feature = "cuda")]
-            {
-                if b.device().is_cuda() {
-                    let b_flat = b.contiguous()?.flatten_all()?;
-                    let a_flat = a.contiguous()?.flatten_all()?;
-                    let a_log_f32 = self.a_log.to_dtype(DType::F32)?.contiguous()?;
-                    let dt_bias_f32 = self.dt_bias.to_dtype(DType::F32)?.contiguous()?;
-                    let (beta_flat, g_flat) = crate::cuda::gdn::fused_gdn_gating_cuda(
-                        &b_flat,
-                        &a_flat,
-                        &a_log_f32,
-                        &dt_bias_f32,
-                    )?;
-                    let shape = b.shape();
-                    (beta_flat.reshape(shape)?, g_flat.reshape(shape)?)
-                } else {
+        let (beta, g) =
+            if let Some(pair) = hanzo_ml::gdn::try_gating(&b, &a, &self.a_log, &self.dt_bias)? {
+                pair
+            } else {
+                #[cfg(feature = "cuda")]
+                {
+                    if b.device().is_cuda() {
+                        let b_flat = b.contiguous()?.flatten_all()?;
+                        let a_flat = a.contiguous()?.flatten_all()?;
+                        let a_log_f32 = self.a_log.to_dtype(DType::F32)?.contiguous()?;
+                        let dt_bias_f32 = self.dt_bias.to_dtype(DType::F32)?.contiguous()?;
+                        let (beta_flat, g_flat) = crate::cuda::gdn::fused_gdn_gating_cuda(
+                            &b_flat,
+                            &a_flat,
+                            &a_log_f32,
+                            &dt_bias_f32,
+                        )?;
+                        let shape = b.shape();
+                        (beta_flat.reshape(shape)?, g_flat.reshape(shape)?)
+                    } else {
+                        self.compute_beta_g_cpu(&b, &a, dtype)?
+                    }
+                }
+                #[cfg(feature = "metal")]
+                {
+                    if b.device().is_metal() {
+                        let b_flat = b.contiguous()?.flatten_all()?;
+                        let a_flat = a.contiguous()?.flatten_all()?;
+                        let a_log_f32 = self.a_log.to_dtype(DType::F32)?.contiguous()?;
+                        let dt_bias_f32 = self.dt_bias.to_dtype(DType::F32)?.contiguous()?;
+                        let (beta_flat, g_flat) = crate::metal::gdn::fused_gdn_gating_metal(
+                            &b_flat,
+                            &a_flat,
+                            &a_log_f32,
+                            &dt_bias_f32,
+                        )?;
+                        let shape = b.shape();
+                        (beta_flat.reshape(shape)?, g_flat.reshape(shape)?)
+                    } else {
+                        self.compute_beta_g_cpu(&b, &a, dtype)?
+                    }
+                }
+                #[cfg(not(any(feature = "cuda", feature = "metal")))]
+                {
                     self.compute_beta_g_cpu(&b, &a, dtype)?
                 }
-            }
-            #[cfg(feature = "metal")]
-            {
-                if b.device().is_metal() {
-                    let b_flat = b.contiguous()?.flatten_all()?;
-                    let a_flat = a.contiguous()?.flatten_all()?;
-                    let a_log_f32 = self.a_log.to_dtype(DType::F32)?.contiguous()?;
-                    let dt_bias_f32 = self.dt_bias.to_dtype(DType::F32)?.contiguous()?;
-                    let (beta_flat, g_flat) = crate::metal::gdn::fused_gdn_gating_metal(
-                        &b_flat,
-                        &a_flat,
-                        &a_log_f32,
-                        &dt_bias_f32,
-                    )?;
-                    let shape = b.shape();
-                    (beta_flat.reshape(shape)?, g_flat.reshape(shape)?)
-                } else {
-                    self.compute_beta_g_cpu(&b, &a, dtype)?
-                }
-            }
-            #[cfg(not(any(feature = "cuda", feature = "metal")))]
-            {
-                self.compute_beta_g_cpu(&b, &a, dtype)?
-            }
-        };
+            };
 
         // 5. If num_v_heads > num_k_heads, repeat_interleave q and k
         let (q, k) = if v_per_group > 1 {

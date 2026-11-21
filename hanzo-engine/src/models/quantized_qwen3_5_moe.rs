@@ -450,6 +450,11 @@ impl DeviceHadamard {
         } else {
             None
         };
+        if let Some(out) = prof::timed(x.device(), &prof::HADAMARD_NS, || {
+            hanzo_ml::fwht::try_hadamard_fwht(x, signs, self.block_size, false)
+        })? {
+            return Ok(out);
+        }
         #[cfg(feature = "cuda")]
         if x.device().is_cuda() && self.block_size.is_power_of_two() && self.block_size <= 8192 {
             return prof::timed(x.device(), &prof::HADAMARD_NS, || {
@@ -497,6 +502,11 @@ impl DeviceHadamard {
         } else {
             None
         };
+        if let Some(out) = prof::timed(u.device(), &prof::HADAMARD_NS, || {
+            hanzo_ml::fwht::try_hadamard_fwht(u, signs, self.block_size, true)
+        })? {
+            return Ok(out);
+        }
         #[cfg(feature = "cuda")]
         if u.device().is_cuda() && self.block_size.is_power_of_two() && self.block_size <= 8192 {
             return prof::timed(u.device(), &prof::HADAMARD_NS, || {

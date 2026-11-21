@@ -510,6 +510,11 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     }
                 }
             };
+            if batch_len == 1 && first_k.is_contiguous() && first_v.is_contiguous() {
+                new_k_cache.push(Some(first_k));
+                new_v_cache.push(Some(first_v));
+                continue;
+            }
             // Build dims for batched cache
             let mut dims_k = first_k.dims().to_vec();
             let mut dims_v = first_v.dims().to_vec();
@@ -1247,7 +1252,38 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for HybridCa
             let layer_cache = hybrid_cache.caches.get_mut(layer_idx).unwrap();
 
             if let HybridLayerCache::Attention(kv_cache) = layer_cache {
-                // Batch KV caches from sequences (same as NormalCacheManager)
+                // Single-sequence fast path: move/share the existing KV storage + capacity_seq_len
+                // directly (O(1) Arc clone). Avoids 3x full-KV `copy3d` copies per layer per token
+                // (clone_in contiguous + zero-headroom SingleCache::append realloc + clone_out contiguous).
+                if seqs.len() == 1 {
+                    let seq_cache = if modify_draft_cache {
+                        seqs[0].normal_draft_cache()
+                    } else {
+                        seqs[0].normal_cache()
+                    };
+                    if let Some(Some(ref seq_kv)) = seq_cache.get(layer_idx) {
+                        let contiguous_backing = match seq_kv {
+                            KvCache::Normal { k, v } => {
+                                k.all_data.as_ref().is_some_and(|t| t.is_contiguous())
+                                    && v.all_data.as_ref().is_some_and(|t| t.is_contiguous())
+                            }
+                            KvCache::Rotating { k, v } => {
+                                k.all_data.as_ref().is_some_and(|t| t.is_contiguous())
+                                    && v.all_data.as_ref().is_some_and(|t| t.is_contiguous())
+                            }
+                            KvCache::Shared { .. } => true,
+                        };
+                        if contiguous_backing {
+                            *kv_cache = seq_kv.clone();
+                            continue;
+                        }
+                    } else {
+                        kv_cache.reset();
+                        continue;
+                    }
+                }
+
+                // Multi-sequence batching: concatenate active KV slices across sequences.
                 let mut k_tensors = Vec::new();
                 let mut v_tensors = Vec::new();
                 let mut template_cache: Option<KvCache> = None;
@@ -1320,6 +1356,25 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for HybridCa
             let layer_cache = hybrid_cache.caches.get(layer_idx).unwrap();
 
             if let HybridLayerCache::Attention(kv_cache) = layer_cache {
+                if num_seqs == 1 {
+                    let has_data = match kv_cache {
+                        KvCache::Normal { k, v } => k.all_data.is_some() && v.all_data.is_some(),
+                        KvCache::Rotating { k, v } => k.all_data.is_some() && v.all_data.is_some(),
+                        KvCache::Shared { .. } => true,
+                    };
+                    if has_data {
+                        let seq_cache = if modify_draft_cache {
+                            seqs[0].normal_draft_cache()
+                        } else {
+                            seqs[0].normal_cache()
+                        };
+                        while seq_cache.len() <= layer_idx {
+                            seq_cache.push(None);
+                        }
+                        seq_cache[layer_idx] = Some(kv_cache.clone());
+                    }
+                    continue;
+                }
                 if let (Ok(Some(k)), Ok(Some(v))) = (kv_cache.k(), kv_cache.v()) {
                     let k_chunks = k.chunk(num_seqs, 0).unwrap();
                     let v_chunks = v.chunk(num_seqs, 0).unwrap();

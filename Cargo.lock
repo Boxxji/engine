@@ -3532,9 +3532,9 @@ dependencies = [
 
 [[package]]
 name = "hanzo-ml"
-version = "0.11.120"
+version = "0.11.121"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29cf04894ed9fb4ce076afe29156327d5f53a9f509f6ba1c8316509ba6642ed0"
+checksum = "345cfba758ee19abee032d4c42a8a72cebf2321b2a8d162f25b30623eebce4d7"
 dependencies = [
  "accelerate-src",
  "ash",
@@ -3684,9 +3684,9 @@ dependencies = [
 
 [[package]]
 name = "hanzo-rocm-kernels"
-version = "0.11.45"
+version = "0.11.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "201573b39835bb197f9aaf9e19170d892a903859f2fb7516dec48176745b8e0a"
+checksum = "3350650191fc2c346f853b713da857dd53194429a369af4db836805739c29a7e"
 dependencies = [
  "dirs 5.0.1",
  "half",
