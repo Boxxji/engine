@@ -173,10 +173,21 @@ impl<'a> SpeculativeCacheAccess for PagedSpeculativeCacheAccess<'a> {
                 seq.id()
             ))
         })?;
-        hybrid
+        let mut guard_hybrid = hybrid
             .lock()
-            .map_err(|_| hanzo_ml::Error::Msg("hybrid cache poisoned".into()))?
-            .rewind_recurrent(slot, rejected)
+            .map_err(|_| hanzo_ml::Error::Msg("hybrid cache poisoned".into()))?;
+        guard_hybrid.rewind_recurrent(slot, rejected)?;
+        if let Some(off) = guard_hybrid.recurrent_offset(slot) {
+            if off != keep_len {
+                hanzo_ml::bail!(
+                    "speculative hybrid rollback invariant violation for seq {}: recurrent offset {} != keep_len {}",
+                    seq.id(),
+                    off,
+                    keep_len
+                );
+            }
+        }
+        Ok(())
     }
 
     fn begin(

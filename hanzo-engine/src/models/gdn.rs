@@ -400,6 +400,9 @@ pub fn gated_delta_rule_recurrence(
     if gdn_force_portable() {
         return recurrence_portable(q, k, v, g, beta, state);
     }
+    if let Some(out) = hanzo_ml::gdn::try_recurrence(q, k, v, g, beta, state, true)? {
+        return Ok(out);
+    }
     #[cfg(feature = "cuda")]
     if state.device().is_cuda() {
         return recurrence_cuda(q, k, v, g, beta, state);
@@ -1003,50 +1006,53 @@ impl GatedDeltaNet {
         let v = v.reshape((batch_size, seq_len, self.num_v_heads, self.head_v_dim))?;
 
         // 4. Compute beta and g
-        let (beta, g) = {
-            #[cfg(feature = "cuda")]
-            {
-                if b.device().is_cuda() {
-                    let b_flat = b.contiguous()?.flatten_all()?;
-                    let a_flat = a.contiguous()?.flatten_all()?;
-                    let a_log_f32 = self.a_log.to_dtype(DType::F32)?.contiguous()?;
-                    let dt_bias_f32 = self.dt_bias.to_dtype(DType::F32)?.contiguous()?;
-                    let (beta_flat, g_flat) = crate::cuda::gdn::fused_gdn_gating_cuda(
-                        &b_flat,
-                        &a_flat,
-                        &a_log_f32,
-                        &dt_bias_f32,
-                    )?;
-                    let shape = b.shape();
-                    (beta_flat.reshape(shape)?, g_flat.reshape(shape)?)
-                } else {
+        let (beta, g) =
+            if let Some(pair) = hanzo_ml::gdn::try_gating(&b, &a, &self.a_log, &self.dt_bias)? {
+                pair
+            } else {
+                #[cfg(feature = "cuda")]
+                {
+                    if b.device().is_cuda() {
+                        let b_flat = b.contiguous()?.flatten_all()?;
+                        let a_flat = a.contiguous()?.flatten_all()?;
+                        let a_log_f32 = self.a_log.to_dtype(DType::F32)?.contiguous()?;
+                        let dt_bias_f32 = self.dt_bias.to_dtype(DType::F32)?.contiguous()?;
+                        let (beta_flat, g_flat) = crate::cuda::gdn::fused_gdn_gating_cuda(
+                            &b_flat,
+                            &a_flat,
+                            &a_log_f32,
+                            &dt_bias_f32,
+                        )?;
+                        let shape = b.shape();
+                        (beta_flat.reshape(shape)?, g_flat.reshape(shape)?)
+                    } else {
+                        self.compute_beta_g_cpu(&b, &a, dtype)?
+                    }
+                }
+                #[cfg(feature = "metal")]
+                {
+                    if b.device().is_metal() {
+                        let b_flat = b.contiguous()?.flatten_all()?;
+                        let a_flat = a.contiguous()?.flatten_all()?;
+                        let a_log_f32 = self.a_log.to_dtype(DType::F32)?.contiguous()?;
+                        let dt_bias_f32 = self.dt_bias.to_dtype(DType::F32)?.contiguous()?;
+                        let (beta_flat, g_flat) = crate::metal::gdn::fused_gdn_gating_metal(
+                            &b_flat,
+                            &a_flat,
+                            &a_log_f32,
+                            &dt_bias_f32,
+                        )?;
+                        let shape = b.shape();
+                        (beta_flat.reshape(shape)?, g_flat.reshape(shape)?)
+                    } else {
+                        self.compute_beta_g_cpu(&b, &a, dtype)?
+                    }
+                }
+                #[cfg(not(any(feature = "cuda", feature = "metal")))]
+                {
                     self.compute_beta_g_cpu(&b, &a, dtype)?
                 }
-            }
-            #[cfg(feature = "metal")]
-            {
-                if b.device().is_metal() {
-                    let b_flat = b.contiguous()?.flatten_all()?;
-                    let a_flat = a.contiguous()?.flatten_all()?;
-                    let a_log_f32 = self.a_log.to_dtype(DType::F32)?.contiguous()?;
-                    let dt_bias_f32 = self.dt_bias.to_dtype(DType::F32)?.contiguous()?;
-                    let (beta_flat, g_flat) = crate::metal::gdn::fused_gdn_gating_metal(
-                        &b_flat,
-                        &a_flat,
-                        &a_log_f32,
-                        &dt_bias_f32,
-                    )?;
-                    let shape = b.shape();
-                    (beta_flat.reshape(shape)?, g_flat.reshape(shape)?)
-                } else {
-                    self.compute_beta_g_cpu(&b, &a, dtype)?
-                }
-            }
-            #[cfg(not(any(feature = "cuda", feature = "metal")))]
-            {
-                self.compute_beta_g_cpu(&b, &a, dtype)?
-            }
-        };
+            };
 
         // 5. If num_v_heads > num_k_heads, repeat_interleave q and k
         let (q, k) = if v_per_group > 1 {
@@ -1109,6 +1115,14 @@ impl GatedDeltaNet {
     /// Single-step causal conv1d update for decode.
     fn causal_conv1d_update(&self, x: &Tensor, cache: &mut GdnLayerCache) -> Result<Tensor> {
         let (_batch, seq_len, _conv_dim) = x.dims3()?;
+
+        if seq_len == 1 {
+            if let Some(out) =
+                hanzo_ml::gdn::try_conv1d_step(x, &self.conv1d_weight, &mut cache.conv_state)?
+            {
+                return Ok(out);
+            }
+        }
 
         // Native Vulkan single decode step: conv_state stays in VRAM, no per-token readback.
         if x.device().is_vulkan() && x.dtype() == DType::F32 && x.dim(0)? == 1 && x.dim(1)? == 1 {
@@ -1195,6 +1209,18 @@ impl GatedDeltaNet {
     /// Full sequence causal conv1d for prefill.
     fn causal_conv1d_full(&self, x: &Tensor, cache: &mut GdnLayerCache) -> Result<Tensor> {
         let (batch_size, seq_len, conv_dim) = x.dims3()?;
+        if hanzo_ml::quantized::dsl::gdn_impl() == hanzo_ml::quantized::dsl::QkImpl::Dsl {
+            let x_raw_t = x.transpose(1, 2)?.contiguous()?;
+            if let Some((out_t, new_state)) = hanzo_ml::gdn::try_conv1d_stateful(
+                &x_raw_t,
+                &self.conv1d_weight,
+                &cache.conv_state,
+                cache.seqlen_offset > 0,
+            )? {
+                cache.conv_state = new_state;
+                return out_t.transpose(1, 2)?.contiguous();
+            }
+        }
         // The full kernel has no conv_state argument and zero-pads its left edge, which is right
         // only at the start of a sequence. A continuation (a later prefill chunk, or a speculative
         // replay) must see the previous tokens, so splice them on and drop their outputs after.

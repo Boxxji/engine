@@ -315,14 +315,33 @@ impl PrefixCacheManagerV2 {
         // For paged attention, prefix caching is handled by the KVCacheManager.
         // PrefixCacheManagerV2 only handles non-paged attention caching.
         if !self.has_paged_attention {
-            let cache = seq.normal_cache().to_vec();
+            let mut cache = seq.normal_cache().to_vec();
+            for layer in cache.iter_mut().flatten() {
+                let len = layer.current_seq_len();
+                if let Err(e) = detach_kv_layer(layer, len) {
+                    tracing::warn!("prefix cache add_sequence detach failed: {e}; skipping store");
+                    return;
+                }
+            }
+            let detached_recurrent = match recurrent_snapshots {
+                Some(snaps) => match deep_copy_recurrent_snapshots(&snaps) {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        tracing::warn!(
+                            "prefix cache add_sequence recurrent copy failed: {e}; skipping store"
+                        );
+                        return;
+                    }
+                },
+                None => None,
+            };
 
             self.stores += 1;
             self.caches.insert(
                 Tokens::new(seq.cache_salt(), seq.get_toks()),
                 CacheElement {
                     cache,
-                    recurrent_snapshots,
+                    recurrent_snapshots: detached_recurrent,
                     image_hashes: seq.image_hashes().map(|x| x.to_vec()),
                     audio_hashes: seq.audio_hashes().map(|x| x.to_vec()),
                     video_hashes: seq.video_hashes().map(|x| x.to_vec()),
@@ -752,10 +771,15 @@ impl PrefixCacheManagerV2 {
             }
             for layer in cache.cache.iter_mut().flatten() {
                 layer.set_len(match_len)?;
+                detach_kv_layer(layer, match_len)?;
             }
+            let detached_recurrent = match cache.recurrent_snapshots {
+                Some(snaps) => Some(deep_copy_recurrent_snapshots(&snaps)?),
+                None => None,
+            };
             return Ok(Some(MatchingCache::Normal {
                 normal: cache.cache,
-                recurrent_snapshots: cache.recurrent_snapshots,
+                recurrent_snapshots: detached_recurrent,
                 images_to_keep,
                 audios_to_keep,
                 videos_to_keep,
@@ -766,6 +790,67 @@ impl PrefixCacheManagerV2 {
 
         Ok(None)
     }
+}
+
+/// Allocate an owned, contiguous backing buffer for `layer` holding `0..active_len` with fresh
+/// `CACHE_GROW_SIZE` headroom so in-place `SingleCache::append` on a restored or live sequence
+/// can never alias or overwrite a cached prefix entry or another concurrent request.
+fn detach_kv_layer(layer: &mut KvCache, active_len: usize) -> Result<()> {
+    match layer {
+        KvCache::Normal { k, v } => {
+            if let Some(kd) = k.current_data()? {
+                let cap = (active_len + crate::kv_cache::NormalCache::CACHE_GROW_SIZE)
+                    .min(k.max_seq_len)
+                    .max(active_len);
+                let mut shape = kd.dims().to_vec();
+                shape[k.dim] = cap;
+                let buf = hanzo_ml::Tensor::zeros(shape, kd.dtype(), kd.device())?;
+                if active_len > 0 {
+                    buf.slice_set(&kd.contiguous()?, k.dim, 0)?;
+                }
+                k.all_data = Some(buf);
+                k.capacity_seq_len = cap;
+            }
+            if let Some(vd) = v.current_data()? {
+                let cap = (active_len + crate::kv_cache::NormalCache::CACHE_GROW_SIZE)
+                    .min(v.max_seq_len)
+                    .max(active_len);
+                let mut shape = vd.dims().to_vec();
+                shape[v.dim] = cap;
+                let buf = hanzo_ml::Tensor::zeros(shape, vd.dtype(), vd.device())?;
+                if active_len > 0 {
+                    buf.slice_set(&vd.contiguous()?, v.dim, 0)?;
+                }
+                v.all_data = Some(buf);
+                v.capacity_seq_len = cap;
+            }
+        }
+        KvCache::Rotating { k, v } => {
+            if let Some(kd) = k.all_data.as_ref() {
+                k.all_data = Some(kd.copy()?);
+            }
+            if let Some(vd) = v.all_data.as_ref() {
+                v.all_data = Some(vd.copy()?);
+            }
+        }
+        KvCache::Shared { .. } => {}
+    }
+    Ok(())
+}
+
+/// Deep-copy every GDN/Conv1D snapshot tensor so concurrent prefix hits never alias mutable state.
+fn deep_copy_recurrent_snapshots(
+    snaps: &[RecurrentStateSnapshot],
+) -> Result<Vec<RecurrentStateSnapshot>> {
+    let mut out = Vec::with_capacity(snaps.len());
+    for s in snaps {
+        out.push(RecurrentStateSnapshot {
+            conv_state: s.conv_state.copy()?,
+            recurrent_state: s.recurrent_state.copy()?,
+            seqlen_offset: s.seqlen_offset,
+        });
+    }
+    Ok(out)
 }
 
 // ===========================================================================
@@ -1393,6 +1478,165 @@ mod tests {
         assert!(mgr_b
             .search_for_matching_cache(&[1, 2, 3, 9], None, None, None, None)?
             .is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn prefix_hit_detaches_kv_backing_buffer() -> hanzo_ml::Result<()> {
+        let mut mgr = PrefixCacheManagerV2::new(8, false, false);
+        let cached_kv = make_normal_kv_cache(4)?;
+        let orig_k = cached_kv.k()?.unwrap().flatten_all()?.to_vec1::<f32>()?;
+        mgr.caches.insert(
+            vec![10u32, 20, 30, 40].into(),
+            element_with(vec![Some(cached_kv)]),
+        );
+
+        let hit = mgr.search_for_matching_cache(&[10, 20, 99], None, None, None, None)?;
+        let mut restored = match hit {
+            Some(MatchingCache::Normal { normal, offset, .. }) => {
+                assert_eq!(offset, 2);
+                normal
+            }
+            None => panic!("expected prefix hit"),
+        };
+        let layer = restored[0].as_mut().unwrap();
+        let new_k = Tensor::full(999.0f32, (1, 1, 1, 1), &Device::Cpu)?;
+        let new_v = Tensor::full(-999.0f32, (1, 1, 1, 1), &Device::Cpu)?;
+        layer.append(&new_k, &new_v)?;
+
+        // Cached entry at position 2 must remain untouched despite in-place append on restored copy.
+        let key = super::Tokens::from(vec![10u32, 20, 30, 40]);
+        let still_cached = mgr.caches.get(&key).unwrap().cache[0]
+            .as_ref()
+            .unwrap()
+            .k()?
+            .unwrap()
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert_eq!(still_cached, orig_k);
+        Ok(())
+    }
+
+    #[test]
+    fn prefix_concurrent_dual_hits_and_eviction_isolation() -> hanzo_ml::Result<()> {
+        // Two concurrent requests hit the same cached hybrid prefix (KV + GDN recurrent snapshot),
+        // diverge with distinct in-place appends, and the cached prefix is evicted while both
+        // requests remain live. Neither request nor the cache may alias each other.
+        let mut mgr = PrefixCacheManagerV2::new(0, false, false);
+        let mut cached_kv = KvCache::new_normal(2, 64, 8);
+        for step in 0..4usize {
+            let v = Tensor::full(step as f32, (1, 1, 1, 1), &Device::Cpu)?;
+            cached_kv.append(&v, &v)?;
+        }
+        let rec_snap = RecurrentStateSnapshot {
+            conv_state: Tensor::full(1.5f32, (1, 4, 4), &Device::Cpu)?,
+            recurrent_state: Tensor::full(2.5f32, (1, 2, 4, 4), &Device::Cpu)?,
+            seqlen_offset: 4,
+        };
+        let mut elem = element_with(vec![Some(cached_kv)]);
+        elem.recurrent_snapshots = Some(vec![rec_snap]);
+        mgr.caches.insert(vec![10u32, 20, 30, 40].into(), elem);
+
+        // Recurrent snapshots only serve exact-length prefix hits (len == 4).
+        let hit_a =
+            mgr.search_for_matching_cache(&[10, 20, 30, 40, 101], None, None, None, None)?;
+        let hit_b =
+            mgr.search_for_matching_cache(&[10, 20, 30, 40, 202], None, None, None, None)?;
+
+        let (mut kv_a, rec_a) = match hit_a {
+            Some(MatchingCache::Normal {
+                normal,
+                recurrent_snapshots,
+                offset,
+                ..
+            }) => {
+                assert_eq!(offset, 4);
+                (normal, recurrent_snapshots.unwrap())
+            }
+            None => panic!("expected hit A"),
+        };
+        let (mut kv_b, rec_b) = match hit_b {
+            Some(MatchingCache::Normal {
+                normal,
+                recurrent_snapshots,
+                offset,
+                ..
+            }) => {
+                assert_eq!(offset, 4);
+                (normal, recurrent_snapshots.unwrap())
+            }
+            None => panic!("expected hit B"),
+        };
+
+        // Mutate A and B independently in-place
+        kv_a[0].as_mut().unwrap().append(
+            &Tensor::full(111.0f32, (1, 1, 1, 1), &Device::Cpu)?,
+            &Tensor::full(-111.0f32, (1, 1, 1, 1), &Device::Cpu)?,
+        )?;
+        kv_b[0].as_mut().unwrap().append(
+            &Tensor::full(222.0f32, (1, 1, 1, 1), &Device::Cpu)?,
+            &Tensor::full(-222.0f32, (1, 1, 1, 1), &Device::Cpu)?,
+        )?;
+        rec_a[0].recurrent_state.slice_set(
+            &Tensor::full(77.0f32, (1, 1, 4, 4), &Device::Cpu)?,
+            1,
+            0,
+        )?;
+
+        // Evict/drop the cached prefix while both live requests remain active.
+        mgr.caches.clear();
+        assert!(mgr.caches.is_empty());
+
+        let a_k: Vec<f32> = kv_a[0]
+            .as_ref()
+            .unwrap()
+            .k()?
+            .unwrap()
+            .flatten_all()?
+            .to_vec1()?;
+        let b_k: Vec<f32> = kv_b[0]
+            .as_ref()
+            .unwrap()
+            .k()?
+            .unwrap()
+            .flatten_all()?
+            .to_vec1()?;
+        assert_eq!(a_k[4], 111.0);
+        assert_eq!(b_k[4], 222.0);
+        // B's recurrent snapshot must be unaffected by A's in-place mutation.
+        let b_rec: Vec<f32> = rec_b[0].recurrent_state.flatten_all()?.to_vec1()?;
+        assert!(b_rec.iter().all(|&x| (x - 2.5).abs() < 1e-6));
+        Ok(())
+    }
+
+    #[test]
+    fn prefix_add_sequence_isolates_live_sequence_mutations() -> hanzo_ml::Result<()> {
+        let mut mgr = PrefixCacheManagerV2::new(8, false, false);
+        let mut seq = crate::sequence::test_sequence(vec![7, 8, 9, 10], None);
+        let mut kv = KvCache::new_normal(2, 64, 8);
+        for step in 0..4usize {
+            let v = Tensor::full(step as f32, (1, 1, 1, 1), &Device::Cpu)?;
+            kv.append(&v, &v)?;
+        }
+        let expected_k = kv.k()?.unwrap().flatten_all()?.to_vec1::<f32>()?;
+        *seq.normal_cache() = vec![Some(kv)];
+        mgr.add_sequence(&mut seq, None);
+
+        // Mutate the live sequence's KV cache after storing into PrefixCacheManagerV2.
+        seq.normal_cache()[0].as_mut().unwrap().append(
+            &Tensor::full(555.0f32, (1, 1, 1, 1), &Device::Cpu)?,
+            &Tensor::full(-555.0f32, (1, 1, 1, 1), &Device::Cpu)?,
+        )?;
+
+        let key = super::Tokens::from(vec![7u32, 8, 9, 10]);
+        let cached_k = mgr.caches.get(&key).unwrap().cache[0]
+            .as_ref()
+            .unwrap()
+            .k()?
+            .unwrap()
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert_eq!(cached_k, expected_k);
         Ok(())
     }
 }
