@@ -1510,7 +1510,10 @@ impl Qwen3DFlash2 {
         need_logits: bool,
         block_size_override: Option<usize>,
     ) -> Result<(Vec<u32>, Option<Tensor>)> {
-        let prof = std::env::var_os("HANZO_DFLASH_PROFILE").is_some();
+        let prof = crate::engine_env_bool("ENGINE_DFLASH_PROFILE", "HANZO_DFLASH_PROFILE", false)
+            || (std::env::var_os("ENGINE_DFLASH_PROFILE").is_none()
+                && std::env::var_os("HANZO_DFLASH_PROFILE")
+                    .is_some_and(|v| v != "0" && v != "false" && !v.is_empty()));
         let t_total = Instant::now();
         let dev = &self.device;
         let max_bs = self.cfg.block_size();
@@ -2192,7 +2195,7 @@ const ADAPTIVE_PROBE_STEPS: usize = 3;
 const ADAPTIVE_CUDA_GRAPH_DISCOUNT: f64 = 0.85;
 
 fn dflash_adaptive_enabled() -> bool {
-    std::env::var("HANZO_DFLASH_ADAPTIVE").ok().as_deref() != Some("0")
+    crate::engine_env_bool("ENGINE_DFLASH_ADAPTIVE", "HANZO_DFLASH_ADAPTIVE", true)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

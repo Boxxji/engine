@@ -130,7 +130,12 @@ impl GgufMatMul {
         // to the f32 fallback, so this exists only as an ops safety valve / A-B measurement toggle.
         use std::sync::OnceLock;
         static DISABLED: OnceLock<bool> = OnceLock::new();
-        if *DISABLED.get_or_init(|| std::env::var("HANZO_NO_BF16_QMM").is_ok()) {
+        if *DISABLED.get_or_init(|| match std::env::var("ENGINE_NO_BF16_QMM") {
+            Ok(v) => v != "0" && v != "false" && !v.is_empty(),
+            Err(std::env::VarError::NotPresent) => std::env::var("HANZO_NO_BF16_QMM")
+                .is_ok_and(|v| v != "0" && v != "false" && !v.is_empty()),
+            Err(_) => false,
+        }) {
             return Ok(None);
         }
         let QMatMul::QTensor(q) = &self.w else {

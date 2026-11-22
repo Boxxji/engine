@@ -469,11 +469,10 @@ impl NormalCache {
     }
 }
 
-static HYBRID_KV_ZERO_COPY_STATE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(0); // 0 = unset, 1 = disabled, 2 = enabled
+static HYBRID_KV_ZERO_COPY_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0); // 0 = unset, 1 = disabled, 2 = enabled
 
 /// Runtime rollback/ablation switch for single-sequence zero-copy KV transfers
-/// (`HANZO_HYBRID_KV_ZERO_COPY=0|false|off|legacy` forces the legacy copy+clamp path; defaults enabled).
+/// (`ENGINE_HYBRID_KV_ZERO_COPY=0|false|off|legacy` forces the legacy copy+clamp path; defaults enabled).
 #[inline]
 pub fn hybrid_kv_zero_copy_enabled() -> bool {
     use std::sync::atomic::Ordering;
@@ -481,9 +480,10 @@ pub fn hybrid_kv_zero_copy_enabled() -> bool {
         1 => false,
         2 => true,
         _ => {
-            let on = !matches!(
-                std::env::var("HANZO_HYBRID_KV_ZERO_COPY").ok().as_deref(),
-                Some("0") | Some("false") | Some("off") | Some("legacy")
+            let on = crate::engine_env_bool(
+                "ENGINE_HYBRID_KV_ZERO_COPY",
+                "HANZO_HYBRID_KV_ZERO_COPY",
+                true,
             );
             HYBRID_KV_ZERO_COPY_STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
             on
@@ -2380,5 +2380,34 @@ mod payload_tests {
             panic!("expected rotating cache");
         }
         Ok(())
+    }
+
+    #[test]
+    fn engine_hybrid_kv_zero_copy_env_precedes_legacy_hanzo() {
+        use std::sync::atomic::Ordering;
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        std::env::remove_var("ENGINE_HYBRID_KV_ZERO_COPY");
+        std::env::remove_var("HANZO_HYBRID_KV_ZERO_COPY");
+        super::HYBRID_KV_ZERO_COPY_STATE.store(0, Ordering::Relaxed);
+        assert!(super::hybrid_kv_zero_copy_enabled());
+
+        std::env::set_var("HANZO_HYBRID_KV_ZERO_COPY", "0");
+        super::HYBRID_KV_ZERO_COPY_STATE.store(0, Ordering::Relaxed);
+        assert!(!super::hybrid_kv_zero_copy_enabled());
+
+        std::env::set_var("ENGINE_HYBRID_KV_ZERO_COPY", "1");
+        super::HYBRID_KV_ZERO_COPY_STATE.store(0, Ordering::Relaxed);
+        assert!(super::hybrid_kv_zero_copy_enabled());
+
+        std::env::set_var("ENGINE_HYBRID_KV_ZERO_COPY", "legacy");
+        std::env::set_var("HANZO_HYBRID_KV_ZERO_COPY", "1");
+        super::HYBRID_KV_ZERO_COPY_STATE.store(0, Ordering::Relaxed);
+        assert!(!super::hybrid_kv_zero_copy_enabled());
+
+        std::env::remove_var("ENGINE_HYBRID_KV_ZERO_COPY");
+        std::env::remove_var("HANZO_HYBRID_KV_ZERO_COPY");
+        super::HYBRID_KV_ZERO_COPY_STATE.store(0, Ordering::Relaxed);
     }
 }

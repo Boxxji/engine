@@ -375,13 +375,23 @@ pub fn sigmoid(x: &Tensor) -> Result<Tensor> {
     hanzo_nn::ops::sigmoid(x)
 }
 
-/// A/B knob: `GDN_FUSED_FALLBACK=1` forces the portable ops-composed scan on every backend,
-/// isolating the fused per-backend recurrence kernel's contribution. Default (unset) uses the fused
-/// kernel where one exists. Read once, cached.
+/// A/B knob: `ENGINE_GDN_PORTABLE=1` (or `GDN_FUSED_FALLBACK=1`) forces the portable ops-composed
+/// scan on every backend, isolating the fused per-backend recurrence kernel's contribution. Default
+/// (unset) uses the fused kernel where one exists. Read once, cached.
 fn gdn_force_portable() -> bool {
     static FORCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FORCE.get_or_init(|| {
-        std::env::var("GDN_FUSED_FALLBACK").is_ok_and(|v| v != "0" && !v.is_empty())
+        for key in [
+            "ENGINE_GDN_PORTABLE",
+            "ENGINE_GDN_FUSED_FALLBACK",
+            "GDN_FUSED_FALLBACK",
+            "HANZO_GDN_FUSED_FALLBACK",
+        ] {
+            if let Ok(v) = std::env::var(key) {
+                return v != "0" && v != "false" && !v.is_empty();
+            }
+        }
+        false
     })
 }
 
