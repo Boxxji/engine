@@ -57,6 +57,32 @@ impl GgufMatMul {
         )
     }
 
+    #[cfg(feature = "cuda")]
+    fn uses_native_cuda_iquant(&self) -> bool {
+        matches!(
+            &self.w,
+            QMatMul::QTensor(q)
+                if q.device().is_cuda()
+                    && matches!(
+                        q.dtype(),
+                        GgmlDType::PQ2_0
+                            | GgmlDType::PTQ1_0
+                            | GgmlDType::Q1_0
+                            | GgmlDType::Q2_0
+                            | GgmlDType::TQ1_0
+                            | GgmlDType::TQ2_0
+                            | GgmlDType::IQ2_XXS
+                            | GgmlDType::IQ2_XS
+                            | GgmlDType::IQ2_S
+                            | GgmlDType::IQ3_XXS
+                            | GgmlDType::IQ3_S
+                            | GgmlDType::IQ1_S
+                            | GgmlDType::IQ1_M
+                            | GgmlDType::IQ4_XS
+                    )
+        )
+    }
+
     /// True when weights are held in the ROCm native-quant path (`QMatMul::RocmQuant`), whose
     /// matmul/matvec kernels consume the activation in its native float dtype. Used to skip the
     /// F32 activation round-trip in `forward` / `forward_raw`.
@@ -117,7 +143,12 @@ impl GgufMatMul {
         }
         if !matches!(
             q.dtype(),
-            GgmlDType::Q4K | GgmlDType::Q6K | GgmlDType::PQ2_0 | GgmlDType::PTQ1_0
+            GgmlDType::Q4K
+                | GgmlDType::Q6K
+                | GgmlDType::PQ2_0
+                | GgmlDType::PTQ1_0
+                | GgmlDType::Q1_0
+                | GgmlDType::Q2_0
         ) {
             return Ok(None);
         }
@@ -177,6 +208,18 @@ impl QuantMethod for GgufMatMul {
         {
             if let Some(out) = self.try_fast_forward(a)? {
                 return self.add_bias(out);
+            }
+            if self.uses_native_cuda_iquant()
+                && matches!(a.dtype(), DType::BF16 | DType::F16 | DType::F32)
+            {
+                let original_dtype = a.dtype();
+                let x = self.w.forward(a)?;
+                let x = if x.dtype() == original_dtype {
+                    x
+                } else {
+                    x.to_dtype(original_dtype)?
+                };
+                return self.add_bias(x);
             }
         }
 
@@ -241,10 +284,30 @@ impl QuantMethod for GgufMatMul {
         }
     }
 
+    fn supports_shared_iq_q8(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            return self.uses_native_cuda_iquant();
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            false
+        }
+    }
+
+    fn forward_iq_q8_dtype(
+        &self,
+        q8: &hanzo_ml::quantized::IqQ8Activation,
+        out_dtype: DType,
+    ) -> Result<Tensor> {
+        let out = self.w.forward_iq_q8_dtype(q8, out_dtype)?;
+        self.add_bias(out)
+    }
+
     fn quantized_act_type(&self) -> Option<DType> {
         #[cfg(feature = "cuda")]
         {
-            if self.uses_fast_mmvq() {
+            if self.uses_fast_mmvq() || self.uses_native_cuda_iquant() {
                 return None;
             }
         }
