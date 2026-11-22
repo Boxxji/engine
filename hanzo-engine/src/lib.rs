@@ -102,6 +102,7 @@ mod toml_selector;
 mod tools;
 mod topology;
 mod utils;
+pub use utils::{engine_env_bool, engine_env_os, engine_env_var};
 mod vision_models;
 mod xlora_models;
 #[cfg(feature = "zap")]
