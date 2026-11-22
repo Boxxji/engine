@@ -61,7 +61,9 @@ pub(crate) fn decode_mrope_position_ids(
     mrope_deltas: Option<&Tensor>,
 ) -> Result<Tensor> {
     let batch = rope_positions.dim(0)?;
-    let pos = rope_positions.to_dtype(DType::I64)?.reshape((1, batch, 1))?;
+    let pos = rope_positions
+        .to_dtype(DType::I64)?
+        .reshape((1, batch, 1))?;
     let pos3 = Tensor::cat(&[&pos, &pos, &pos], 0)?;
     if let Some(deltas) = mrope_deltas {
         let deltas = deltas
@@ -802,16 +804,23 @@ mod tests {
             let p0 = decode_mrope_position_ids(var.as_tensor(), None)?.to_vec3::<i64>()?;
             assert_eq!(
                 p0,
-                vec![vec![vec![10], vec![25]], vec![vec![10], vec![25]], vec![vec![10], vec![25]]]
+                vec![
+                    vec![vec![10], vec![25]],
+                    vec![vec![10], vec![25]],
+                    vec![vec![10], vec![25]]
+                ]
             );
 
             let deltas = Tensor::from_vec(vec![-4i64, -9], (2, 1), &dev)?;
             var.set(&Tensor::from_vec(vec![11u32, 26], (2,), &dev)?)?;
-            let p1 =
-                decode_mrope_position_ids(var.as_tensor(), Some(&deltas))?.to_vec3::<i64>()?;
+            let p1 = decode_mrope_position_ids(var.as_tensor(), Some(&deltas))?.to_vec3::<i64>()?;
             assert_eq!(
                 p1,
-                vec![vec![vec![7], vec![17]], vec![vec![7], vec![17]], vec![vec![7], vec![17]]]
+                vec![
+                    vec![vec![7], vec![17]],
+                    vec![vec![7], vec![17]],
+                    vec![vec![7], vec![17]]
+                ]
             );
         }
         Ok(())

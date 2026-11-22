@@ -159,7 +159,10 @@ fn fwht_typed(
         };
     }
     let mut data = x.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let signs_vec = signs.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let signs_vec = signs
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
     if signs_vec.len() != last_dim {
         hanzo_ml::bail!(
             "fwht sign width ({}) does not match last dim ({last_dim})",
@@ -894,11 +897,7 @@ mod tests {
                         };
                         sum += v * h;
                     }
-                    dst[b0 + i] = if inverse {
-                        sum * signs[b0 + i]
-                    } else {
-                        sum
-                    };
+                    dst[b0 + i] = if inverse { sum * signs[b0 + i] } else { sum };
                 }
             }
         }
@@ -959,7 +958,10 @@ mod tests {
                     .zip(x_host.iter())
                     .map(|(a, b)| (a - b).abs())
                     .fold(0.0f32, f32::max);
-                assert!(rt_err < 1e-4, "fwht roundtrip block={block} rt_err={rt_err}");
+                assert!(
+                    rt_err < 1e-4,
+                    "fwht roundtrip block={block} rt_err={rt_err}"
+                );
 
                 if dev.is_cpu() {
                     cpu_fwd_out = Some(fwd_v);
@@ -996,7 +998,10 @@ mod tests {
                             .flatten_all()?
                             .max(0)?
                             .to_scalar::<f32>()?;
-                        assert!(err < 3e-2, "half roundtrip block={block} dt={dt:?} err={err}");
+                        assert!(
+                            err < 3e-2,
+                            "half roundtrip block={block} dt={dt:?} err={err}"
+                        );
                     }
                 }
             }
@@ -1021,7 +1026,9 @@ mod tests {
                 let groups = in_dim / gs;
 
                 let w_vals: Vec<u32> = (0..(out_dim * packed_k))
-                    .map(|i| 0x5555_5555u32 ^ ((i as u32).wrapping_mul(0x0101_0101) & 0xaaaa_aaaau32))
+                    .map(|i| {
+                        0x5555_5555u32 ^ ((i as u32).wrapping_mul(0x0101_0101) & 0xaaaa_aaaau32)
+                    })
                     .collect();
                 let s_vals: Vec<f32> = (0..(out_dim * groups))
                     .map(|i| 0.05 + ((i % 7) as f32) * 0.01)
@@ -1070,26 +1077,22 @@ mod tests {
                     .is_err(),
                     "must fail closed when signs exist and hadamard_block is 0"
                 );
-                assert!(
-                    AfqLayer::afq_embed(
-                        out_dim,
-                        in_dim,
-                        &missing_block_cfg,
-                        vb.pp("language_model.lm_head")
-                    )
-                    .is_err()
-                );
-                assert!(
-                    AfqLayer::afq_linear_typed(
-                        in_dim,
-                        out_dim,
-                        2,
-                        128,
-                        false,
-                        vb.pp("language_model.lm_head")
-                    )
-                    .is_err()
-                );
+                assert!(AfqLayer::afq_embed(
+                    out_dim,
+                    in_dim,
+                    &missing_block_cfg,
+                    vb.pp("language_model.lm_head")
+                )
+                .is_err());
+                assert!(AfqLayer::afq_linear_typed(
+                    in_dim,
+                    out_dim,
+                    2,
+                    128,
+                    false,
+                    vb.pp("language_model.lm_head")
+                )
+                .is_err());
 
                 let mut cfg = missing_block_cfg;
                 cfg.with_afq_module_specs(&[AfqModuleSpec {

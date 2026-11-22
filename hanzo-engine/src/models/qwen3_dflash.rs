@@ -761,11 +761,8 @@ impl DFlash2Layer {
     ) -> Result<(Linear, Linear, Linear)> {
         let q_dim = q_proj.weight().dim(0)?;
         let kv_dim = k_proj.weight().dim(0)?;
-        let qkv_w = Tensor::cat(
-            &[q_proj.weight(), k_proj.weight(), v_proj.weight()],
-            0,
-        )?
-        .contiguous()?;
+        let qkv_w =
+            Tensor::cat(&[q_proj.weight(), k_proj.weight(), v_proj.weight()], 0)?.contiguous()?;
         let kv_w = qkv_w.narrow(0, q_dim, 2 * kv_dim)?;
         let gate_up_w = Tensor::cat(&[gate_proj.weight(), up_proj.weight()], 0)?.contiguous()?;
         Ok((
@@ -1554,7 +1551,9 @@ impl Qwen3DFlash2 {
             } else {
                 let mask_id =
                     Tensor::new(&[self.cfg.dflash_config.mask_token_id], dev)?.reshape((1, 1))?;
-                let row = as_2d(&embed(&mask_id)?)?.to_dtype(self.dtype)?.contiguous()?;
+                let row = as_2d(&embed(&mask_id)?)?
+                    .to_dtype(self.dtype)?
+                    .contiguous()?;
                 *guard = Some(row.clone());
                 row
             }
@@ -1670,9 +1669,7 @@ impl Qwen3DFlash2 {
             let up = gate_up.narrow(1, inter, inter)?;
             let act = crate::ops::mul_and_act(&gate, &up, crate::layers::Activation::Silu)?;
             let mlp = layer.down_proj.forward(&act)?;
-            hstate = layer
-                .mlp_conv
-                .finish_residual(&mlp, &mlp_taps, &residual)?;
+            hstate = layer.mlp_conv.finish_residual(&mlp, &mlp_taps, &residual)?;
         }
         let hstate = self.norm.forward(&hstate)?; // [bs, hidden]
         let ms_layers = t_layers.elapsed().as_secs_f64() * 1e3;
@@ -3603,10 +3600,7 @@ mod tests {
             top_k,
         };
         let sel_cuda = CandidateSelector {
-            hidden_projection: Linear::new(
-                Tensor::from_vec(w_h, (rank, hidden), &cuda_dev)?,
-                None,
-            ),
+            hidden_projection: Linear::new(Tensor::from_vec(w_h, (rank, hidden), &cuda_dev)?, None),
             predecessor_codebook: Tensor::from_vec(pred_v, (vocab, rank), &cuda_dev)?,
             successor_codebook: Tensor::from_vec(succ_v, (vocab, rank), &cuda_dev)?,
             top_k,
@@ -3627,7 +3621,10 @@ mod tests {
             false,
         )?;
         assert!(got_logits.is_none());
-        assert_eq!(got_toks, want_toks, "CUDA greedy walk tokens mismatch vs CPU");
+        assert_eq!(
+            got_toks, want_toks,
+            "CUDA greedy walk tokens mismatch vs CPU"
+        );
         Ok(())
     }
 }

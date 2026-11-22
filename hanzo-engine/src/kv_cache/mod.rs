@@ -12,6 +12,7 @@ use crate::{
 mod full_cache;
 mod hybrid_cache;
 mod hybrid_contract;
+pub mod phase_policy;
 mod rotating_cache;
 mod single_cache;
 
@@ -20,7 +21,19 @@ pub use hybrid_cache::{
     HybridCache, HybridCacheConfig, HybridLayerCache, HybridLayerType, RecurrentLayerConfig,
     RecurrentStatePool, RecurrentStateSnapshot, RecurrentTrail,
 };
-pub use hybrid_contract::{HybridRequestBinding, HybridStateCheckpoint, HybridStateContract};
+pub use hybrid_contract::{
+    CacheProvenance, HybridPrefixCheckpoint, HybridReplayStep, HybridRequestBinding,
+    HybridStateCheckpoint, HybridStateContract,
+};
+pub use phase_policy::{
+    active_kv_phase_policy, evaluate_multiturn_hybrid_prefix_reuse,
+    evaluate_phase_aware_kv_precision, hybrid_prefix_cache_enabled,
+    set_hybrid_prefix_cache_override, set_kv_phase_policy_override,
+    verify_hybrid_prefix_provenance_isolation, HybridEvalConfig, HybridMultiturnEvalReport,
+    HybridPrefixRadixCache, HybridPrefixStats, KvPhaseEvalReport, KvPhasePointMetrics,
+    KvPhasePolicy, ProvenanceIsolationReport, TurnReuseMetrics, DEFAULT_MIN_FP8_DECODE_CTX,
+    ENV_ENGINE_HYBRID_PREFIX_CACHE, ENV_ENGINE_KV_PHASE_POLICY,
+};
 pub use rotating_cache::{RotatingCache, RotatingCacheSnapshot};
 pub use single_cache::{SingleCache, SingleCacheSnapshot};
 

@@ -155,9 +155,7 @@ pub fn dflash2_topk_cuda(logits: &Tensor, k: usize) -> Result<(Tensor, Tensor)> 
     let (nrows, ncols) = logits.dims2()?;
     let k = k.min(ncols);
     if k == 0 || k > DFLASH2_MAX_TOPK {
-        hanzo_ml::bail!(
-            "dflash2_topk_cuda k={k} must be in 1..={DFLASH2_MAX_TOPK}"
-        );
+        hanzo_ml::bail!("dflash2_topk_cuda k={k} must be in 1..={DFLASH2_MAX_TOPK}");
     }
     let dev = logits.device().as_cuda_device()?;
     let vals_buf = unsafe { dev.alloc::<f32>(nrows * k) }?;
@@ -194,7 +192,10 @@ pub fn dflash2_topk_cuda(logits: &Tensor, k: usize) -> Result<(Tensor, Tensor)> 
     }
 
     let vals = Tensor::from((
-        hanzo_ml::Storage::Cuda(hanzo_ml::CudaStorage::wrap_cuda_slice(vals_buf, dev.clone())),
+        hanzo_ml::Storage::Cuda(hanzo_ml::CudaStorage::wrap_cuda_slice(
+            vals_buf,
+            dev.clone(),
+        )),
         (nrows, k),
     ));
     let ids = Tensor::from((
@@ -224,9 +225,7 @@ pub fn dflash2_greedy_walk_cuda(params: DFlash2GreedyWalkParams<'_>) -> Result<T
     let (slots, top_k) = topk_values.dims2()?;
     let (_, rank) = gate_hidden.dims2()?;
     if top_k == 0 || top_k > DFLASH2_MAX_TOPK {
-        hanzo_ml::bail!(
-            "dflash2_greedy_walk_cuda top_k={top_k} must be in 1..={DFLASH2_MAX_TOPK}"
-        );
+        hanzo_ml::bail!("dflash2_greedy_walk_cuda top_k={top_k} must be in 1..={DFLASH2_MAX_TOPK}");
     }
     if rank == 0 || rank > DFLASH2_MAX_WALK_RANK {
         hanzo_ml::bail!(

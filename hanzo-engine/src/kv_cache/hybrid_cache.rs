@@ -290,6 +290,10 @@ impl RecurrentStatePool {
     pub fn device(&self) -> &Device {
         &self.device
     }
+
+    pub fn config(&self) -> &RecurrentLayerConfig {
+        &self.config
+    }
 }
 
 /// Per-layer cache that can be either attention (KV) or recurrent (state pool)

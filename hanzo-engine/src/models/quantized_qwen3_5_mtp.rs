@@ -25,9 +25,7 @@ use crate::models::quantized_qwen3_5_moe::{
 use crate::models::qwen3_5_mtp::{
     chain_cache, default_n_predict, MtpOut, MtpStep, Qwen3_5MtpProposer,
 };
-use crate::speculative::{
-    MtpConfig, SelfSpeculative, SpeculativeProposer, SpeculativeSharedHeads,
-};
+use crate::speculative::{MtpConfig, SelfSpeculative, SpeculativeProposer, SpeculativeSharedHeads};
 
 /// The tensor that says a GGUF carries a head, relative to its block prefix.
 pub const NEXTN_EH_PROJ: &str = "nextn.eh_proj.weight";
@@ -562,13 +560,20 @@ mod tests {
         for (seed, (name, rows, cols)) in shapes.iter().enumerate() {
             let full_name = format!("{prefix}.{name}");
             let t = synthetic(*rows, *cols, u32::try_from(seed).unwrap() + 101, &device)?;
-            let t_plain = if *cols == 1 { t.flatten_all()? } else { t.clone() };
+            let t_plain = if *cols == 1 {
+                t.flatten_all()?
+            } else {
+                t.clone()
+            };
             let t_fold = if hm.is_folded(&full_name) {
                 had.forward(&t)?
             } else {
                 t_plain.clone()
             };
-            plain_owned.push((full_name.clone(), QTensor::quantize(&t_plain, GgmlDType::F32)?));
+            plain_owned.push((
+                full_name.clone(),
+                QTensor::quantize(&t_plain, GgmlDType::F32)?,
+            ));
             folded_owned.push((full_name, QTensor::quantize(&t_fold, GgmlDType::F32)?));
         }
 
@@ -626,7 +631,9 @@ mod tests {
         let emb_table = synthetic(VOCAB, h, 201, &device)?;
         let emb_table_folded = had.forward(&emb_table)?;
         let ids = Tensor::from_vec(vec![3u32, 9], (2, 1), &device)?;
-        let embeds_plain = emb_table.index_select(&ids.flatten_all()?, 0)?.reshape((2, 1, h))?;
+        let embeds_plain = emb_table
+            .index_select(&ids.flatten_all()?, 0)?
+            .reshape((2, 1, h))?;
         let embeds_unrot = had
             .inverse(&emb_table_folded.index_select(&ids.flatten_all()?, 0)?)?
             .reshape((2, 1, h))?;

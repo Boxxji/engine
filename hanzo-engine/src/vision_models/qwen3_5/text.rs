@@ -900,9 +900,13 @@ impl Qwen3_5TextModel {
                             let indices = state_indices.as_ref().expect(
                                 "checked above: linear-attention layers require recurrent indices",
                             );
-                            xs = forward_pooled(pool, PoolSlots::Many(indices), i, trail, |cache| {
-                                layer.forward_linear(&xs, cache)
-                            })?;
+                            xs = forward_pooled(
+                                pool,
+                                PoolSlots::Many(indices),
+                                i,
+                                trail,
+                                |cache| layer.forward_linear(&xs, cache),
+                            )?;
                         }
                     } else {
                         hanzo_ml::bail!(

@@ -572,21 +572,31 @@ impl DeviceHadamard {
     }
 }
 
-/// Token embedding table keeping quantized rows resident on CPU/CUDA/Metal instead of expanding
-/// large vocab tables (e.g. 248,320 x 5,120 = 5.08 GB F32 on 27B) on load.
+/// Token embedding table keeping quantized rows resident on CPU/CUDA/Metal (or host-gathered on
+/// Vulkan/ROCm) instead of expanding large vocab tables (e.g. 248,320 x 5,120 = 5.09 GB F32 on 27B,
+/// which exceeds Vulkan's 4 GiB `maxStorageBufferRange` on NVIDIA GPUs and clamps token IDs >= 209,715).
 #[derive(Clone)]
 enum TokEmbedding {
     Dense(Embedding),
     Quantized(Arc<QTensor>),
+    QuantizedHost { q: Arc<QTensor>, target: Device },
 }
 
 impl TokEmbedding {
-    fn from_gguf_qtensor(q: Arc<QTensor>, hidden_size: usize, device: &Device) -> Result<Self> {
-        let can_gather_quantized =
-            matches!(device, Device::Cpu | Device::Cuda(_) | Device::Metal(_))
-                && hidden_size.is_multiple_of(q.dtype().block_size());
-        if can_gather_quantized {
+    fn from_gguf_qtensor(
+        q: Arc<QTensor>,
+        host_q: Option<Arc<QTensor>>,
+        hidden_size: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        let block_aligned = hidden_size.is_multiple_of(q.dtype().block_size());
+        if matches!(device, Device::Cpu | Device::Cuda(_) | Device::Metal(_)) && block_aligned {
             Ok(Self::Quantized(q))
+        } else if let Some(hq) = host_q.filter(|_| block_aligned) {
+            Ok(Self::QuantizedHost {
+                q: hq,
+                target: device.clone(),
+            })
         } else {
             Ok(Self::Dense(Embedding::new(
                 q.dequantize(device)?,
@@ -599,13 +609,17 @@ impl TokEmbedding {
         match self {
             Self::Dense(e) => e.forward(ids),
             Self::Quantized(q) => q.embedding(ids),
+            Self::QuantizedHost { q, target } => {
+                let ids_cpu = ids.to_device(&Device::Cpu)?;
+                q.embedding(&ids_cpu)?.to_device(target)
+            }
         }
     }
 
     fn dtype(&self) -> DType {
         match self {
             Self::Dense(e) => e.embeddings().dtype(),
-            Self::Quantized(_) => DType::F32,
+            Self::Quantized(_) | Self::QuantizedHost { .. } => DType::F32,
         }
     }
 }
@@ -1374,7 +1388,8 @@ impl GatedFullAttention {
             let v = self.attn_v.forward_iq_q8_dtype(q8, out_dtype)?;
             Ok((q_gate, k, v))
         })?;
-        let (q, k, v, gate) = self.split_norm_rope_qkv(q_gate, k, v, b_sz, seq_len, dev, cos_sin)?;
+        let (q, k, v, gate) =
+            self.split_norm_rope_qkv(q_gate, k, v, b_sz, seq_len, dev, cos_sin)?;
         let y = prof::timed(dev, &prof::FULL_ATTN_NS, || {
             self.attend(&q, &k, &v, mask, kv_cache, paged)
         })?;
@@ -1457,15 +1472,7 @@ impl GatedFullAttention {
                     let v = self.attn_v.forward_iq_q8_dtype(&q8, out_dtype)?;
                     Ok((q_gate, k, v))
                 })?;
-                return self.split_norm_rope_qkv(
-                    q_gate,
-                    k,
-                    v,
-                    b_sz,
-                    seq_len,
-                    x.device(),
-                    cos_sin,
-                );
+                return self.split_norm_rope_qkv(q_gate, k, v, b_sz, seq_len, x.device(), cos_sin);
             }
         }
 
@@ -2464,7 +2471,9 @@ impl DecoderLayer {
                 return dense.forward_iq_q8(&q8, x_mid.dtype())? + x_mid;
             }
         }
-        let (x_mid, normed) = self.post_attention_layernorm.forward_of_sum(&attn_out, &residual)?;
+        let (x_mid, normed) = self
+            .post_attention_layernorm
+            .forward_of_sum(&attn_out, &residual)?;
         self.mlp.forward(&normed)? + x_mid
     }
 }
@@ -2762,9 +2771,20 @@ impl ModelConfig::FromGGUF for ModelWeights {
         }
 
         let has_output_weight = ct.has_tensor("output.weight");
-        let qtok_embeddings = Arc::new(ct.tensor("token_embd.weight", device)?);
+        let host_qtok_embeddings =
+            if !matches!(device, Device::Cpu | Device::Cuda(_) | Device::Metal(_)) {
+                Some(Arc::new(ct.tensor("token_embd.weight", &Device::Cpu)?))
+            } else {
+                None
+            };
+        let qtok_embeddings = if has_output_weight && host_qtok_embeddings.is_some() {
+            Arc::clone(host_qtok_embeddings.as_ref().unwrap())
+        } else {
+            Arc::new(ct.tensor("token_embd.weight", device)?)
+        };
         let tok_embeddings = TokEmbedding::from_gguf_qtensor(
             Arc::clone(&qtok_embeddings),
+            host_qtok_embeddings,
             props.embedding_length,
             device,
         )?;
@@ -3194,9 +3214,9 @@ impl ModelWeights {
                             prof::DECODE_STEPS.store(0, std::sync::atomic::Ordering::Relaxed);
                             prof::reset();
                         } else {
-                            let s =
-                                prof::DECODE_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                                    + 1;
+                            let s = prof::DECODE_STEPS
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                + 1;
                             if s == 1 || s % 16 == 0 {
                                 prof::dump("decode", seq_len, s);
                             }
@@ -4521,10 +4541,7 @@ mod tests {
                     .map(|i| if (i * 11 + 5) % 2 == 0 { 1 } else { -1 })
                     .collect();
                 let mut kv = HashMap::new();
-                kv.insert(
-                    "prism.hadamard.version".into(),
-                    gguf_file::Value::U32(1),
-                );
+                kv.insert("prism.hadamard.version".into(), gguf_file::Value::U32(1));
                 kv.insert(
                     "prism.hadamard.block_size".into(),
                     gguf_file::Value::U32(block as u32),
@@ -4548,7 +4565,10 @@ mod tests {
                 kv.insert(
                     "prism.hadamard.sign_values".into(),
                     gguf_file::Value::Array(
-                        sign_vals.iter().map(|&v| gguf_file::Value::I8(v as i8)).collect(),
+                        sign_vals
+                            .iter()
+                            .map(|&v| gguf_file::Value::I8(v as i8))
+                            .collect(),
                     ),
                 );
                 kv.insert(
@@ -4565,10 +4585,8 @@ mod tests {
                 let norm_w_vals: Vec<f32> = (0..width)
                     .map(|i| 0.75 + ((i as f32) * 0.013).sin() * 0.4)
                     .collect();
-                let norm = QRmsNorm::from_weight(
-                    Tensor::from_vec(norm_w_vals, (width,), &dev)?,
-                    1e-6,
-                );
+                let norm =
+                    QRmsNorm::from_weight(Tensor::from_vec(norm_w_vals, (width,), &dev)?, 1e-6);
                 let signed_norm = norm.mul_weight(signs)?;
 
                 let x_vals: Vec<f32> = (0..(2 * width))
@@ -4585,8 +4603,14 @@ mod tests {
                     let x = x_f32.to_dtype(dt)?;
                     let unfolded = had.forward(&norm.forward(&x)?)?;
                     let folded = had.forward_presigned(&signed_norm.forward(&x)?)?;
-                    let u_v = unfolded.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-                    let f_v = folded.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+                    let u_v = unfolded
+                        .to_dtype(DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?;
+                    let f_v = folded
+                        .to_dtype(DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?;
                     assert_eq!(
                         u_v, f_v,
                         "sign-folded RMSNorm + FWHT must be IEEE-754 bit-exact (block={block}, dt={dt:?}, dev={dev:?})"

@@ -412,7 +412,10 @@ impl QuantizedConfig {
         else {
             return None;
         };
-        if matches!(recipe_entry(modules, prefix), Some(AfqModule::Quantized(false))) {
+        if matches!(
+            recipe_entry(modules, prefix),
+            Some(AfqModule::Quantized(false))
+        ) {
             return None;
         }
         if let Some(&block) = recipe_entry(hadamard_blocks, prefix) {
@@ -439,7 +442,7 @@ impl QuantizedConfig {
 }
 
 type AfqParsedRest = (
-     usize,
+    usize,
     std::collections::HashMap<String, AfqModule>,
     std::collections::HashMap<String, usize>,
 );
@@ -2119,7 +2122,10 @@ mod afq_recipe_tests {
             },
         ];
         qcfg.with_afq_module_specs(&specs);
-        assert_eq!(qcfg.afq_hadamard_block_at("language_model.lm_head"), Some(1024));
+        assert_eq!(
+            qcfg.afq_hadamard_block_at("language_model.lm_head"),
+            Some(1024)
+        );
         assert_eq!(
             qcfg.afq_hadamard_block_at("language_model.model.embed_tokens"),
             Some(1024)

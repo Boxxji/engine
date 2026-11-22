@@ -677,7 +677,7 @@ fn recurrence_metal_step(
 }
 
 /// Portable f32 reference scan. Serves CPU, Vulkan, and any backend without a fused kernel.
-fn recurrence_portable(
+pub(crate) fn recurrence_portable(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
