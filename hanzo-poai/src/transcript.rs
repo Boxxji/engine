@@ -182,7 +182,8 @@ impl Default for Sha256 {
 /// Challenge derivation mode for Freivalds verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChallengeMode {
-    /// Non-interactive Fiat-Shamir heuristic bound to `(profile, op, p, m, k, n, commit_A, commit_B, commit_C)`.
+    /// Non-interactive Fiat-Shamir heuristic bound to
+    /// `(profile, op, p, m, k, n, rounds, commit_A, commit_B, commit_C)`.
     ///
     /// Note: With `rounds = 2` (`p^2 > 2^121`), grinding `C` to pass Fiat-Shamir requires `> 2^121`
     /// SHA-256 evaluations. For interactive or beacon-settled verification where zero grinding
@@ -267,8 +268,8 @@ pub fn commit_round_projection(round_idx: u32, projection: &[Fp]) -> [u8; 32] {
     h.finalize()
 }
 
-/// Derive the transcript root seed binding profile, operator, modulus, dimensions, commitments,
-/// and challenge mode.
+/// Derive the transcript root seed binding profile, operator, modulus, dimensions, round count,
+/// commitments, and challenge mode.
 #[allow(clippy::too_many_arguments)]
 pub fn derive_transcript_seed(
     profile: &VerificationProfile,
@@ -276,6 +277,7 @@ pub fn derive_transcript_seed(
     m: usize,
     k: usize,
     n: usize,
+    rounds: usize,
     commit_a: &[u8; 32],
     commit_b: &[u8; 32],
     commit_c: &[u8; 32],
@@ -290,6 +292,7 @@ pub fn derive_transcript_seed(
     h.update(&(m as u64).to_le_bytes());
     h.update(&(k as u64).to_le_bytes());
     h.update(&(n as u64).to_le_bytes());
+    h.update(&(rounds as u32).to_le_bytes());
     h.update(commit_a);
     h.update(commit_b);
     h.update(commit_c);

@@ -25,10 +25,11 @@ use std::time::Instant;
 use hanzo_poai::{
     commit_activation_matrix, commit_output_matrix, commit_weight_matrix, derive_challenge_vector,
     derive_transcript_seed, prove_matrix_product_with_cached_b_commit, prover_matmul,
-    verify_freivalds_algebraic_only, verify_matrix_product,
-    verify_matrix_product_with_cached_b_commit, verify_matrix_product_with_mode, ActivationMatrix,
-    ChallengeMode, MatrixProofReceipt, OperatorKind, PackedQuantFormat, PackedWeightMatrix,
-    PoaiError, VerificationProfile, DEFAULT_FREIVALDS_ROUNDS, MAX_SAFE_SIGNED, MODULUS_P,
+    verify_freivalds_algebraic_only, verify_matrix_product_with_cached_b_commit,
+    verify_matrix_product_with_cached_b_commit_and_policy, verify_matrix_product_with_mode,
+    verify_matrix_product_with_policy, ActivationMatrix, ChallengeMode, MatrixProofReceipt,
+    OperatorKind, PackedQuantFormat, PackedWeightMatrix, PoaiError, VerificationPolicy,
+    VerificationProfile, DEFAULT_FREIVALDS_ROUNDS, MAX_SAFE_SIGNED, MODULUS_P,
     PROOF_SCOPE_DISCLAIMER,
 };
 
@@ -212,10 +213,14 @@ fn benchmark_shape(
     .expect("prove succeeds");
     let receipt_bytes = receipt.to_bytes().len();
 
+    let policy = VerificationPolicy::with_min_rounds(rounds);
+
     // Warmup
     let _ = black_box(prover_matmul(&a, &b).unwrap());
-    verify_matrix_product_with_cached_b_commit(profile, &a, &b, &c, &receipt, commit_b, None)
-        .expect("warmup verify succeeds");
+    verify_matrix_product_with_cached_b_commit_and_policy(
+        profile, &a, &b, &c, &receipt, commit_b, policy,
+    )
+    .expect("warmup verify succeeds");
 
     let mut prover_us = Vec::with_capacity(iterations);
     let mut commit_ac_us = Vec::with_capacity(iterations);
@@ -247,6 +252,7 @@ fn benchmark_shape(
             m,
             k,
             n,
+            rounds,
             &ca,
             &cb,
             &cc,
@@ -264,12 +270,14 @@ fn benchmark_shape(
         freivalds_us.push(t4.elapsed().as_secs_f64() * 1e6);
 
         let t5 = Instant::now();
-        verify_matrix_product_with_cached_b_commit(profile, &a, &b, &c, &receipt, commit_b, None)
-            .unwrap();
+        verify_matrix_product_with_cached_b_commit_and_policy(
+            profile, &a, &b, &c, &receipt, commit_b, policy,
+        )
+        .unwrap();
         online_us.push(t5.elapsed().as_secs_f64() * 1e6);
 
         let t6 = Instant::now();
-        verify_matrix_product(profile, &a, &b, &c, &receipt).unwrap();
+        verify_matrix_product_with_policy(profile, &a, &b, &c, &receipt, policy).unwrap();
         cold_us.push(t6.elapsed().as_secs_f64() * 1e6);
     }
 

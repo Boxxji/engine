@@ -221,6 +221,56 @@ impl MatrixProofReceipt {
     }
 }
 
+/// Verifier-owned security policy enforced during receipt verification.
+///
+/// Ensures the verifier—not the untrusted prover receipt—controls the minimum
+/// number of independent Freivalds rounds and optional challenge mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerificationPolicy {
+    /// Minimum number of independent Freivalds rounds required by the verifier.
+    /// Defaults to `VerificationProfile::default_rounds` (`2`, > 121-bit soundness).
+    pub min_rounds: usize,
+    /// Optional verifier-chosen challenge mode (e.g. a fresh interactive CSPRNG seed).
+    pub expected_mode: Option<ChallengeMode>,
+}
+
+impl VerificationPolicy {
+    /// Default verifier policy for `profile`: enforces `profile.default_rounds` (`2` under
+    /// `poai.matmul.v1`) and accepts either challenge mode.
+    pub const fn default_for(profile: &VerificationProfile) -> Self {
+        Self {
+            min_rounds: profile.default_rounds,
+            expected_mode: None,
+        }
+    }
+
+    /// Construct a verifier policy with an explicit minimum round count (e.g. `1` when
+    /// explicitly opting into 61-bit verification, or `4` for 244-bit security).
+    pub const fn with_min_rounds(min_rounds: usize) -> Self {
+        Self {
+            min_rounds,
+            expected_mode: None,
+        }
+    }
+
+    /// Construct a verifier policy enforcing `profile.default_rounds` and a specific
+    /// [`ChallengeMode`].
+    pub const fn with_mode(profile: &VerificationProfile, expected_mode: ChallengeMode) -> Self {
+        Self {
+            min_rounds: profile.default_rounds,
+            expected_mode: Some(expected_mode),
+        }
+    }
+
+    /// Construct a fully explicit verifier policy.
+    pub const fn new(min_rounds: usize, expected_mode: Option<ChallengeMode>) -> Self {
+        Self {
+            min_rounds,
+            expected_mode,
+        }
+    }
+}
+
 /// Produce a canonical proof receipt for a claimed packed low-bit integer matrix product `C = A * B`.
 pub fn prove_matrix_product(
     profile: &VerificationProfile,
@@ -262,6 +312,7 @@ pub fn prove_matrix_product_with_cached_b_commit(
         m,
         k,
         n,
+        rounds,
         &commit_a,
         &commit_b,
         &commit_c,
@@ -293,7 +344,8 @@ pub fn prove_matrix_product_with_cached_b_commit(
 }
 
 /// Verify a claimed matrix product `C = A * B` against its proof receipt (cold path: recomputes
-/// all three commitments `commit_A`, `commit_B`, `commit_C`).
+/// all three commitments `commit_A`, `commit_B`, `commit_C`) while enforcing the profile's default
+/// minimum round count (`profile.default_rounds`, i.e., `2` rounds under `poai.matmul.v1`).
 pub fn verify_matrix_product(
     profile: &VerificationProfile,
     a: &ActivationMatrix,
@@ -301,12 +353,19 @@ pub fn verify_matrix_product(
     c: &OutputMatrix,
     receipt: &MatrixProofReceipt,
 ) -> Result<(), PoaiError> {
-    let commit_b = commit_weight_matrix(b);
-    verify_matrix_product_inner(profile, a, b, c, receipt, commit_b, None)
+    verify_matrix_product_with_policy(
+        profile,
+        a,
+        b,
+        c,
+        receipt,
+        VerificationPolicy::default_for(profile),
+    )
 }
 
-/// Verify a claimed matrix product while enforcing an explicit verifier-chosen [`ChallengeMode`]
-/// (e.g. requiring a fresh interactive CSPRNG seed so a cheating prover cannot grind Fiat-Shamir).
+/// Verify a claimed matrix product while enforcing `profile.default_rounds` and an explicit
+/// verifier-chosen [`ChallengeMode`] (e.g. requiring a fresh interactive CSPRNG seed so a
+/// cheating prover cannot grind Fiat-Shamir).
 pub fn verify_matrix_product_with_mode(
     profile: &VerificationProfile,
     a: &ActivationMatrix,
@@ -315,13 +374,34 @@ pub fn verify_matrix_product_with_mode(
     receipt: &MatrixProofReceipt,
     expected_mode: ChallengeMode,
 ) -> Result<(), PoaiError> {
-    let commit_b = commit_weight_matrix(b);
-    verify_matrix_product_inner(profile, a, b, c, receipt, commit_b, Some(expected_mode))
+    verify_matrix_product_with_policy(
+        profile,
+        a,
+        b,
+        c,
+        receipt,
+        VerificationPolicy::with_mode(profile, expected_mode),
+    )
 }
 
-/// Verify a claimed matrix product using a pre-verified static model weight commitment `trusted_commit_b`
-/// (hot inference serving path: hashes only dynamic `A` and `C`, still checks `trusted_commit_b == receipt.commit_b`
-/// and runs full Freivalds `A * (B * r) == C * r (mod p)` against the resident packed weights `B`).
+/// Verify a claimed matrix product (cold path) under an explicit verifier-owned
+/// [`VerificationPolicy`] (controlling `min_rounds` and optional `expected_mode`).
+pub fn verify_matrix_product_with_policy(
+    profile: &VerificationProfile,
+    a: &ActivationMatrix,
+    b: &PackedWeightMatrix,
+    c: &OutputMatrix,
+    receipt: &MatrixProofReceipt,
+    policy: VerificationPolicy,
+) -> Result<(), PoaiError> {
+    let commit_b = commit_weight_matrix(b);
+    verify_matrix_product_inner(profile, a, b, c, receipt, commit_b, policy)
+}
+
+/// Verify a claimed matrix product using a pre-verified static model weight commitment
+/// `trusted_commit_b` (hot inference serving path: hashes only dynamic `A` and `C`, still checks
+/// `trusted_commit_b == receipt.commit_b`, enforces `profile.default_rounds` minimum rounds, and
+/// runs full Freivalds `A * (B * r) == C * r (mod p)` against the resident packed weights `B`).
 pub fn verify_matrix_product_with_cached_b_commit(
     profile: &VerificationProfile,
     a: &ActivationMatrix,
@@ -331,7 +411,29 @@ pub fn verify_matrix_product_with_cached_b_commit(
     trusted_commit_b: [u8; 32],
     expected_mode: Option<ChallengeMode>,
 ) -> Result<(), PoaiError> {
-    verify_matrix_product_inner(profile, a, b, c, receipt, trusted_commit_b, expected_mode)
+    verify_matrix_product_inner(
+        profile,
+        a,
+        b,
+        c,
+        receipt,
+        trusted_commit_b,
+        VerificationPolicy::new(profile.default_rounds, expected_mode),
+    )
+}
+
+/// Verify a claimed matrix product using a pre-verified static model weight commitment
+/// `trusted_commit_b` under an explicit verifier-owned [`VerificationPolicy`].
+pub fn verify_matrix_product_with_cached_b_commit_and_policy(
+    profile: &VerificationProfile,
+    a: &ActivationMatrix,
+    b: &PackedWeightMatrix,
+    c: &OutputMatrix,
+    receipt: &MatrixProofReceipt,
+    trusted_commit_b: [u8; 32],
+    policy: VerificationPolicy,
+) -> Result<(), PoaiError> {
+    verify_matrix_product_inner(profile, a, b, c, receipt, trusted_commit_b, policy)
 }
 
 fn verify_matrix_product_inner(
@@ -341,7 +443,7 @@ fn verify_matrix_product_inner(
     c: &OutputMatrix,
     receipt: &MatrixProofReceipt,
     expected_commit_b: [u8; 32],
-    expected_mode: Option<ChallengeMode>,
+    policy: VerificationPolicy,
 ) -> Result<(), PoaiError> {
     if receipt.profile_version != profile.version {
         return Err(PoaiError::ProfileMismatch {
@@ -356,7 +458,7 @@ fn verify_matrix_product_inner(
         });
     }
     profile.ensure_eligible(receipt.operator)?;
-    profile.validate_rounds(receipt.rounds)?;
+    profile.validate_rounds_at_least(receipt.rounds, policy.min_rounds)?;
 
     let expected_op = b.format().operator_kind();
     if receipt.operator != expected_op {
@@ -365,7 +467,7 @@ fn verify_matrix_product_inner(
             actual: receipt.operator.as_str().to_string(),
         });
     }
-    if let Some(mode) = expected_mode {
+    if let Some(mode) = policy.expected_mode {
         if receipt.challenge_mode != mode {
             return Err(PoaiError::ChallengeModeMismatch {
                 reason: "receipt challenge mode or interactive seed does not match verifier policy",
@@ -410,6 +512,7 @@ fn verify_matrix_product_inner(
         m,
         k,
         n,
+        receipt.rounds,
         &receipt.commit_a,
         &receipt.commit_b,
         &receipt.commit_c,
@@ -659,5 +762,181 @@ mod tests {
             MatrixProofReceipt::from_bytes(&wire),
             Err(PoaiError::InvalidProofEncoding { .. })
         ));
+    }
+
+    #[test]
+    fn rejects_prover_round_downgrade_and_honors_verifier_owned_policy() {
+        let profile = VerificationProfile::v1();
+        let (a, b, c) = sample_instance(PackedQuantFormat::PackedInt4Q4_0, 8, 64, 32);
+        let commit_b = commit_weight_matrix(&b);
+        let interactive_mode = ChallengeMode::InteractiveSeed(os_random_seed().unwrap());
+
+        for mode in [ChallengeMode::FiatShamir, interactive_mode] {
+            // Reproduce the exact downgrade attack: take a valid 2-round receipt, mutate rounds
+            // to 1, truncate round_digests, and round-trip through the wire codec.
+            let two_round = prove_matrix_product(&profile, &a, &b, &c, 2, mode).unwrap();
+            let mut downgraded = two_round.clone();
+            downgraded.rounds = 1;
+            downgraded.round_digests.truncate(1);
+            let downgraded_wire = MatrixProofReceipt::from_bytes(&downgraded.to_bytes()).unwrap();
+
+            // Cold, mode-enforced, and cached-B default verifiers MUST all reject with min=2.
+            assert!(matches!(
+                verify_matrix_product(&profile, &a, &b, &c, &downgraded_wire),
+                Err(PoaiError::InvalidChallengeRounds {
+                    rounds: 1,
+                    min: 2,
+                    max: 4
+                })
+            ));
+            assert!(matches!(
+                verify_matrix_product_with_mode(&profile, &a, &b, &c, &downgraded_wire, mode),
+                Err(PoaiError::InvalidChallengeRounds {
+                    rounds: 1,
+                    min: 2,
+                    max: 4
+                })
+            ));
+            assert!(matches!(
+                verify_matrix_product_with_cached_b_commit(
+                    &profile,
+                    &a,
+                    &b,
+                    &c,
+                    &downgraded_wire,
+                    commit_b,
+                    Some(mode),
+                ),
+                Err(PoaiError::InvalidChallengeRounds {
+                    rounds: 1,
+                    min: 2,
+                    max: 4
+                })
+            ));
+
+            // Even if a verifier explicitly opts into min_rounds = 1, truncating a 2-round receipt
+            // MUST fail because `rounds` is cryptographically bound into the transcript seed.
+            let explicit_1 = VerificationPolicy::new(1, Some(mode));
+            assert!(matches!(
+                verify_matrix_product_with_policy(
+                    &profile,
+                    &a,
+                    &b,
+                    &c,
+                    &downgraded_wire,
+                    explicit_1
+                ),
+                Err(PoaiError::RoundDigestMismatch { round: 0 })
+            ));
+            assert!(matches!(
+                verify_matrix_product_with_cached_b_commit_and_policy(
+                    &profile,
+                    &a,
+                    &b,
+                    &c,
+                    &downgraded_wire,
+                    commit_b,
+                    explicit_1,
+                ),
+                Err(PoaiError::RoundDigestMismatch { round: 0 })
+            ));
+
+            // A freshly proved honest 1-round receipt is still rejected by default verifiers...
+            let honest_one_round = prove_matrix_product(&profile, &a, &b, &c, 1, mode).unwrap();
+            let honest_one_wire =
+                MatrixProofReceipt::from_bytes(&honest_one_round.to_bytes()).unwrap();
+            assert!(matches!(
+                verify_matrix_product(&profile, &a, &b, &c, &honest_one_wire),
+                Err(PoaiError::InvalidChallengeRounds {
+                    rounds: 1,
+                    min: 2,
+                    max: 4
+                })
+            ));
+            assert!(matches!(
+                verify_matrix_product_with_mode(&profile, &a, &b, &c, &honest_one_wire, mode),
+                Err(PoaiError::InvalidChallengeRounds {
+                    rounds: 1,
+                    min: 2,
+                    max: 4
+                })
+            ));
+            assert!(matches!(
+                verify_matrix_product_with_cached_b_commit(
+                    &profile,
+                    &a,
+                    &b,
+                    &c,
+                    &honest_one_wire,
+                    commit_b,
+                    Some(mode),
+                ),
+                Err(PoaiError::InvalidChallengeRounds {
+                    rounds: 1,
+                    min: 2,
+                    max: 4
+                })
+            ));
+
+            // ...and accepted ONLY when the verifier explicitly chooses min_rounds = 1.
+            verify_matrix_product_with_policy(&profile, &a, &b, &c, &honest_one_wire, explicit_1)
+                .unwrap();
+            verify_matrix_product_with_cached_b_commit_and_policy(
+                &profile,
+                &a,
+                &b,
+                &c,
+                &honest_one_wire,
+                commit_b,
+                explicit_1,
+            )
+            .unwrap();
+
+            // Higher verifier-owned minimum (4 rounds) rejects 2-round receipts and accepts 4-round.
+            let require_4 = VerificationPolicy::new(4, Some(mode));
+            assert!(matches!(
+                verify_matrix_product_with_policy(&profile, &a, &b, &c, &two_round, require_4),
+                Err(PoaiError::InvalidChallengeRounds {
+                    rounds: 2,
+                    min: 4,
+                    max: 4
+                })
+            ));
+            let four_round = prove_matrix_product(&profile, &a, &b, &c, 4, mode).unwrap();
+            verify_matrix_product_with_policy(&profile, &a, &b, &c, &four_round, require_4)
+                .unwrap();
+
+            // Out-of-range policy min_rounds (0 or 5) is itself rejected.
+            assert!(matches!(
+                verify_matrix_product_with_policy(
+                    &profile,
+                    &a,
+                    &b,
+                    &c,
+                    &two_round,
+                    VerificationPolicy::with_min_rounds(0),
+                ),
+                Err(PoaiError::InvalidChallengeRounds {
+                    rounds: 0,
+                    min: 1,
+                    max: 4
+                })
+            ));
+            assert!(matches!(
+                verify_matrix_product_with_policy(
+                    &profile,
+                    &a,
+                    &b,
+                    &c,
+                    &two_round,
+                    VerificationPolicy::with_min_rounds(5),
+                ),
+                Err(PoaiError::InvalidChallengeRounds {
+                    rounds: 5,
+                    min: 1,
+                    max: 4
+                })
+            ));
+        }
     }
 }

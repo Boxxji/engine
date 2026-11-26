@@ -183,3 +183,117 @@ fn multithreaded_16_thread_concurrent_verification_is_deterministic() {
         h.join().expect("verifier thread panicked");
     }
 }
+
+#[test]
+fn rejects_round_downgrade_across_all_default_verifiers_and_allows_explicit_policy() {
+    use hanzo_poai::{
+        verify_matrix_product_with_cached_b_commit_and_policy, verify_matrix_product_with_policy,
+        VerificationPolicy,
+    };
+
+    let profile = VerificationProfile::v1();
+    let mut seed = 0x5150_1350_u64;
+    let (a, b, c) = make_case(&mut seed, PackedQuantFormat::PackedTernaryI2S, 4, 64, 32);
+    let commit_b = commit_weight_matrix(&b);
+    let mode = ChallengeMode::InteractiveSeed(os_random_seed().unwrap());
+
+    // Prover takes a 2-round receipt, downgrades rounds=1, truncates round_digests, and re-encodes.
+    let mut downgraded = prove_matrix_product(&profile, &a, &b, &c, 2, mode).unwrap();
+    downgraded.rounds = 1;
+    downgraded.round_digests.truncate(1);
+    let decoded = MatrixProofReceipt::from_bytes(&downgraded.to_bytes()).unwrap();
+
+    // All default verifiers require >= 2 rounds.
+    assert!(matches!(
+        verify_matrix_product(&profile, &a, &b, &c, &decoded),
+        Err(PoaiError::InvalidChallengeRounds {
+            rounds: 1,
+            min: 2,
+            max: 4
+        })
+    ));
+    assert!(matches!(
+        verify_matrix_product_with_mode(&profile, &a, &b, &c, &decoded, mode),
+        Err(PoaiError::InvalidChallengeRounds {
+            rounds: 1,
+            min: 2,
+            max: 4
+        })
+    ));
+    assert!(matches!(
+        verify_matrix_product_with_cached_b_commit(
+            &profile,
+            &a,
+            &b,
+            &c,
+            &decoded,
+            commit_b,
+            Some(mode),
+        ),
+        Err(PoaiError::InvalidChallengeRounds {
+            rounds: 1,
+            min: 2,
+            max: 4
+        })
+    ));
+
+    // Even under an explicit 1-round policy, a truncated 2-round receipt fails transcript verification.
+    let policy_1 = VerificationPolicy::new(1, Some(mode));
+    assert!(matches!(
+        verify_matrix_product_with_policy(&profile, &a, &b, &c, &decoded, policy_1),
+        Err(PoaiError::RoundDigestMismatch { round: 0 })
+    ));
+
+    // An honest 1-round receipt passes ONLY when the verifier explicitly chooses min_rounds = 1.
+    let honest_1 = prove_matrix_product(&profile, &a, &b, &c, 1, mode).unwrap();
+    let honest_1_decoded = MatrixProofReceipt::from_bytes(&honest_1.to_bytes()).unwrap();
+    assert!(matches!(
+        verify_matrix_product(&profile, &a, &b, &c, &honest_1_decoded),
+        Err(PoaiError::InvalidChallengeRounds {
+            rounds: 1,
+            min: 2,
+            max: 4
+        })
+    ));
+    verify_matrix_product_with_policy(&profile, &a, &b, &c, &honest_1_decoded, policy_1).unwrap();
+    verify_matrix_product_with_cached_b_commit_and_policy(
+        &profile,
+        &a,
+        &b,
+        &c,
+        &honest_1_decoded,
+        commit_b,
+        policy_1,
+    )
+    .unwrap();
+}
+
+#[test]
+fn packed_ternary_i2s_is_distinct_from_gguf_tq2_0_66_byte_blocks() {
+    // GGUF TQ2_0 stores 256 weights in 66 bytes (qs[64] + trailing f16 scale), whereas
+    // poai.matmul.v1 PackedTernaryI2S stores 8 x 10-byte blocks (80 bytes for K=256, N=1).
+    let tq2_0_sized_column = vec![0u8; 66];
+    let err = PackedWeightMatrix::from_raw_bytes(
+        PackedQuantFormat::PackedTernaryI2S,
+        256,
+        1,
+        tq2_0_sized_column,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        PoaiError::MalformedPackedWeights {
+            format: "PackedTernaryI2S",
+            ..
+        }
+    ));
+    let poai_column = vec![0u8; 80];
+    let mat = PackedWeightMatrix::from_raw_bytes(
+        PackedQuantFormat::PackedTernaryI2S,
+        256,
+        1,
+        poai_column,
+    )
+    .unwrap();
+    assert_eq!(mat.raw_bytes().len(), 80);
+}

@@ -35,11 +35,11 @@ pub const PROOF_SCOPE_DISCLAIMER: &str =
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum OperatorKind {
-    /// Deterministic `i8` activation x `Q8_0`-layout `i8` block-scaled weight GEMM.
+    /// Deterministic `i8` activation x `Int8Q8_0` (`i16`-scaled 32-weight `i8`) GEMM.
     Int8Gemm = 1,
-    /// Deterministic `i8` activation x `Q4_0`-layout 4-bit nibble-packed block-scaled weight GEMM.
+    /// Deterministic `i8` activation x `PackedInt4Q4_0` (`i16`-scaled 32-weight 4-bit nibble) GEMM.
     PackedInt4BlockGemm = 2,
-    /// Deterministic `i8` activation x `I2_S`-layout 2-bit packed ternary block-scaled weight GEMM.
+    /// Deterministic `i8` activation x `PackedTernaryI2S` (custom `poai.matmul.v1` `i16`-scaled 32-weight 2-bit ternary; distinct from GGUF `TQ2_0`) GEMM.
     PackedTernaryI2SGemm = 3,
     /// Ineligible: IEEE-754 FP16 GEMM (non-associative across warp/tile reduction orders).
     Fp16Gemm = 100,
@@ -124,7 +124,7 @@ pub struct VerificationProfile {
     pub field_modulus_p: u64,
     /// Maximum safe signed integer accumulator magnitude (`(p - 1)/2 = 2^60 - 1`).
     pub max_safe_abs_accumulator: i64,
-    /// Quantization block size along reduction dimension `K` (`32`, aligned with `hanzo-quant` GGUF Q8_0/Q4_0).
+    /// Quantization block size along reduction dimension `K` (`32` weights per `i16`-scaled block in `poai.matmul.v1`).
     pub block_size: usize,
     /// Default number of Freivalds rounds (`2` -> soundness error `< 1/p^2 < 2^-121`).
     pub default_rounds: usize,
@@ -189,12 +189,30 @@ impl VerificationProfile {
         }
     }
 
-    /// Validate Freivalds round count against profile bounds.
+    /// Validate Freivalds round count against global profile bounds `[MIN_FREIVALDS_ROUNDS, MAX_FREIVALDS_ROUNDS]`.
     pub fn validate_rounds(&self, rounds: usize) -> Result<(), PoaiError> {
         if !(MIN_FREIVALDS_ROUNDS..=MAX_FREIVALDS_ROUNDS).contains(&rounds) {
             return Err(PoaiError::InvalidChallengeRounds {
                 rounds,
                 min: MIN_FREIVALDS_ROUNDS,
+                max: MAX_FREIVALDS_ROUNDS,
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate that a receipt's Freivalds round count satisfies a verifier-owned minimum round
+    /// requirement `min_rounds` within `[MIN_FREIVALDS_ROUNDS, MAX_FREIVALDS_ROUNDS]`.
+    pub fn validate_rounds_at_least(
+        &self,
+        rounds: usize,
+        min_rounds: usize,
+    ) -> Result<(), PoaiError> {
+        self.validate_rounds(min_rounds)?;
+        if !(min_rounds..=MAX_FREIVALDS_ROUNDS).contains(&rounds) {
+            return Err(PoaiError::InvalidChallengeRounds {
+                rounds,
+                min: min_rounds,
                 max: MAX_FREIVALDS_ROUNDS,
             });
         }

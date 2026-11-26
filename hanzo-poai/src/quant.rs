@@ -1,25 +1,31 @@
 // Copyright 2026 Hanzo AI, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Packed low-bit quantized integer matrix layouts aligned with `hanzo-quant`
-//! (`Q8_0`, `Q4_0`, and `I2_S` / `TQ2_0` 32-element block semantics).
+//! Packed low-bit quantized integer matrix layouts for the `poai.matmul.v1` execution profile.
 //!
 //! # Accepted Numerical Semantics (`poai.matmul.v1`)
 //!
 //! Let `A` be an `M x K` row-major signed `i8` activation matrix (`A[i, k] in [-128, 127]`),
 //! and let `B` be a `K x N` packed low-bit weight matrix stored in column-blocked layout
 //! (`N` output channels, each partitioned into `K / 32` blocks of `QUANT_BLOCK_SIZE = 32`
-//! weights along `K`, mirroring GGUF `Q8_0` / `Q4_0` / `I2_S` weight layouts in `hanzo-quant`).
+//! weights along `K`).
 //!
 //! Each block `(j, b)` (`j in 0..N`, `b in 0..K/32`) stores:
 //! - an exact signed `i16` fixed-point block scale `s_{j, b} in [-32768, 32767]`
-//!   (little-endian; `s = 1` recovers raw unscaled integer GEMM), followed by
+//!   (little-endian; `s = 1` recovers raw unscaled integer GEMM — note that GGUF blocks in
+//!   `hanzo-quant` use IEEE-754 `f16` scales, so GGUF weights require explicit scale conversion
+//!   at load time), followed by
 //! - 32 packed quantized integer weights `q_{j, 32b + t}`:
-//!   - [`PackedQuantFormat::Int8Q8_0`]: 32 signed `i8` bytes (`34 bytes/block`, identical size to GGML `block_q8_0`).
-//!   - [`PackedQuantFormat::PackedInt4Q4_0`]: 16 packed bytes (`18 bytes/block`, identical size and split-half
-//!     nibble layout to GGML `block_q4_0`: low nibble = `q[t] + 8` for `t in 0..16`, high nibble = `q[t + 16] + 8`).
-//!   - [`PackedQuantFormat::PackedTernaryI2S`]: 8 packed bytes (`10 bytes/block`, 4 weights/byte in 2-bit
-//!     little-endian fields: `0b00 -> -1`, `0b01 -> 0`, `0b10 -> +1`; `0b11` is rejected as malformed).
+//!   - [`PackedQuantFormat::Int8Q8_0`]: 32 signed `i8` bytes (`34 bytes/block`, matching the
+//!     32-weight payload geometry of GGML `block_q8_0` with an `i16` scale instead of `f16`).
+//!   - [`PackedQuantFormat::PackedInt4Q4_0`]: 16 packed bytes (`18 bytes/block`, matching the
+//!     32-weight split-half nibble payload geometry of GGML `block_q4_0`: low nibble = `q[t] + 8`
+//!     for `t in 0..16`, high nibble = `q[t + 16] + 8`, with an `i16` scale instead of `f16`).
+//!   - [`PackedQuantFormat::PackedTernaryI2S`]: 8 packed bytes (`10 bytes/block`, 4 weights/byte in
+//!     2-bit little-endian fields: `0b00 -> -1`, `0b01 -> 0`, `0b10 -> +1`; `0b11` is rejected as
+//!     malformed). **Distinct execution-profile format — NOT wire-compatible with GGUF `TQ2_0`**
+//!     (`BlockTQ2_0` packs 256 weights into 66 bytes with `qs[64]` and a trailing `f16` scale,
+//!     whereas `PackedTernaryI2S` requires 80 bytes per 256 weights across eight 10-byte blocks).
 //!
 //! The exact integer matrix product `C = A * B` (`M x N`, row-major `i64`) is defined by:
 //!
@@ -37,7 +43,7 @@ use crate::error::PoaiError;
 use crate::field::{Fp, MAX_SAFE_SIGNED};
 use crate::profile::OperatorKind;
 
-/// Block size along reduction dimension `K`, matching `hanzo-quant` GGUF `Q8_0` / `Q4_0` / `I2_S`.
+/// Block size along reduction dimension `K` (`32` weights per `i16`-scaled block in `poai.matmul.v1`).
 pub const QUANT_BLOCK_SIZE: usize = 32;
 
 /// Maximum supported dimension along `K` or `N` to guarantee zero `i64`/`i128` overflow
@@ -48,11 +54,11 @@ pub const MAX_SAFE_DIM: usize = 1 << 30;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum PackedQuantFormat {
-    /// `Q8_0`-aligned: 2-byte `i16` scale + 32 `i8` weights = 34 bytes per 32-weight block.
+    /// 2-byte `i16` scale + 32 `i8` weights = 34 bytes per 32-weight block (`Q8_0` payload geometry, `i16` scale).
     Int8Q8_0 = 1,
-    /// `Q4_0`-aligned: 2-byte `i16` scale + 16 split-half nibble bytes = 18 bytes per 32-weight block.
+    /// 2-byte `i16` scale + 16 split-half nibble bytes = 18 bytes per 32-weight block (`Q4_0` payload geometry, `i16` scale).
     PackedInt4Q4_0 = 2,
-    /// `I2_S`-aligned: 2-byte `i16` scale + 8 2-bit ternary bytes = 10 bytes per 32-weight block.
+    /// Custom `poai.matmul.v1` ternary layout: 2-byte leading `i16` scale + 8 2-bit ternary bytes = 10 bytes per 32-weight block (distinct from GGUF `TQ2_0`'s 256-weight, 66-byte layout).
     PackedTernaryI2S = 3,
 }
 

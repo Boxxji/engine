@@ -7,7 +7,8 @@
 //!
 //! Clean-room, zero-dependency Rust (`std`-only, Apache-2.0) execution profile and
 //! Freivalds probabilistic verifier for packed low-bit quantized integer matrix products
-//! aligned with `hanzo-quant` (`Q8_0`, `Q4_0`, and `I2_S` 32-element block layouts).
+//! (`poai.matmul.v1`: 32-element `i16`-scaled `Int8Q8_0`, `PackedInt4Q4_0`, and custom
+//! `PackedTernaryI2S` block layouts).
 //!
 //! ## Scope Boundary (`hanzoai/engine#66` / `zoo-apps/papers#13`)
 //!
@@ -25,8 +26,8 @@
 //! - **Per-round soundness error**: For uniform non-zero challenge `r in GF(p)^n \ {0}`,
 //!   any non-zero error matrix `D = A*B - C (mod p)` satisfies
 //!   `Pr[D*r = 0 | r != 0] <= (p^(n-1) - 1) / (p^n - 1) < 1/p ~= 4.3368e-19`.
-//! - **Multi-round soundness**: For `k = 2` independent rounds (default), error `< 1/p^2 < 2^-121`;
-//!   for `k = 4`, error `< 1/p^4 < 2^-243`.
+//! - **Multi-round soundness**: For `k = 2` independent rounds (default verifier minimum),
+//!   error `< 1/p^2 < 2^-121`; for `k = 4`, error `< 1/p^4 < 2^-243`.
 
 pub mod error;
 pub mod field;
@@ -40,8 +41,9 @@ pub use field::{Fp, MAX_SAFE_SIGNED, MODULUS_P};
 pub use freivalds::{
     prove_matrix_product, prove_matrix_product_with_cached_b_commit,
     verify_freivalds_algebraic_only, verify_matrix_product,
-    verify_matrix_product_with_cached_b_commit, verify_matrix_product_with_mode,
-    MatrixProofReceipt,
+    verify_matrix_product_with_cached_b_commit,
+    verify_matrix_product_with_cached_b_commit_and_policy, verify_matrix_product_with_mode,
+    verify_matrix_product_with_policy, MatrixProofReceipt, VerificationPolicy,
 };
 pub use profile::{
     OperatorKind, VerificationProfile, DEFAULT_FREIVALDS_ROUNDS, MAX_FREIVALDS_ROUNDS,

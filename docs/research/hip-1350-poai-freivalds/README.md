@@ -9,7 +9,7 @@
   - Jacob T. Schwartz, *"Fast Probabilistic Algorithms for Verification of Polynomial Identities"*, JACM 27(4), 1980, pp. 701–717; Richard Zippel, EUROSAM 1979.
   - Amos Fiat and Adi Shamir, *"How to Prove Yourself: Practical Solutions to Identification and Signature Problems"*, CRYPTO 1986.
   - NIST FIPS 180-4, *"Secure Hash Standard (SHS)"* (SHA-256 test vectors verified in `hanzo-poai/src/transcript.rs`).
-  - `hanzo-quant` (`Q8_0`, `Q4_0`, and `I2_S` / `TQ2_0` 32-element packed weight block conventions in `hanzo-quant/src/lib.rs` and `hanzo-quant/src/gguf/`).
+  - `hanzo-quant` (`Q8_0` and `Q4_0` 32-element payload conventions in `hanzo-quant/src/lib.rs` and `hanzo-quant/src/gguf/`; note that `poai.matmul.v1` defines its own deterministic `i16`-scaled execution-profile layouts—and a distinct custom `PackedTernaryI2S` 32-weight / `10 B` layout that is **not** wire-compatible with GGUF `TQ2_0`'s 256-weight / `66 B` layout, see §3.2).
 - **License and dependency audit**:
   - `hanzo-poai` is a **100% clean-room Apache-2.0** Rust crate using **`std` only** with **zero external crate dependencies** (`[dependencies]` and `[dev-dependencies]` are both empty; `Cargo.lock` adds only the local `hanzo-poai` package entry with zero dependencies).
   - No external source files, third-party crypto crates, proprietary datasets, or restricted model weights are imported.
@@ -27,16 +27,17 @@ In accordance with the decentralized Hanzo bounty rules, this crate strictly sep
 
 | Mechanism | What `hanzo-poai` Provides | What Remains Out of Scope |
 |---|---|---|
-| **Probabilistic cryptographic check** | Verifies $C = A \cdot B$ exactly over $\mathbb{Z}$ via Freivalds over $\mathbb{F}_p$ ($p = 2^{61} - 1$) bound by SHA-256 commitments (`commit_A`, `commit_B`, `commit_C`) and round projection digests. | Does not verify non-matmul layers (attention, norms, activations, sampling, KV/GDN state updates) or semantic response quality. |
+| **Probabilistic cryptographic check** | Verifies $C = A \cdot B$ exactly over $\mathbb{Z}$ via Freivalds over $\mathbb{F}_p$ ($p = 2^{61} - 1$) bound by SHA-256 commitments (`commit_A`, `commit_B`, `commit_C`), transcript-bound round count, and round projection digests. | Does not verify non-matmul layers (attention, norms, activations, sampling, KV/GDN state updates) or semantic response quality. |
 | **Hardware attestation** | **None assumed.** Any commodity CPU verifier can audit a GPU prover without TEEs, SGX, or vendor attestation keys. | GPU kernel timing / hardware identity is not attested by this receipt. |
 | **Economic / settlement security** | Provides compact `216 B` (Fiat-Shamir) / `248 B` (Interactive) canonical wire receipts suitable for challenge-response games. | Slashing contracts, stake sizing, challenge windows, and economic incentives require external security audit before holding real funds. |
 
-### Challenge Modes and Grinding Defense
+### Challenge Modes, Verifier-Owned Policy, and Grinding Defense
 
-`hanzo-poai` supports two explicit challenge modes (`ChallengeMode`):
+`hanzo-poai` supports two explicit challenge modes (`ChallengeMode`) governed by a verifier-owned [`VerificationPolicy`](../../../hanzo-poai/src/freivalds.rs):
 
-1. **`ChallengeMode::FiatShamir` (non-interactive)**: Binds `(profile_version, operator_tag, p, m, k, n, commit_A, commit_B, commit_C)` via domain-separated SHA-256. With `k = 2` rounds, finding a forged $C' \neq A B$ that collides with all $k$ challenge projections requires $\Omega(p^2) > 2^{121}$ SHA-256 evaluations, which is computationally infeasible.
-2. **`ChallengeMode::InteractiveSeed([u8; 32])` (commit-then-challenge)**: The prover commits to `commit_C` *before* receiving a fresh 256-bit verifier CSPRNG seed (from OS `/dev/urandom` or an independent randomness beacon). Verifiers calling `verify_matrix_product_with_mode` reject any receipt attempting to downgrade from interactive to Fiat-Shamir or substitute a different seed, eliminating prover grinding altogether.
+1. **`ChallengeMode::FiatShamir` (non-interactive)**: Binds `(profile_version, operator_tag, p, m, k, n, rounds, commit_A, commit_B, commit_C)` via domain-separated SHA-256. With `k = 2` rounds, finding a forged $C' \neq A B$ that collides with all $k$ challenge projections requires $\Omega(p^2) > 2^{121}$ SHA-256 evaluations, which is computationally infeasible.
+2. **`ChallengeMode::InteractiveSeed([u8; 32])` (commit-then-challenge)**: The prover commits to `commit_C` *before* receiving a fresh 256-bit verifier CSPRNG seed (from OS `/dev/urandom` or an independent randomness beacon). Verifiers calling `verify_matrix_product_with_mode` or `verify_matrix_product_with_policy` reject any receipt attempting to downgrade from interactive to Fiat-Shamir or substitute a different seed, eliminating prover grinding altogether.
+3. **Verifier-owned minimum round enforcement**: All default verifiers (`verify_matrix_product`, `verify_matrix_product_with_mode`, and `verify_matrix_product_with_cached_b_commit`) enforce `min_rounds = profile.default_rounds` (`2` rounds / `122.00` soundness bits under `poai.matmul.v1`), rejecting any untrusted 1-round receipt with `PoaiError::InvalidChallengeRounds`. Furthermore, `rounds` is hashed into `derive_transcript_seed`, so truncating a 2-round receipt to 1 round fails transcript verification even if a verifier explicitly selects `VerificationPolicy::with_min_rounds(1)` via `verify_matrix_product_with_policy` or `verify_matrix_product_with_cached_b_commit_and_policy`.
 
 ---
 
@@ -55,13 +56,13 @@ In accordance with the decentralized Hanzo bounty rules, this crate strictly sep
 Under **`poai.matmul.v1`**:
 
 - Activation matrix $A \in [-128, 127]^{M \times K}$ is row-major signed `i8`.
-- Weight matrix $B \in \mathbb{Z}^{K \times N}$ is stored in column-blocked layout ($N$ output channels, each partitioned into $K / 32$ blocks of `QUANT_BLOCK_SIZE = 32` weights along $K$, matching `hanzo-quant` GGUF `Q8_0` / `Q4_0` / `I2_S`). Each block $(j, b)$ holds a signed fixed-point `i16` scale $s_{j,b} \in [-32768, 32767]$ (`s = 1` for unscaled integer GEMM) followed by packed integer weights:
+- Weight matrix $B \in \mathbb{Z}^{K \times N}$ is stored in `poai.matmul.v1`'s canonical column-blocked integer layout ($N$ output channels, each partitioned into $K / 32$ blocks of `QUANT_BLOCK_SIZE = 32` weights along $K$). Each block $(j, b)$ holds a leading little-endian signed fixed-point `i16` scale $s_{j,b} \in [-32768, 32767]$ (`s = 1` for unscaled integer GEMM) followed by packed integer weights:
 
-| Eligible Operator | Packed Format | Block Layout (`32` weights) | Weight Domain $q$ | Exact Byte Size / Block | `hanzo-quant` Alignment |
+| Eligible Operator | Packed Format | Block Layout (`32` weights) | Weight Domain $q$ | Exact Byte Size / Block | Relationship to `hanzo-quant` / GGUF |
 |---|---|---|---|---|---|
-| `Int8Gemm` | `Int8Q8_0` | `i16` scale + `32 × i8` | $[-128, 127]$ | `34 B` | Twin of GGML `block_q8_0` (`34 B`) |
-| `PackedInt4BlockGemm` | `PackedInt4Q4_0` | `i16` scale + `16 B` split-half nibbles | $[-8, 7]$ | `18 B` | Twin of GGML `block_q4_0` (`18 B`) |
-| `PackedTernaryI2SGemm` | `PackedTernaryI2S` | `i16` scale + `8 B` 2-bit codes (`00:-1, 01:0, 10:+1`; `11` rejected) | $\{-1, 0, +1\}$ | `10 B` | Twin of `I2_S` / `TQ2_0` (`10 B`) |
+| `Int8Gemm` | `Int8Q8_0` | Leading `i16` scale + `32 × i8` | $[-128, 127]$ | `34 B` | Same 32-weight / `34 B` payload geometry as GGML `block_q8_0`, but replaces the `f16` scale with an exact `i16` fixed-point scale (requires scale conversion at load time) |
+| `PackedInt4BlockGemm` | `PackedInt4Q4_0` | Leading `i16` scale + `16 B` split-half nibbles | $[-8, 7]$ | `18 B` | Same 32-weight / `18 B` split-half nibble payload geometry as GGML `block_q4_0`, but replaces the `f16` scale with an exact `i16` fixed-point scale (requires scale conversion at load time) |
+| `PackedTernaryI2SGemm` | `PackedTernaryI2S` | Leading `i16` scale + `8 B` 2-bit codes (`00:-1, 01:0, 10:+1`; `11` rejected) | $\{-1, 0, +1\}$ | `10 B` (`80 B` / 256 weights) | **Distinct custom `poai.matmul.v1` format — NOT wire-compatible with GGUF `TQ2_0`** (`BlockTQ2_0` in `hanzo-quant`/`hanzo-ml` packs 256 weights into `66 B`: `qs[64]` followed by a trailing `f16` scale). Raw `TQ2_0` bytes are rejected by `from_raw_bytes` and require an explicit repacking adapter |
 
 - Exact integer product $C = A \cdot B \in \mathbb{Z}^{M \times N}$:
   $$C_{i,j} = \sum_{b=0}^{K/32 - 1} s_{j,b} \sum_{t=0}^{31} A_{i,\,32b+t} \cdot q_{j,\,32b+t}$$
@@ -76,8 +77,8 @@ Because `derive_challenge_vector` uses zero-bias rejection sampling (rejecting o
 $$\Pr[A(Br) \equiv Cr \pmod p \mid C \neq AB] = \Pr[Dr = 0 \mid r \neq 0] \le \frac{p^{N-1} - 1}{p^N - 1} < \frac{1}{p} \approx 4.3368 \times 10^{-19}.$$
 
 Across $k$ independent rounds:
-- $k = 1$: $\varepsilon_1 < p^{-1} \approx 4.3368 \times 10^{-19}$ (`61.00` soundness bits)
-- $k = 2$ (default): $\varepsilon_2 < p^{-2} \approx 1.8808 \times 10^{-37} < 2^{-121}$ (`122.00` soundness bits)
+- $k = 1$ *(opt-in only via explicit `VerificationPolicy::with_min_rounds(1)`)*: $\varepsilon_1 < p^{-1} \approx 4.3368 \times 10^{-19}$ (`61.00` soundness bits)
+- $k = 2$ *(default verifier minimum)*: $\varepsilon_2 < p^{-2} \approx 1.8808 \times 10^{-37} < 2^{-121}$ (`122.00` soundness bits)
 - $k = 4$: $\varepsilon_4 < p^{-4} \approx 3.5374 \times 10^{-74} < 2^{-243}$ (`244.00` soundness bits)
 
 ---
@@ -87,13 +88,13 @@ Across $k$ independent rounds:
 ### Crate Layout
 
 - `hanzo-poai/src/field.rs`: `Fp`, `MODULUS_P`, `MAX_SAFE_SIGNED`, exact 128-bit reduction, Fermat inverse, constant-time digest equality.
-- `hanzo-poai/src/profile.rs`: `VerificationProfile::v1()` (`poai.matmul.v1`), `OperatorKind` eligibility gate, `PROOF_SCOPE_DISCLAIMER`, soundness bound calculators.
-- `hanzo-poai/src/quant.rs`: `ActivationMatrix`, `PackedWeightMatrix` (`Int8Q8_0`, `PackedInt4Q4_0`, `PackedTernaryI2S`), `OutputMatrix`, `prover_matmul`, and streaming zero-decompression `B * r (mod p)` using split-`i64` accumulators and branchless ternary LUTs.
-- `hanzo-poai/src/transcript.rs`: Clean-room FIPS 180-4 `Sha256` (verified against official NIST vectors including the 1,000,000-byte `'a'` vector), domain-separated commitments, `ChallengeMode::{FiatShamir, InteractiveSeed}`, and unbiased challenge sampling.
-- `hanzo-poai/src/freivalds.rs`: `MatrixProofReceipt` canonical binary wire codec (`216 B` / `248 B` at `k = 2`), cold/cached/interactive proving and verification.
+- `hanzo-poai/src/profile.rs`: `VerificationProfile::v1()` (`poai.matmul.v1`), `OperatorKind` eligibility gate, `validate_rounds_at_least`, `PROOF_SCOPE_DISCLAIMER`, soundness bound calculators.
+- `hanzo-poai/src/quant.rs`: `ActivationMatrix`, `PackedWeightMatrix` (`Int8Q8_0`, `PackedInt4Q4_0`, custom `PackedTernaryI2S`), `OutputMatrix`, `prover_matmul`, and streaming zero-decompression `B * r (mod p)` using split-`i64` accumulators and branchless ternary LUTs.
+- `hanzo-poai/src/transcript.rs`: Clean-room FIPS 180-4 `Sha256` (verified against official NIST vectors including the 1,000,000-byte `'a'` vector), domain-separated commitments, `ChallengeMode::{FiatShamir, InteractiveSeed}`, round-bound transcript seed derivation, and unbiased challenge sampling.
+- `hanzo-poai/src/freivalds.rs`: `MatrixProofReceipt` canonical binary wire codec (`216 B` / `248 B` at `k = 2`), verifier-owned `VerificationPolicy`, cold/cached/interactive/policy-controlled proving and verification.
 - `hanzo-poai/src/error.rs`: Non-panicking typed `PoaiError`.
 - `hanzo-poai/src/bin/poai-bench.rs`: Deterministic acceptance & timing harness outputting `docs/research/hip-1350-poai-freivalds/results.json`.
-- `hanzo-poai/tests/acceptance_suite.rs`: Ineligible operator gate, 150+150 integration tests, modular wraparound rejection, and 16-thread concurrent verifier stress test.
+- `hanzo-poai/tests/acceptance_suite.rs`: Ineligible operator gate, 150+150 integration tests, modular wraparound rejection, round-downgrade rejection across all verifier entrypoints, `TQ2_0` vs `PackedTernaryI2S` layout separation test, and 16-thread concurrent verifier stress test.
 
 ### Reproducible Commands
 
@@ -121,10 +122,10 @@ All numbers below are transcribed directly from `docs/research/hip-1350-poai-fre
 
 | Acceptance Suite | Tested | Result | Rate / False Accepts | Wall Time |
 |---|---:|---:|---|---:|
-| Unit + integration + 16-thread concurrency (`cargo test --release`) | `16` tests | **`16 / 16` PASS** | `100.00%` | `0.06 s` |
+| Unit + integration + 16-thread concurrency (`cargo test --release`) | `19` tests | **`19 / 19` PASS** | `100.00%` | `0.04 s` |
 | Ineligible operator rejection (`Fp16/Bf16/Fp32/Fp8/Attn/Norm/Sample/State`) | `8` ops | **`8 / 8` REJECTED** | `100.00%` | `< 0.01 s` |
-| **Correct packed matrix products** (`Int8=334`, `Int4=333`, `Ternary=333`; `FS=500`, `Interactive=500`) | `1,000` | **`1,000 / 1,000` PASS** | `100.00%` (`0` false rejects) | `7.35 s` |
-| **Deliberately corrupted matrix products** (all 7 attack classes below) | `1,000` | **`1,000 / 1,000` DETECTED** | `100.00%` (`0` false accepts) | `5.16 s` |
+| **Correct packed matrix products** (`Int8=334`, `Int4=333`, `Ternary=333`; `FS=500`, `Interactive=500`) | `1,000` | **`1,000 / 1,000` PASS** | `100.00%` (`0` false rejects) | `7.09 s` |
+| **Deliberately corrupted matrix products** (all 7 attack classes below) | `1,000` | **`1,000 / 1,000` DETECTED** | `100.00%` (`0` false accepts) | `5.28 s` |
 
 Breakdown of the 1,000 adversarial corruptions (`0` false accepts across every attack class):
 
@@ -144,46 +145,46 @@ Times are median (`p50`) in microseconds (`us`). **Online verifier** caches stat
 
 | Format | Shape `M×K×N` | Prover `A·B` (`us`) | `commit(A,C)` (`us`) | `commit(B)` (`us`) | Challenge Gen (`us`) | Freivalds Alg (`us`) | Online Total (`us`) | Cold Total (`us`) | Speedup (Alg / Online / Cold) |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---|
-| `Int8Q8_0` | `1×64×64` *(neg)* | `3.3` | `4.0` | `23.7` | `24.0` | `8.4` | `36.9` | `60.3` | `0.40x / 0.09x / 0.05x` |
-| `Int8Q8_0` | `1×512×512` *(neg)* | `162.8` | `26.0` | `1,495.7` | `176.5` | `476.1` | `687.7` | `2,191.8` | `0.34x / 0.24x / 0.07x` |
-| `Int8Q8_0` | `4×1024×1024` *(neg)* | `1,310.2` | `200.0` | `5,970.0` | `371.3` | `2,029.3` | `2,719.5` | `8,772.8` | `0.65x / 0.48x / 0.15x` |
-| `Int8Q8_0` | `32×1024×1024` | `6,803.4` | `1,502.4` | `6,062.4` | `355.5` | `2,086.4` | `4,280.9` | `9,999.0` | **`3.26x / 1.59x`** `/ 0.68x` |
-| `Int8Q8_0` | `64×2048×2048` | `52,333.0` | `6,259.6` | `23,057.4` | `724.7` | `8,376.2` | `15,050.0` | `38,485.7` | **`6.25x / 3.48x / 1.36x`** |
-| `Int8Q8_0` | `128×2048×2048` | `104,338.8` | `13,699.6` | `24,249.0` | `755.4` | `9,683.0` | `22,067.3` | `45,268.9` | **`10.78x / 4.73x / 2.30x`** |
-| `PackedInt4Q4_0` | `1×64×64` *(neg)* | `3.6` | `3.7` | `11.8` | `22.2` | `8.1` | `34.6` | `46.6` | `0.44x / 0.10x / 0.08x` |
-| `PackedInt4Q4_0` | `1×512×512` *(neg)* | `218.2` | `25.9` | `844.8` | `182.6` | `503.5` | `739.2` | `1,576.6` | `0.43x / 0.30x / 0.14x` |
-| `PackedInt4Q4_0` | `4×1024×1024` *(neg)* | `1,454.4` | `195.7` | `3,100.8` | `353.3` | `1,965.7` | `2,530.1` | `5,727.1` | `0.74x / 0.57x / 0.25x` |
-| `PackedInt4Q4_0` | `32×1024×1024` | `6,845.2` | `1,494.2` | `3,103.1` | `360.4` | `2,220.9` | `4,205.9` | `7,155.3` | **`3.08x / 1.63x`** `/ 0.96x` |
-| `PackedInt4Q4_0` | `64×2048×2048` | `53,027.0` | `6,298.5` | `12,701.1` | `732.3` | `8,782.9` | `15,957.7` | `28,170.7` | **`6.04x / 3.32x / 1.88x`** |
-| `PackedInt4Q4_0` | `128×2048×2048` | `103,628.9` | `12,115.2` | `11,926.5` | `736.0` | `9,651.7` | `23,961.3` | `34,668.6` | **`10.74x / 4.32x / 2.99x`** |
-| `PackedTernaryI2S` | `1×64×64` *(neg)* | `4.7` | `3.9` | `7.0` | `23.1` | `12.9` | `41.2` | `48.4` | `0.36x / 0.11x / 0.10x` |
-| `PackedTernaryI2S` | `1×512×512` *(neg)* | `273.0` | `25.0` | `442.3` | `182.0` | `781.3` | `1,006.0` | `1,443.8` | `0.35x / 0.27x / 0.19x` |
-| `PackedTernaryI2S` | `4×1024×1024` *(neg)* | `1,707.7` | `199.2` | `1,711.5` | `350.3` | `2,924.9` | `3,645.3` | `5,274.5` | `0.58x / 0.47x / 0.32x` |
-| `PackedTernaryI2S` | `32×1024×1024` | `7,132.0` | `1,524.3` | `1,735.1` | `365.3` | `3,368.2` | `5,251.1` | `7,093.9` | **`2.12x / 1.36x / 1.01x`** |
-| `PackedTernaryI2S` | `64×2048×2048` | `54,765.4` | `6,354.2` | `7,104.5` | `733.6` | `12,717.2` | `20,049.5` | `26,672.5` | **`4.31x / 2.73x / 2.05x`** |
-| `PackedTernaryI2S` | `128×2048×2048` | `106,426.1` | `12,504.6` | `7,332.1` | `765.9` | `13,994.3` | `26,884.6` | `33,089.6` | **`7.61x / 3.96x / 3.22x`** |
+| `Int8Q8_0` | `1×64×64` *(neg)* | `3.0` | `4.0` | `24.0` | `24.1` | `8.1` | `37.0` | `61.1` | `0.37x / 0.08x / 0.05x` |
+| `Int8Q8_0` | `1×512×512` *(neg)* | `156.1` | `24.5` | `1,461.9` | `166.3` | `439.1` | `651.5` | `2,238.5` | `0.36x / 0.24x / 0.07x` |
+| `Int8Q8_0` | `4×1024×1024` *(neg)* | `1,242.3` | `182.6` | `5,929.4` | `336.7` | `1,868.6` | `2,444.2` | `8,518.5` | `0.66x / 0.51x / 0.15x` |
+| `Int8Q8_0` | `32×1024×1024` | `6,479.6` | `1,486.0` | `5,956.3` | `332.6` | `2,040.5` | `4,076.4` | `10,156.8` | **`3.18x / 1.59x`** `/ 0.64x` |
+| `Int8Q8_0` | `64×2048×2048` | `51,282.1` | `6,346.6` | `23,627.4` | `740.4` | `8,443.5` | `15,186.0` | `38,074.3` | **`6.07x / 3.38x / 1.35x`** |
+| `Int8Q8_0` | `128×2048×2048` | `101,164.6` | `12,465.0` | `23,213.6` | `703.1` | `8,803.2` | `21,889.9` | `44,518.5` | **`11.49x / 4.62x / 2.27x`** |
+| `PackedInt4Q4_0` | `1×64×64` *(neg)* | `3.5` | `3.9` | `12.4` | `23.2` | `8.4` | `36.3` | `50.2` | `0.42x / 0.10x / 0.07x` |
+| `PackedInt4Q4_0` | `1×512×512` *(neg)* | `184.3` | `24.4` | `790.1` | `159.7` | `453.8` | `672.5` | `1,491.2` | `0.41x / 0.27x / 0.12x` |
+| `PackedInt4Q4_0` | `4×1024×1024` *(neg)* | `1,387.7` | `194.8` | `3,163.0` | `336.5` | `1,960.4` | `2,604.8` | `5,901.9` | `0.71x / 0.53x / 0.24x` |
+| `PackedInt4Q4_0` | `32×1024×1024` | `6,472.6` | `1,586.0` | `3,070.6` | `339.0` | `2,175.5` | `4,282.2` | `7,399.2` | **`2.98x / 1.51x`** `/ 0.87x` |
+| `PackedInt4Q4_0` | `64×2048×2048` | `51,342.9` | `6,299.1` | `12,510.6` | `684.5` | `8,634.1` | `15,560.6` | `27,983.9` | **`5.95x / 3.30x / 1.83x`** |
+| `PackedInt4Q4_0` | `128×2048×2048` | `100,794.6` | `11,927.0` | `12,243.5` | `705.1` | `9,361.7` | `22,364.2` | `36,309.1` | **`10.77x / 4.51x / 2.78x`** |
+| `PackedTernaryI2S` | `1×64×64` *(neg)* | `4.2` | `3.6` | `6.6` | `21.6` | `11.8` | `37.9` | `44.4` | `0.36x / 0.11x / 0.10x` |
+| `PackedTernaryI2S` | `1×512×512` *(neg)* | `262.1` | `23.6` | `439.1` | `184.8` | `772.0` | `999.1` | `1,426.6` | `0.34x / 0.26x / 0.18x` |
+| `PackedTernaryI2S` | `4×1024×1024` *(neg)* | `1,640.9` | `190.0` | `1,712.1` | `389.8` | `2,968.8` | `3,533.6` | `5,342.0` | `0.55x / 0.46x / 0.31x` |
+| `PackedTernaryI2S` | `32×1024×1024` | `7,055.4` | `1,542.3` | `1,701.4` | `353.2` | `3,164.8` | `5,121.6` | `6,717.8` | **`2.23x / 1.38x / 1.05x`** |
+| `PackedTernaryI2S` | `64×2048×2048` | `54,847.6` | `6,271.2` | `6,893.6` | `709.7` | `12,258.1` | `19,207.3` | `26,667.0` | **`4.47x / 2.86x / 2.06x`** |
+| `PackedTernaryI2S` | `128×2048×2048` | `103,450.7` | `12,089.4` | `6,992.6` | `741.1` | `13,325.5` | `26,030.8` | `33,286.5` | **`7.76x / 3.97x / 3.11x`** |
 
 ### 5.3 Soundness vs Latency Trade-Off (`64×2048×2048`, `PackedInt4Q4_0`)
 
 | Rounds $k$ | Soundness Error Bound | Security Bits | Prover (`us`) | Challenge (`us`) | Freivalds Alg (`us`) | Online Total (`us`) | Speedup (Alg / Online) | Receipt Size |
 |---:|---|---:|---:|---:|---:|---:|---|---:|
-| `k = 1` | `< 4.34e-19` | `61.00` | `56,287.6` | `370.0` | `4,381.1` | `11,264.0` | `12.85x / 5.00x` | `184 B` |
-| **`k = 2` (default)** | **`< 1.88e-37`** | **`122.00`** | `55,092.5` | `692.7` | `8,724.4` | `15,944.2` | **`6.31x / 3.46x`** | **`216 B`** |
-| `k = 4` | `< 3.54e-74` | `244.00` | `52,137.0` | `1,483.8` | `17,674.0` | `25,033.2` | `2.95x / 2.08x` | `280 B` |
+| `k = 1` *(explicit opt-in)* | `< 4.34e-19` | `61.00` | `51,987.2` | `337.1` | `3,949.6` | `10,036.2` | `13.16x / 5.18x` | `184 B` |
+| **`k = 2` (default)** | **`< 1.88e-37`** | **`122.00`** | `53,400.7` | `761.2` | `8,456.5` | `15,474.3` | **`6.31x / 3.45x`** | **`216 B`** |
+| `k = 4` | `< 3.54e-74` | `244.00` | `51,608.5` | `1,407.4` | `16,877.9` | `24,760.0` | `3.06x / 2.08x` | `280 B` |
 
 ### 5.4 Honest Negative Regime Analysis
 
 As shown explicitly in Table 5.2, **Freivalds is strictly slower than naive recomputation for tiny and single-token decode GEMVs ($M \in \{1, 4\}$)**:
 
-- At `1×64×64`, algebraic Freivalds (`k = 2`) is `0.36x–0.44x` (2.3–2.8× slower than direct matmul) and online verification including SHA-256 commitments is `0.09x–0.11x` (~10× slower).
-- At `1×512×512`, algebraic Freivalds is `0.34x–0.43x` and online verification is `0.24x–0.30x`.
+- At `1×64×64`, algebraic Freivalds (`k = 2`) is `0.36x–0.42x` (2.4–2.8× slower than direct matmul) and online verification including SHA-256 commitments is `0.08x–0.11x` (~9–12× slower).
+- At `1×512×512`, algebraic Freivalds is `0.34x–0.41x` and online verification is `0.24x–0.27x`.
 - **Root cause**: When $M = 1$, exact matrix-vector multiplication $A \cdot B$ costs $O(KN)$ work, whereas $k = 2$ rounds of Freivalds execute $2 \times O(KN)$ sweeps over $B$ plus $O(MK + MN)$ SHA-256 hashing.
-- **Crossover & engineering takeaway**: Freivalds crosses `> 1.0x` online speedup between $M = 8$ and $M = 32$ (`1.36x–1.63x` online / `2.12x–3.26x` algebraic at `32×1024×1024`), reaching `3.96x–4.73x` online (`7.61x–10.78x` algebraic) at `128×2048×2048` and scaling linearly with $M$ (`O(M)` speedup). Therefore, **single-token decode steps MUST be stacked across $M \ge 32$ decode tokens (or batched requests sharing static weights $B$) into one `(M × K) · (K × N)` verification proof** rather than proving individual `M = 1` GEMVs.
+- **Crossover & engineering takeaway**: Freivalds crosses `> 1.0x` online speedup between $M = 8$ and $M = 32$ (`1.38x–1.59x` online / `2.23x–3.18x` algebraic at `32×1024×1024`), reaching `3.97x–4.62x` online (`7.76x–11.49x` algebraic) at `128×2048×2048` and scaling linearly with $M$ (`O(M)` speedup). Therefore, **single-token decode steps MUST be stacked across $M \ge 32$ decode tokens (or batched requests sharing static weights $B$) into one `(M × K) · (K × N)` verification proof** rather than proving individual `M = 1` GEMVs.
 
 ### 5.5 Decentralized Hanzo Bounty 5-Axis Scorecard
 
-- **Cost**: Constant `216 B` receipt overhead per verified matmul (`~0.17 bytes/token` amortized over a 128-token prefill batch); CPU verification cuts compute work by `3.96x–10.78x` at $M = 128$ (and `> 40x` at $M = 512$ prefill batches) with zero prover extra matmuls (prover overhead is only dynamic SHA-256 commitments + $k$ vector projections `C * r`).
-- **Performance**: `8.38–13.99 ms` algebraic / `15.05–26.88 ms` online CPU verification on a single 2.30 GHz Xeon core for `64–128 × 2048 × 2048` projections; zero GPU stalling when proofs are verified asynchronously off the critical decode path.
+- **Cost**: Constant `216 B` receipt overhead per verified matmul (`~0.17 bytes/token` amortized over a 128-token prefill batch); CPU verification cuts compute work by `3.97x–11.49x` at $M = 128$ (and `> 40x` at $M = 512$ prefill batches) with zero prover extra matmuls (prover overhead is only dynamic SHA-256 commitments + $k$ vector projections `C * r`).
+- **Performance**: `8.44–13.33 ms` algebraic / `15.19–26.03 ms` online CPU verification on a single 2.30 GHz Xeon core for `64–128 × 2048 × 2048` projections; zero GPU stalling when proofs are verified asynchronously off the critical decode path.
 - **Trust**: `1,000 / 1,000` (`100.00%`) corruption detection with `0` false accepts across all 7 attack classes and mathematically proven `< 1.88e-37` (`< 2^-121`) cheating acceptance probability under `poai.matmul.v1`.
 - **Decentralization**: `100%` independently verifiable on any commodity CPU with zero Hanzo-operated infrastructure, zero cloud KMS, and zero external crate dependencies.
 - **Sovereignty**: Pure Apache-2.0 Rust `std` crate with canonical little-endian wire receipts (`POAI` v1) that any external verifier, node operator, or fork can compile and run offline.
@@ -193,12 +194,12 @@ As shown explicitly in Table 5.2, **Freivalds is strictly slower than naive reco
 ## 6. Security Review, Rollout/Rollback, and Integration Roadmap
 
 - **Security review**:
-  - Strict input validation on all dimensions (`1..=2^30`, checked multiplications, `k % 32 == 0`), reserved 2-bit ternary code (`0b11`) rejection, strict signed output range guard (`|C[i,j]| <= 2^60 - 1` preventing wraparound forgery), constant-time digest comparison (`ct_eq_digest`), interactive seed anti-downgrade enforcement, and canonical wire parser rejecting trailing/truncated bytes.
+  - Strict input validation on all dimensions (`1..=2^30`, checked multiplications, `k % 32 == 0`), reserved 2-bit ternary code (`0b11`) rejection, strict signed output range guard (`|C[i,j]| <= 2^60 - 1` preventing wraparound forgery), constant-time digest comparison (`ct_eq_digest`), verifier-owned `VerificationPolicy` enforcing minimum round count (`default = 2`) and interactive seed anti-downgrade, round-bound transcript seeds preventing receipt truncation, and canonical wire parser rejecting trailing/truncated bytes.
   - Zero `unsafe` code anywhere in `hanzo-poai`.
 - **Disposition & Rollout / Rollback**:
   - **Execution-profile crate (`hanzo-poai`)**: Ready for `MERGE` as an opt-in workspace crate (touches only root `Cargo.toml` workspace membership, adds zero external dependencies to `Cargo.lock`, and leaves all existing `hanzo-quant` / `hanzo-engine` hot paths untouched). Revert is a single clean `git revert`.
   - **Economic / on-chain settlement**: Explicitly `GATED` on external cryptographic and smart-contract review before binding real funds or slashing stakes.
 - **Integration roadmap (`hanzo-quant`, `hanzo-engine`, `zoo-apps/papers#13`)**:
-  1. **Model-load weight commitment registry**: Compute `commit_weight_matrix` once per quantized projection (`IsqType::{Q8_0, Q4_0, TQ2_0}`) during `hanzo-quant` GGUF / ISQ model load and cache alongside `GgufMatMul` metadata.
+  1. **Model-load adapter & weight commitment registry**: At `hanzo-quant` GGUF / ISQ model load, convert loaded weights into canonical `poai.matmul.v1` buffers via explicit adapters—converting `Q8_0`/`Q4_0` `f16` block scales to exact `i16` fixed-point scales, and repacking GGUF `TQ2_0` (`256`-weight, `66 B` blocks with trailing `f16` scales) into `PackedTernaryI2S` (`32`-weight, `10 B` blocks with leading `i16` scales)—then compute and cache `commit_weight_matrix` once per converted projection alongside `GgufMatMul` metadata.
   2. **Deterministic integer epilogue hook**: Add an opt-in `--poai-profile poai.matmul.v1` execution mode in `hanzo-quant` / `hanzo-engine` exposing the pre-dequantization `i64` integer accumulator buffer `C` for sampled prefill layers (`M >= 32`) or stacked decode windows (`32–128` steps).
   3. **Cross-repo protocol alignment (`zoo-apps/papers#13`)**: Map `MatrixProofReceipt::to_bytes()` directly into the Zoo Gym / Enso challenge-response envelope alongside interactive randomness beacons (`ChallengeMode::InteractiveSeed`).
