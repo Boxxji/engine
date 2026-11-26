@@ -624,3 +624,158 @@ fn wire_security_profile_version_and_commitment_binding() {
         })
     ));
 }
+
+#[test]
+fn receipts_distinguish_non_default_rmsnorm_epsilon_and_enable_replay() {
+    let mut profile_eps_1 = ExecutionProfile::v1_default();
+    profile_eps_1.rmsnorm_eps_q24 = 1;
+    let mut profile_eps_large = ExecutionProfile::v1_default();
+    profile_eps_large.rmsnorm_eps_q24 = 1 << 24;
+
+    let graph = OpGraph::new(
+        "rmsnorm_eps_binding",
+        vec![OpNode::FixedPointRmsNormInt64 { gamma: vec![4096] }],
+    );
+
+    // On [4096] with gamma [4096], both epsilons produce identical output bytes,
+    // yet their receipts MUST differ so verifiers know the exact numerical profile.
+    let input_4096 = GraphInput::Int32(Int32Tensor::new(1, 1, vec![4096]).unwrap());
+    let r1 = assert_all_three_backends_bit_identical(&profile_eps_1, &graph, &input_4096);
+    let r2 = assert_all_three_backends_bit_identical(&profile_eps_large, &graph, &input_4096);
+    assert_eq!(r1.output_digest, r2.output_digest);
+    assert_ne!(r1.commitment, r2.commitment);
+    assert_ne!(r1.to_bytes(), r2.to_bytes());
+    assert_eq!(r1.rmsnorm_eps_q24, 1);
+    assert_eq!(r2.rmsnorm_eps_q24, 1 << 24);
+    assert_eq!(r1.profile(), profile_eps_1);
+    assert_eq!(r2.profile(), profile_eps_large);
+
+    // Replaying with the decoded receipt profiles on input [1] reproduces distinct outputs
+    // deterministically across all three backends.
+    let decoded_1 = ExecutionReceipt::from_bytes(&r1.to_bytes()).unwrap();
+    let decoded_2 = ExecutionReceipt::from_bytes(&r2.to_bytes()).unwrap();
+    let input_1 = GraphInput::Int32(Int32Tensor::new(1, 1, vec![1]).unwrap());
+    let out_1 = ScalarCpuReference
+        .execute(&decoded_1.profile(), &graph, &input_1)
+        .unwrap();
+    let out_2 = ScalarCpuReference
+        .execute(&decoded_2.profile(), &graph, &input_1)
+        .unwrap();
+    assert_ne!(out_1.output_bytes, out_2.output_bytes);
+    let _ = assert_all_three_backends_bit_identical(&decoded_1.profile(), &graph, &input_1);
+    let _ = assert_all_three_backends_bit_identical(&decoded_2.profile(), &graph, &input_1);
+}
+
+#[test]
+fn backends_validate_directly_constructed_malformed_tensors_without_panicking() {
+    let profile = ExecutionProfile::v1_default();
+    let backends: [&dyn DeterministicBackend; 3] = [
+        &ScalarCpuReference,
+        &TiledSimdLikeCpuBackend,
+        &SimGpuWarpBackend,
+    ];
+
+    // 1. Exact reproducer: empty data with non-zero Int32Tensor dims on ArgMax.
+    let argmax_graph = OpGraph::new("argmax", vec![OpNode::ArgMaxDeterministicTieBreak]);
+    let bad_i32_input = GraphInput::Int32(Int32Tensor {
+        rows: 1,
+        cols: 1,
+        data: vec![],
+    });
+    for backend in backends {
+        assert!(
+            matches!(
+                backend.execute(&profile, &argmax_graph, &bad_i32_input),
+                Err(DetError::InvalidDimensions { .. })
+            ),
+            "{} failed to reject malformed Int32Tensor",
+            backend.name()
+        );
+    }
+
+    // 2. Zero-dimension and overflowing Int32Tensor inputs.
+    let zero_i32_input = GraphInput::Int32(Int32Tensor {
+        rows: 0,
+        cols: 1,
+        data: vec![],
+    });
+    let overflow_i32_input = GraphInput::Int32(Int32Tensor {
+        rows: usize::MAX,
+        cols: 2,
+        data: vec![],
+    });
+    for backend in backends {
+        assert!(matches!(
+            backend.execute(&profile, &argmax_graph, &zero_i32_input),
+            Err(DetError::InvalidDimensions { .. })
+        ));
+        assert!(matches!(
+            backend.execute(&profile, &argmax_graph, &overflow_i32_input),
+            Err(DetError::InvalidDimensions { .. })
+        ));
+    }
+
+    // 3. Malformed Int8Tensor input on Int8Gemm.
+    let valid_w = Int8Tensor::new(2, 2, vec![1, 2, 3, 4]).unwrap();
+    let gemm_graph = OpGraph::new(
+        "int8_gemm",
+        vec![OpNode::Int8Gemm {
+            weights: valid_w,
+            output_scale: DyadicScale::identity(),
+            input_requant: None,
+        }],
+    );
+    let bad_i8_input = GraphInput::Int8(Int8Tensor {
+        rows: 1,
+        cols: 2,
+        data: vec![1],
+    });
+    for backend in backends {
+        assert!(matches!(
+            backend.execute(&profile, &gemm_graph, &bad_i8_input),
+            Err(DetError::InvalidDimensions { .. })
+        ));
+    }
+
+    // 4. Malformed Int8Gemm weight tensor constructed with public fields.
+    let bad_weight_graph = OpGraph::new(
+        "bad_int8_weight",
+        vec![OpNode::Int8Gemm {
+            weights: Int8Tensor {
+                rows: 2,
+                cols: 2,
+                data: vec![],
+            },
+            output_scale: DyadicScale::identity(),
+            input_requant: None,
+        }],
+    );
+    let good_i8_input = GraphInput::Int8(Int8Tensor::new(1, 2, vec![1, 2]).unwrap());
+    for backend in backends {
+        assert!(matches!(
+            backend.execute(&profile, &bad_weight_graph, &good_i8_input),
+            Err(DetError::InvalidDimensions { .. })
+        ));
+    }
+
+    // 5. Malformed PackedInt4Weight constructed with public fields.
+    let bad_int4_graph = OpGraph::new(
+        "bad_int4_weight",
+        vec![OpNode::PackedInt4Gemm {
+            weights: PackedInt4Weight {
+                k: 32,
+                n: 1,
+                blocks: vec![],
+            },
+            output_scale: DyadicScale::identity(),
+            input_requant: None,
+        }],
+    );
+    let good_i8_32 = GraphInput::Int8(Int8Tensor::new(1, 32, vec![1; 32]).unwrap());
+    for backend in backends {
+        assert!(matches!(
+            backend.execute(&profile, &bad_int4_graph, &good_i8_32),
+            Err(DetError::InvalidPackedWeight { .. })
+        ));
+    }
+}

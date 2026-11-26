@@ -87,6 +87,7 @@ pub fn requantize_i32_to_i8(
     rounding: RoundingMode,
     overflow: OverflowMode,
 ) -> DetResult<Int8Tensor> {
+    src.validate()?;
     scale.validate()?;
     let mut data = Vec::with_capacity(src.data.len());
     for &v in &src.data {
@@ -110,15 +111,22 @@ pub struct Int8Tensor {
 impl Int8Tensor {
     /// Construct and validate a row-major `Int8Tensor`.
     pub fn new(rows: usize, cols: usize, data: Vec<i8>) -> DetResult<Self> {
-        let expected = checked_elem_count(rows, cols, "Int8Tensor::new")?;
-        if data.len() != expected {
+        let tensor = Self { rows, cols, data };
+        tensor.validate()?;
+        Ok(tensor)
+    }
+
+    /// Validate that shape dimensions are non-zero, do not overflow, and match `data.len()`.
+    pub fn validate(&self) -> DetResult<()> {
+        let expected = checked_elem_count(self.rows, self.cols, "Int8Tensor::validate")?;
+        if self.data.len() != expected {
             return Err(DetError::InvalidDimensions {
-                context: "Int8Tensor::new",
-                expected: format!("{rows}x{cols} = {expected} elements"),
-                actual: format!("{} elements", data.len()),
+                context: "Int8Tensor::validate",
+                expected: format!("{}x{} = {expected} elements", self.rows, self.cols),
+                actual: format!("{} elements", self.data.len()),
             });
         }
-        Ok(Self { rows, cols, data })
+        Ok(())
     }
 
     /// Encode into canonical little-endian wire bytes.
@@ -144,15 +152,22 @@ pub struct Int32Tensor {
 impl Int32Tensor {
     /// Construct and validate a row-major `Int32Tensor`.
     pub fn new(rows: usize, cols: usize, data: Vec<i32>) -> DetResult<Self> {
-        let expected = checked_elem_count(rows, cols, "Int32Tensor::new")?;
-        if data.len() != expected {
+        let tensor = Self { rows, cols, data };
+        tensor.validate()?;
+        Ok(tensor)
+    }
+
+    /// Validate that shape dimensions are non-zero, do not overflow, and match `data.len()`.
+    pub fn validate(&self) -> DetResult<()> {
+        let expected = checked_elem_count(self.rows, self.cols, "Int32Tensor::validate")?;
+        if self.data.len() != expected {
             return Err(DetError::InvalidDimensions {
-                context: "Int32Tensor::new",
-                expected: format!("{rows}x{cols} = {expected} elements"),
-                actual: format!("{} elements", data.len()),
+                context: "Int32Tensor::validate",
+                expected: format!("{}x{} = {expected} elements", self.rows, self.cols),
+                actual: format!("{} elements", self.data.len()),
             });
         }
-        Ok(Self { rows, cols, data })
+        Ok(())
     }
 
     /// Encode into canonical little-endian wire bytes.
@@ -222,22 +237,30 @@ pub struct PackedInt4Weight {
 impl PackedInt4Weight {
     /// Construct and validate a column-blocked `PackedInt4Weight`.
     pub fn new(k: usize, n: usize, blocks: Vec<PackedInt4Block>) -> DetResult<Self> {
-        if k == 0 || n == 0 || !k.is_multiple_of(QUANT_BLOCK_SIZE) {
+        let weight = Self { k, n, blocks };
+        weight.validate()?;
+        Ok(weight)
+    }
+
+    /// Validate that `k` is a positive multiple of `QUANT_BLOCK_SIZE`, `n > 0`,
+    /// and `blocks.len() == n * (k / QUANT_BLOCK_SIZE)`.
+    pub fn validate(&self) -> DetResult<()> {
+        if self.k == 0 || self.n == 0 || !self.k.is_multiple_of(QUANT_BLOCK_SIZE) {
             return Err(DetError::InvalidDimensions {
-                context: "PackedInt4Weight::new",
+                context: "PackedInt4Weight::validate",
                 expected: format!("k > 0, k % {QUANT_BLOCK_SIZE} == 0, n > 0"),
-                actual: format!("k={k}, n={n}"),
+                actual: format!("k={}, n={}", self.k, self.n),
             });
         }
-        let blocks_per_col = k / QUANT_BLOCK_SIZE;
-        let expected = checked_elem_count(n, blocks_per_col, "PackedInt4Weight::new")?;
-        if blocks.len() != expected {
+        let blocks_per_col = self.k / QUANT_BLOCK_SIZE;
+        let expected = checked_elem_count(self.n, blocks_per_col, "PackedInt4Weight::validate")?;
+        if self.blocks.len() != expected {
             return Err(DetError::InvalidPackedWeight {
-                context: "PackedInt4Weight::new",
-                detail: format!("expected {expected} blocks, got {}", blocks.len()),
+                context: "PackedInt4Weight::validate",
+                detail: format!("expected {expected} blocks, got {}", self.blocks.len()),
             });
         }
-        Ok(Self { k, n, blocks })
+        Ok(())
     }
 
     /// Number of 32-element blocks along `K`.
@@ -319,6 +342,14 @@ pub enum GraphInput {
 }
 
 impl GraphInput {
+    /// Validate that the underlying tensor satisfies shape and storage invariants.
+    pub fn validate(&self) -> DetResult<()> {
+        match self {
+            Self::Int8(t) => t.validate(),
+            Self::Int32(t) => t.validate(),
+        }
+    }
+
     /// Canonical little-endian byte representation for input commitments.
     pub fn to_canonical_bytes(&self) -> Vec<u8> {
         let mut w = WireWriter::new();
@@ -553,15 +584,22 @@ impl OpGraph {
             let is_last = idx + 1 == self.nodes.len();
             match node {
                 OpNode::Int8Gemm {
+                    weights,
                     output_scale,
                     input_requant,
-                    ..
-                }
-                | OpNode::PackedInt4Gemm {
-                    output_scale,
-                    input_requant,
-                    ..
                 } => {
+                    weights.validate()?;
+                    output_scale.validate()?;
+                    if let Some(req) = input_requant {
+                        req.validate()?;
+                    }
+                }
+                OpNode::PackedInt4Gemm {
+                    weights,
+                    output_scale,
+                    input_requant,
+                } => {
+                    weights.validate()?;
                     output_scale.validate()?;
                     if let Some(req) = input_requant {
                         req.validate()?;

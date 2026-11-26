@@ -69,11 +69,12 @@ enum StageTensor {
 }
 
 impl StageTensor {
-    fn from_input(input: &GraphInput) -> Self {
-        match input {
+    fn from_input(input: &GraphInput) -> DetResult<Self> {
+        input.validate()?;
+        Ok(match input {
             GraphInput::Int8(t) => Self::Int8(t.clone()),
             GraphInput::Int32(t) => Self::Int32(t.clone()),
-        }
+        })
     }
 
     fn as_int32(&self, op: &'static str) -> DetResult<&Int32Tensor> {
@@ -407,7 +408,7 @@ impl DeterministicBackend for ScalarCpuReference {
         input: &GraphInput,
     ) -> DetResult<ExecutionResult> {
         graph.validate(profile)?;
-        let mut state = StageTensor::from_input(input);
+        let mut state = StageTensor::from_input(input)?;
         let mut terminal: Option<ExecutionOutput> = None;
 
         for node in &graph.nodes {
@@ -836,7 +837,7 @@ impl DeterministicBackend for TiledSimdLikeCpuBackend {
         input: &GraphInput,
     ) -> DetResult<ExecutionResult> {
         graph.validate(profile)?;
-        let mut state = StageTensor::from_input(input);
+        let mut state = StageTensor::from_input(input)?;
         let mut terminal: Option<ExecutionOutput> = None;
 
         for node in &graph.nodes {
@@ -1276,7 +1277,7 @@ impl DeterministicBackend for SimGpuWarpBackend {
         input: &GraphInput,
     ) -> DetResult<ExecutionResult> {
         graph.validate(profile)?;
-        let mut state = StageTensor::from_input(input);
+        let mut state = StageTensor::from_input(input)?;
         let mut terminal: Option<ExecutionOutput> = None;
 
         for node in &graph.nodes {

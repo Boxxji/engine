@@ -300,8 +300,8 @@ pub fn commit_output(output_tensor_bytes: &[u8]) -> Digest {
     h.finalize()
 }
 
-/// Canonical bit-identical execution receipt binding profile metadata, graph,
-/// inputs, weights, numerical policies, and output tensor bytes via SHA-256.
+/// Canonical bit-identical execution receipt binding complete profile metadata,
+/// graph, inputs, weights, numerical policies, and output tensor bytes via SHA-256.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionReceipt {
     /// Profile identifier (`det.zen-kai.v1`).
@@ -320,6 +320,10 @@ pub struct ExecutionReceipt {
     pub overflow_mode: OverflowMode,
     /// Explicit reduction order bound into this execution.
     pub reduction_order: ReductionOrder,
+    /// Fixed-point SiLU LUT revision bound into this execution.
+    pub silu_lut_version: u32,
+    /// Integer RMSNorm epsilon in Q24 fixed-point units bound into this execution.
+    pub rmsnorm_eps_q24: u64,
     /// Byte length of canonical `output_tensor_bytes`.
     pub output_byte_len: u64,
     /// Domain-separated SHA-256 digest of `output_tensor_bytes`.
@@ -328,11 +332,21 @@ pub struct ExecutionReceipt {
     pub commitment: Digest,
 }
 
+/// Complete context passed to `compute_receipt_commitment` so no profile field
+/// can be omitted from the master SHA-256 receipt digest.
+struct ReceiptCommitCtx<'a> {
+    profile: &'a ExecutionProfile,
+    op_graph_digest: &'a Digest,
+    input_digest: &'a Digest,
+    weights_digest: &'a Digest,
+    output_tensor_bytes: &'a [u8],
+}
+
 impl ExecutionReceipt {
     /// Construct an `ExecutionReceipt` and compute its canonical SHA-256
-    /// commitment over `(profile_id, profile_version, op_graph_digest,
-    /// input_digest, weights_digest, rounding_mode, overflow_mode,
-    /// reduction_order, output_tensor_bytes)`.
+    /// commitment over the complete `ExecutionProfile` (including
+    /// `silu_lut_version` and `rmsnorm_eps_q24`), graph/input/weights digests,
+    /// and raw `output_tensor_bytes`.
     pub fn build(
         profile: &ExecutionProfile,
         op_graph_digest: Digest,
@@ -342,17 +356,14 @@ impl ExecutionReceipt {
     ) -> DetResult<Self> {
         profile.validate()?;
         let output_digest = commit_output(output_tensor_bytes);
-        let commitment = compute_receipt_commitment(
-            &profile.profile_id,
-            profile.profile_version,
-            &op_graph_digest,
-            &input_digest,
-            &weights_digest,
-            profile.rounding_mode,
-            profile.overflow_mode,
-            profile.reduction_order,
+        let ctx = ReceiptCommitCtx {
+            profile,
+            op_graph_digest: &op_graph_digest,
+            input_digest: &input_digest,
+            weights_digest: &weights_digest,
             output_tensor_bytes,
-        );
+        };
+        let commitment = compute_receipt_commitment(&ctx);
         Ok(Self {
             profile_id: profile.profile_id.clone(),
             profile_version: profile.profile_version,
@@ -362,10 +373,26 @@ impl ExecutionReceipt {
             rounding_mode: profile.rounding_mode,
             overflow_mode: profile.overflow_mode,
             reduction_order: profile.reduction_order,
+            silu_lut_version: profile.silu_lut_version,
+            rmsnorm_eps_q24: profile.rmsnorm_eps_q24,
             output_byte_len: output_tensor_bytes.len() as u64,
             output_digest,
             commitment,
         })
+    }
+
+    /// Reconstruct the complete [`ExecutionProfile`] bound into this receipt so
+    /// an independent verifier can replay the exact numerical semantics.
+    pub fn profile(&self) -> ExecutionProfile {
+        ExecutionProfile {
+            profile_id: self.profile_id.clone(),
+            profile_version: self.profile_version,
+            rounding_mode: self.rounding_mode,
+            overflow_mode: self.overflow_mode,
+            reduction_order: self.reduction_order,
+            silu_lut_version: self.silu_lut_version,
+            rmsnorm_eps_q24: self.rmsnorm_eps_q24,
+        }
     }
 
     /// Verify this receipt against a candidate `output_tensor_bytes` payload
@@ -382,17 +409,15 @@ impl ExecutionReceipt {
                 field: "output_digest",
             });
         }
-        let expected_commit = compute_receipt_commitment(
-            &self.profile_id,
-            self.profile_version,
-            &self.op_graph_digest,
-            &self.input_digest,
-            &self.weights_digest,
-            self.rounding_mode,
-            self.overflow_mode,
-            self.reduction_order,
+        let profile = self.profile();
+        let ctx = ReceiptCommitCtx {
+            profile: &profile,
+            op_graph_digest: &self.op_graph_digest,
+            input_digest: &self.input_digest,
+            weights_digest: &self.weights_digest,
             output_tensor_bytes,
-        );
+        };
+        let expected_commit = compute_receipt_commitment(&ctx);
         if !ct_eq_digest(&self.commitment, &expected_commit) {
             return Err(DetError::CommitmentMismatch {
                 field: "commitment",
@@ -403,7 +428,7 @@ impl ExecutionReceipt {
 
     /// Encode this receipt into canonical little-endian binary wire format.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut w = WireWriter::with_capacity(200);
+        let mut w = WireWriter::with_capacity(212);
         w.write_raw(&WIRE_MAGIC);
         w.write_u8(RECEIPT_WIRE_TAG);
         w.write_str(&self.profile_id);
@@ -414,6 +439,8 @@ impl ExecutionReceipt {
         w.write_u8(self.rounding_mode.to_u8());
         w.write_u8(self.overflow_mode.to_u8());
         w.write_u8(self.reduction_order.to_u8());
+        w.write_u32(self.silu_lut_version);
+        w.write_u64(self.rmsnorm_eps_q24);
         w.write_u64(self.output_byte_len);
         w.write_raw(&self.output_digest);
         w.write_raw(&self.commitment);
@@ -449,6 +476,8 @@ impl ExecutionReceipt {
         let overflow_mode = OverflowMode::from_u8(r.read_u8()?, overflow_off)?;
         let reduction_off = r.offset();
         let reduction_order = ReductionOrder::from_u8(r.read_u8()?, reduction_off)?;
+        let silu_lut_version = r.read_u32()?;
+        let rmsnorm_eps_q24 = r.read_u64()?;
         let output_byte_len = r.read_u64()?;
         let output_digest = r.read_array::<32>()?;
         let commitment = r.read_array::<32>()?;
@@ -463,6 +492,8 @@ impl ExecutionReceipt {
             rounding_mode,
             overflow_mode,
             reduction_order,
+            silu_lut_version,
+            rmsnorm_eps_q24,
             output_byte_len,
             output_digest,
             commitment,
@@ -470,33 +501,35 @@ impl ExecutionReceipt {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn compute_receipt_commitment(
-    profile_id: &str,
-    profile_version: u32,
-    op_graph_digest: &Digest,
-    input_digest: &Digest,
-    weights_digest: &Digest,
-    rounding_mode: RoundingMode,
-    overflow_mode: OverflowMode,
-    reduction_order: ReductionOrder,
-    output_tensor_bytes: &[u8],
-) -> Digest {
+fn compute_receipt_commitment(ctx: &ReceiptCommitCtx<'_>) -> Digest {
+    // Exhaustive destructure guarantees any new ExecutionProfile field is bound here.
+    let ExecutionProfile {
+        profile_id,
+        profile_version,
+        rounding_mode,
+        overflow_mode,
+        reduction_order,
+        silu_lut_version,
+        rmsnorm_eps_q24,
+    } = ctx.profile;
+
     let mut h = Sha256::new();
     h.update(DOMAIN_RECEIPT);
     h.update(&(profile_id.len() as u32).to_le_bytes());
     h.update(profile_id.as_bytes());
     h.update(&profile_version.to_le_bytes());
-    h.update(op_graph_digest);
-    h.update(input_digest);
-    h.update(weights_digest);
+    h.update(ctx.op_graph_digest);
+    h.update(ctx.input_digest);
+    h.update(ctx.weights_digest);
     h.update(&[
         rounding_mode.to_u8(),
         overflow_mode.to_u8(),
         reduction_order.to_u8(),
     ]);
-    h.update(&(output_tensor_bytes.len() as u64).to_le_bytes());
-    h.update(output_tensor_bytes);
+    h.update(&silu_lut_version.to_le_bytes());
+    h.update(&rmsnorm_eps_q24.to_le_bytes());
+    h.update(&(ctx.output_tensor_bytes.len() as u64).to_le_bytes());
+    h.update(ctx.output_tensor_bytes);
     h.finalize()
 }
 
@@ -554,6 +587,51 @@ mod tests {
         assert!(matches!(
             decoded.verify_output(&tampered_out),
             Err(DetError::CommitmentMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn receipt_binds_rmsnorm_eps_and_silu_lut_version() {
+        let mut p1 = ExecutionProfile::v1_default();
+        p1.rmsnorm_eps_q24 = 1;
+        let mut p2 = ExecutionProfile::v1_default();
+        p2.rmsnorm_eps_q24 = 1 << 24;
+
+        let g = commit_op_graph(b"rmsnorm_graph");
+        let i = commit_inputs(b"input_4096");
+        let w = commit_weights(b"gamma_4096");
+        let out = b"identical_output_on_4096";
+
+        let r1 = ExecutionReceipt::build(&p1, g, i, w, out).unwrap();
+        let r2 = ExecutionReceipt::build(&p2, g, i, w, out).unwrap();
+        assert_ne!(r1.commitment, r2.commitment);
+        assert_ne!(r1.to_bytes(), r2.to_bytes());
+        assert_eq!(r1.profile(), p1);
+        assert_eq!(r2.profile(), p2);
+        assert_eq!(r1.to_bytes().len(), 210);
+
+        let decoded = ExecutionReceipt::from_bytes(&r2.to_bytes()).unwrap();
+        assert_eq!(decoded, r2);
+        assert_eq!(decoded.profile(), p2);
+        decoded.verify_output(out).unwrap();
+
+        // Tampering with rmsnorm_eps_q24 or silu_lut_version must fail commitment verification.
+        let mut eps_tampered = decoded.clone();
+        eps_tampered.rmsnorm_eps_q24 = 1;
+        assert!(matches!(
+            eps_tampered.verify_output(out),
+            Err(DetError::CommitmentMismatch {
+                field: "commitment"
+            })
+        ));
+
+        let mut lut_tampered = decoded;
+        lut_tampered.silu_lut_version = 2;
+        assert!(matches!(
+            lut_tampered.verify_output(out),
+            Err(DetError::CommitmentMismatch {
+                field: "commitment"
+            })
         ));
     }
 }
