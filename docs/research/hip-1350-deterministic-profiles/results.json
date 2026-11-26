@@ -1,0 +1,189 @@
+{
+  "profile_id": "det.zen-kai.v1",
+  "profile_version": 1,
+  "eligible_operator_count": 8,
+  "excluded_fp_operator_count": 8,
+  "environment": {
+    "cpu": "Intel(R) Xeon(R) CPU @ 2.30GHz",
+    "os": "linux",
+    "arch": "x86_64"
+  },
+  "corpus_anchor": {
+    "path": "calibration_data/calibration_datav3.txt",
+    "bytes": 279515,
+    "sha256": "200e109bcd2b599fabcceaada7f52bbd1e7c8f9ae030b8dc59c011de039a8026"
+  },
+  "acceptance_corpus": {
+    "total_workloads": 512,
+    "backends": ["ScalarCpuReference", "TiledSimdLikeCpuBackend", "SimGpuWarpBackend"],
+    "bit_identical_outputs": 512,
+    "bit_identical_commitments": 512,
+    "agreement_rate_pct": 100.0000,
+    "canonical_receipt_wire_bytes": 198,
+    "wall_time_sec": 0.1366,
+    "categories": [
+      {"category": "Int8Gemm", "tested": 52, "bit_identical": 52},
+      {"category": "PackedInt4Gemm", "tested": 52, "bit_identical": 52},
+      {"category": "Int32BiasAdd", "tested": 51, "bit_identical": 51},
+      {"category": "FixedPointReLU", "tested": 51, "bit_identical": 51},
+      {"category": "FixedPointSiLU_LUT", "tested": 51, "bit_identical": 51},
+      {"category": "FixedPointRMSNorm_Int64", "tested": 51, "bit_identical": 51},
+      {"category": "ArgMax_DeterministicTieBreak", "tested": 51, "bit_identical": 51},
+      {"category": "TopK_DeterministicOrder", "tested": 51, "bit_identical": 51},
+      {"category": "ZenKaiMicroTransformer_ArgMax", "tested": 51, "bit_identical": 51},
+      {"category": "ZenKaiMicroTransformer_TopK", "tested": 51, "bit_identical": 51}
+    ],
+    "sample_commitments": [
+      {"workload_idx": 0, "category": "Int8Gemm", "sha256_commitment": "c07a17e62e67d924c03231209136f7b37b0db73958e4519e51798f7a32c42d4f"},
+      {"workload_idx": 1, "category": "PackedInt4Gemm", "sha256_commitment": "903b7b59953909a432f98059dbae284de4cdd72b70060ca836334a59c2cf9cd3"},
+      {"workload_idx": 2, "category": "Int32BiasAdd", "sha256_commitment": "e6269af8422be47ee7c724b9e43d947d4851eb07aaf6fda4214006052dcbdcba"},
+      {"workload_idx": 3, "category": "FixedPointReLU", "sha256_commitment": "72be227579604eb3366092c9fb19b00b90db7a849ccbe9a58ddbbcaaa1cdbaf4"},
+      {"workload_idx": 4, "category": "FixedPointSiLU_LUT", "sha256_commitment": "073ee79f6321318c96d04d3022ad2b7e390d41720d3631c90bd8fa03c6e213a4"},
+      {"workload_idx": 5, "category": "FixedPointRMSNorm_Int64", "sha256_commitment": "79aaaf928a42ff64e78b8617c5ed437d0514604ddb046410578d1ce8a9e95ea0"},
+      {"workload_idx": 6, "category": "ArgMax_DeterministicTieBreak", "sha256_commitment": "b84f75f082c815ee3b99bf03db533e32c0888413ea642c318c9929b03550fe3b"},
+      {"workload_idx": 7, "category": "TopK_DeterministicOrder", "sha256_commitment": "a2fcab538858d6bc0560bd9256e568244f07ff2f0e349355069b75a7a62fbbf7"},
+      {"workload_idx": 8, "category": "ZenKaiMicroTransformer_ArgMax", "sha256_commitment": "0bcfda0456de6bd6c3ab4b86483a33f4f83be0efdba52e9e456213501c1997f8"},
+      {"workload_idx": 9, "category": "ZenKaiMicroTransformer_TopK", "sha256_commitment": "261eaff691a0cc5f301f23eea902aee4df6970f2c33081b3c16c8d9e05563fce"}
+    ]
+  },
+  "floating_point_exclusion_gate": {
+    "ops_tested": 8,
+    "ops_rejected": 8,
+    "backend_invocations_tested": 24,
+    "backend_invocations_rejected": 24,
+    "rejection_rate_pct": 100.0,
+    "operators": [
+      {"operator": "Fp16MatMul", "rejected": true, "reason": "FP16 accumulation is non-associative and varies across tensor-core/CPU rounding paths"},
+      {"operator": "Bf16MatMul", "rejected": true, "reason": "BF16 accumulation exhibits split-K / warp-order rounding divergence across architectures"},
+      {"operator": "Fp32ParallelReduce", "rejected": true, "reason": "IEEE-754 FP32 addition is non-associative; parallel reduction trees diverge bit-for-bit"},
+      {"operator": "AtomicFloatAdd", "rejected": true, "reason": "GPU atomic float accumulation order depends on non-deterministic hardware thread scheduling"},
+      {"operator": "NonDeterministicSoftmax", "rejected": true, "reason": "Floating-point expf and parallel normalization vary in ULP across libm/GPU implementations"},
+      {"operator": "UncappedTopPSampling", "rejected": true, "reason": "Floating-point cumulative sum thresholding flips token boundaries under 1-ULP drift"},
+      {"operator": "HardwareFmaDependentOp", "rejected": true, "reason": "Fused vs unfused multiply-add contraction differs across x86 AVX2, ARM NEON, CUDA, and Metal"},
+      {"operator": "Fp8DynamicScaleGemm", "rejected": true, "reason": "FP8 E4M3/E5M2 dynamic float scaling introduces vendor-specific saturation and rounding drift"}
+    ]
+  },
+  "negative_control_unordered_fp32": [
+    {
+      "comparison": "ScalarFloatRef vs UnorderedFloatGpuSim(warp_strided_tree_32)",
+      "workloads": 128,
+      "diverged_digests": 128,
+      "digest_divergence_rate_pct": 100.0000,
+      "total_elements": 32768,
+      "mismatched_elements": 25125,
+      "element_mismatch_rate_pct": 76.6754,
+      "max_ulp": 25231,
+      "mean_ulp": 10.3832
+    },
+    {
+      "comparison": "ScalarFloatRef vs UnorderedFloatGpuSim(split_k_atomic_reverse)",
+      "workloads": 128,
+      "diverged_digests": 128,
+      "digest_divergence_rate_pct": 100.0000,
+      "total_elements": 32768,
+      "mismatched_elements": 25642,
+      "element_mismatch_rate_pct": 78.2532,
+      "max_ulp": 24857,
+      "mean_ulp": 10.3456
+    },
+    {
+      "comparison": "ScalarFloatRef vs UnorderedFloatGpuSim(fma_warp_tree_32)",
+      "workloads": 128,
+      "diverged_digests": 128,
+      "digest_divergence_rate_pct": 100.0000,
+      "total_elements": 32768,
+      "mismatched_elements": 25156,
+      "element_mismatch_rate_pct": 76.7700,
+      "max_ulp": 20123,
+      "mean_ulp": 9.7140
+    },
+    {
+      "comparison": "UnorderedFloatGpuSim(warp_strided_tree_32) vs UnorderedFloatGpuSim(split_k_atomic_reverse)",
+      "workloads": 128,
+      "diverged_digests": 128,
+      "digest_divergence_rate_pct": 100.0000,
+      "total_elements": 32768,
+      "mismatched_elements": 21666,
+      "element_mismatch_rate_pct": 66.1194,
+      "max_ulp": 25230,
+      "mean_ulp": 8.4263
+    }
+  ],
+  "performance_benchmark": [
+    {
+      "workload": "Int8Gemm+RMSNorm+SiLU (decode M=1)",
+      "shape": "1x64x64",
+      "mac_ops": 4096,
+      "scalar_det_p50_us": 44.59,
+      "scalar_det_p95_us": 85.09,
+      "tiled_simd_det_p50_us": 49.52,
+      "tiled_simd_det_p95_us": 72.50,
+      "sim_gpu_warp_det_p50_us": 54.70,
+      "sim_gpu_warp_det_p95_us": 71.14,
+      "unordered_f32_scalar_p50_us": 6.62,
+      "unordered_f32_gpu_p50_us": 8.94,
+      "tiled_det_vs_f32_ratio": 7.478,
+      "tiled_det_mmac_per_sec": 82.71
+    },
+    {
+      "workload": "Int8Gemm+RMSNorm+SiLU (micro-batch M=4)",
+      "shape": "4x64x64",
+      "mac_ops": 16384,
+      "scalar_det_p50_us": 81.23,
+      "scalar_det_p95_us": 127.39,
+      "tiled_simd_det_p50_us": 78.07,
+      "tiled_simd_det_p95_us": 102.41,
+      "sim_gpu_warp_det_p50_us": 104.94,
+      "sim_gpu_warp_det_p95_us": 138.34,
+      "unordered_f32_scalar_p50_us": 30.12,
+      "unordered_f32_gpu_p50_us": 36.59,
+      "tiled_det_vs_f32_ratio": 2.592,
+      "tiled_det_mmac_per_sec": 209.86
+    },
+    {
+      "workload": "Int8Gemm+RMSNorm+SiLU (prefill M=8)",
+      "shape": "8x128x128",
+      "mac_ops": 131072,
+      "scalar_det_p50_us": 450.94,
+      "scalar_det_p95_us": 465.98,
+      "tiled_simd_det_p50_us": 473.24,
+      "tiled_simd_det_p95_us": 510.46,
+      "sim_gpu_warp_det_p50_us": 520.80,
+      "sim_gpu_warp_det_p95_us": 573.80,
+      "unordered_f32_scalar_p50_us": 218.44,
+      "unordered_f32_gpu_p50_us": 216.16,
+      "tiled_det_vs_f32_ratio": 2.166,
+      "tiled_det_mmac_per_sec": 276.97
+    },
+    {
+      "workload": "Int8Gemm+RMSNorm+SiLU (prefill M=16)",
+      "shape": "16x128x128",
+      "mac_ops": 262144,
+      "scalar_det_p50_us": 706.27,
+      "scalar_det_p95_us": 1606.10,
+      "tiled_simd_det_p50_us": 820.51,
+      "tiled_simd_det_p95_us": 893.67,
+      "sim_gpu_warp_det_p50_us": 990.85,
+      "sim_gpu_warp_det_p95_us": 1024.13,
+      "unordered_f32_scalar_p50_us": 452.72,
+      "unordered_f32_gpu_p50_us": 406.26,
+      "tiled_det_vs_f32_ratio": 1.812,
+      "tiled_det_mmac_per_sec": 319.49
+    },
+    {
+      "workload": "PackedInt4+RMSNorm+SiLU (prefill M=16)",
+      "shape": "16x128x128",
+      "mac_ops": 262144,
+      "scalar_det_p50_us": 869.10,
+      "scalar_det_p95_us": 1872.72,
+      "tiled_simd_det_p50_us": 428.23,
+      "tiled_simd_det_p95_us": 445.66,
+      "sim_gpu_warp_det_p50_us": 926.58,
+      "sim_gpu_warp_det_p95_us": 1889.52,
+      "unordered_f32_scalar_p50_us": 419.60,
+      "unordered_f32_gpu_p50_us": 422.22,
+      "tiled_det_vs_f32_ratio": 1.021,
+      "tiled_det_mmac_per_sec": 612.16
+    }
+  ]
+}
