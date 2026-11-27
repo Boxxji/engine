@@ -51,6 +51,15 @@ pub enum SchedulerError {
     },
     /// Invalid configuration parameter.
     InvalidConfig(String),
+    /// Simulation hit its hard iteration cap while requests remained unfinished.
+    SimulationStepLimitExceeded {
+        /// Configured iteration cap.
+        max_iterations: usize,
+        /// Requests completed before the cap was hit.
+        completed_requests: usize,
+        /// Requests still unfinished when the cap was hit.
+        unfinished_requests: usize,
+    },
 }
 
 impl fmt::Display for SchedulerError {
@@ -73,6 +82,14 @@ impl fmt::Display for SchedulerError {
                 write!(f, "sequence {seq_id} is already allocated in KV pool")
             }
             Self::InvalidConfig(msg) => write!(f, "invalid scheduler configuration: {msg}"),
+            Self::SimulationStepLimitExceeded {
+                max_iterations,
+                completed_requests,
+                unfinished_requests,
+            } => write!(
+                f,
+                "simulation exceeded {max_iterations} steps with {unfinished_requests} unfinished requests ({completed_requests} completed)"
+            ),
         }
     }
 }

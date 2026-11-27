@@ -180,19 +180,21 @@ Workload: `32,768`-token cold repo prefill + `20` chained coding-agent turns × 
 
 ## 8. Explicitly Tested Honest Negative Regimes
 
+> **Canonical Regenerated Receipt**: `docs/research/hip-1346-continuous-batching-scheduler/results.json` (SHA-256: `02544c9c46832e299b08a9cf42493d62f1e2cb34bf979e4359862874fb7890a9`; `24/24` integration & Codex regression tests passing; streamed linear weights separated from per-token `embed_tokens` row lookups).
+
 1. **Negative Regime 1 — Single-User Chunking Overhead (`neg_single_user_concurrency_1`)**:
-   - At `C = 1` (`32,768`-token repo prefill on `9B-Hybrid`), forcing datacenter small-chunk batching (`chunk_size = 256`, no bypass) adds **`+9.5%` cold TTFT tax** (`1,371.26 ms` vs `1,252.65 ms`) and **`+5.4%` wall-time regression** (`2.311 s` vs `2.193 s`) from `128` repeated weight + FP32 GDN state loads and ragged dispatch overheads.
+   - At `C = 1` (`32,768`-token repo prefill on `9B-Hybrid`), forcing datacenter small-chunk batching (`chunk_size = 256`, no bypass) adds **`+9.6%` cold TTFT tax** (`1,290.2 ms` vs `1,177.6 ms` single-user bypass) from `128` repeated streamed weight + FP32 GDN state loads and ragged dispatch overheads.
    - **Verdict**: **REJECTED**. Proves why `SingleUserInteractive` and `LatencyAwareChunkedKvScheduler`'s automatic `C == 1` bypass must skip chunking at single-user concurrency.
 
 2. **Negative Regime 2 — KV Memory Oversubscription at `C = 256` (`neg_kv_memory_oversubscription_256`)**:
    - `256` simultaneous requests (`144 × 32K` long prompts + `112 × 256`-tok chats) create **`101.987 GiB`** exact unbounded KV+GDN demand against `9B-Hybrid`'s **`61.148 GiB`** H100 KV+GDN pool (`1.67x` oversubscribed; never clamped).
-   - **Unguarded admission** (`kv_admission_control = false`) eagerly admits all sequences using only first-chunk checks, slamming into the physical KV block limit and collapsing into **`1,891` preemptions** and **`1,831,832` wasted recomputed tokens** (`255.566 s` makespan, `39.07 tok/s`).
-   - **KV-guarded admission** (`latency_aware_chunked_kv`) queues excess requests cleanly with **`0` preemptions**, **`0` recomputed tokens**, **`+37.1%` higher output throughput** (`53.58 tok/s`), **`-27.1%` shorter makespan** (`186.352 s`), and protected **`p95 ITL = 43.96 ms <= 50 ms` SLO**, honestly trading **`50,529 ms` mean admission queue wait** against physical VRAM limits rather than crashing or thrashing.
+   - **Unguarded admission** (`kv_admission_control = false`) eagerly admits all sequences using only first-chunk checks, slamming into the physical KV block limit and collapsing into **`1,828` preemptions** and **`1,848,679` wasted recomputed tokens** (including full generated-history replay).
+   - **KV-guarded admission** (`latency_aware_chunked_kv`) queues excess requests cleanly with **`0` preemptions**, **`0` recomputed tokens**, and protected **`p95 ITL = 41.6 ms <= 50 ms` SLO**, honestly trading admission queue wait against physical VRAM limits rather than crashing or thrashing.
    - **Verdict**: Unguarded admission **REJECTED**.
 
 3. **Negative Regime 3 — Microbenchmark Win / End-to-End Loss (`neg_ultra_small_chunk_prefill_tax`)**:
-   - Setting `chunk_size = 64` **wins the single-decode ITL microbenchmark** (`itl_max = 8.20 ms` vs `44.00 ms` on `9B-Hybrid`, **`5.4x` lower max decode ITL**).
-   - **However**, `64`-token chunks fall far below the H100 BF16 roofline ridge point, forcing `512` full-model weight + FP32 GDN state reads per `32K` prefill and `75` per `4.8K` turn. This regresses 20-turn end-to-end wall time by **`+18.9%`** on `9B-Hybrid` (`58.044 s` vs `48.788 s`) and **`+20.2%`** on `27B-Hybrid` (`158.446 s` vs `131.830 s`), inflating energy by **`+23.9%`** (`3,261.81` vs `2,633.27 mJ/tok`).
+   - Setting `chunk_size = 64` **wins the single-decode ITL microbenchmark**, yet `64`-token chunks fall far below the H100 BF16 roofline ridge point, forcing `512` full-model streamed weight + FP32 GDN state reads per `32K` prefill and `75` per `4.8K` turn.
+   - This regresses 20-turn end-to-end wall time by **`+18.6%`** on `9B-Hybrid` (`54.51 s` vs `45.97 s` baseline) and **`+20.1%`** on `27B-Hybrid` (`154.02 s` vs `128.23 s` baseline), inflating energy per output token by **`+23.7%`** (`3,067.6` vs `2,479.1 mJ/tok`).
    - **Verdict**: **Explicitly REJECTED** by `evaluate_end_to_end_gate` across all three hybrid models (`4B`, `9B`, `27B`).
 
 ---

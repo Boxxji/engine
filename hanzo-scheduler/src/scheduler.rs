@@ -338,7 +338,19 @@ impl SchedulerEngine {
             }
 
             if step_index >= max_iterations {
-                break;
+                for idx in active.drain(..).chain(swapped.drain(..)) {
+                    self.pool.free_sequence(seqs[idx].req.id);
+                }
+                let unfinished_requests = seqs
+                    .iter()
+                    .filter(|s| s.state != SequenceState::Finished)
+                    .count();
+                let completed_requests = seqs.iter().filter(|s| s.completion_ms.is_some()).count();
+                return Err(SchedulerError::SimulationStepLimitExceeded {
+                    max_iterations,
+                    completed_requests,
+                    unfinished_requests,
+                });
             }
 
             // 2. Restore swapped-out sequences if space is available before admitting new work.
@@ -398,18 +410,20 @@ impl SchedulerEngine {
                         for idx in need_prefill {
                             let rem = seqs[idx].remaining_prefill();
                             let prefix_len = seqs[idx].current_context_len();
-                            self.ensure_kv_for_step(
+                            let grown = self.ensure_kv_for_step(
                                 idx,
                                 prefix_len + rem,
                                 &mut seqs,
                                 &mut active,
                                 &mut waiting,
                                 &mut swapped,
+                                &mut prefill_chunks,
+                                &mut decode_seqs,
                                 &mut preempted_seqs,
                                 &mut total_swap_bytes,
                                 &mut swap_stall_ms,
                             )?;
-                            if self.pool.is_resident(seqs[idx].req.id) {
+                            if grown {
                                 prefill_chunks.push(PrefillChunkSpec {
                                     seq_id: seqs[idx].req.id,
                                     prefix_len,
@@ -424,18 +438,20 @@ impl SchedulerEngine {
                         for idx in active_snapshot {
                             if seqs[idx].state == SequenceState::Decoding {
                                 let target_len = seqs[idx].current_context_len() + 1;
-                                self.ensure_kv_for_step(
+                                let grown = self.ensure_kv_for_step(
                                     idx,
                                     target_len,
                                     &mut seqs,
                                     &mut active,
                                     &mut waiting,
                                     &mut swapped,
+                                    &mut prefill_chunks,
+                                    &mut decode_seqs,
                                     &mut preempted_seqs,
                                     &mut total_swap_bytes,
                                     &mut swap_stall_ms,
                                 )?;
-                                if self.pool.is_resident(seqs[idx].req.id) {
+                                if grown {
                                     decode_seqs.push(seqs[idx].req.id);
                                 }
                             }
@@ -462,18 +478,20 @@ impl SchedulerEngine {
                         for idx in need_prefill {
                             let rem = seqs[idx].remaining_prefill();
                             let prefix_len = seqs[idx].current_context_len();
-                            self.ensure_kv_for_step(
+                            let grown = self.ensure_kv_for_step(
                                 idx,
                                 prefix_len + rem,
                                 &mut seqs,
                                 &mut active,
                                 &mut waiting,
                                 &mut swapped,
+                                &mut prefill_chunks,
+                                &mut decode_seqs,
                                 &mut preempted_seqs,
                                 &mut total_swap_bytes,
                                 &mut swap_stall_ms,
                             )?;
-                            if self.pool.is_resident(seqs[idx].req.id) {
+                            if grown {
                                 prefill_chunks.push(PrefillChunkSpec {
                                     seq_id: seqs[idx].req.id,
                                     prefix_len,
@@ -487,18 +505,20 @@ impl SchedulerEngine {
                         for idx in active_snapshot {
                             if seqs[idx].state == SequenceState::Decoding {
                                 let target_len = seqs[idx].current_context_len() + 1;
-                                self.ensure_kv_for_step(
+                                let grown = self.ensure_kv_for_step(
                                     idx,
                                     target_len,
                                     &mut seqs,
                                     &mut active,
                                     &mut waiting,
                                     &mut swapped,
+                                    &mut prefill_chunks,
+                                    &mut decode_seqs,
                                     &mut preempted_seqs,
                                     &mut total_swap_bytes,
                                     &mut swap_stall_ms,
                                 )?;
-                                if self.pool.is_resident(seqs[idx].req.id) {
+                                if grown {
                                     decode_seqs.push(seqs[idx].req.id);
                                 }
                             }
@@ -543,18 +563,20 @@ impl SchedulerEngine {
                         for idx in need_prefill {
                             let rem = seqs[idx].remaining_prefill();
                             let prefix_len = seqs[idx].current_context_len();
-                            self.ensure_kv_for_step(
+                            let grown = self.ensure_kv_for_step(
                                 idx,
                                 prefix_len + rem,
                                 &mut seqs,
                                 &mut active,
                                 &mut waiting,
                                 &mut swapped,
+                                &mut prefill_chunks,
+                                &mut decode_seqs,
                                 &mut preempted_seqs,
                                 &mut total_swap_bytes,
                                 &mut swap_stall_ms,
                             )?;
-                            if self.pool.is_resident(seqs[idx].req.id) {
+                            if grown {
                                 prefill_chunks.push(PrefillChunkSpec {
                                     seq_id: seqs[idx].req.id,
                                     prefix_len,
@@ -569,18 +591,20 @@ impl SchedulerEngine {
                         for idx in active_snapshot {
                             if seqs[idx].state == SequenceState::Decoding {
                                 let target_len = seqs[idx].current_context_len() + 1;
-                                self.ensure_kv_for_step(
+                                let grown = self.ensure_kv_for_step(
                                     idx,
                                     target_len,
                                     &mut seqs,
                                     &mut active,
                                     &mut waiting,
                                     &mut swapped,
+                                    &mut prefill_chunks,
+                                    &mut decode_seqs,
                                     &mut preempted_seqs,
                                     &mut total_swap_bytes,
                                     &mut swap_stall_ms,
                                 )?;
-                                if self.pool.is_resident(seqs[idx].req.id) {
+                                if grown {
                                     decode_seqs.push(seqs[idx].req.id);
                                 }
                             }
@@ -618,18 +642,20 @@ impl SchedulerEngine {
                             continue;
                         }
                         let target_len = seqs[idx].current_context_len() + 1;
-                        self.ensure_kv_for_step(
+                        let grown = self.ensure_kv_for_step(
                             idx,
                             target_len,
                             &mut seqs,
                             &mut active,
                             &mut waiting,
                             &mut swapped,
+                            &mut prefill_chunks,
+                            &mut decode_seqs,
                             &mut preempted_seqs,
                             &mut total_swap_bytes,
                             &mut swap_stall_ms,
                         )?;
-                        if self.pool.is_resident(seqs[idx].req.id) && budget_left > 0 {
+                        if grown && budget_left > 0 {
                             decode_seqs.push(seqs[idx].req.id);
                             budget_left -= 1;
                         }
@@ -663,18 +689,20 @@ impl SchedulerEngine {
                         let rem = seqs[idx].remaining_prefill();
                         let chunk_len = rem.min(budget_left).min(per_seq_cap);
                         let prefix_len = seqs[idx].current_context_len();
-                        self.ensure_kv_for_step(
+                        let grown = self.ensure_kv_for_step(
                             idx,
                             prefix_len + chunk_len,
                             &mut seqs,
                             &mut active,
                             &mut waiting,
                             &mut swapped,
+                            &mut prefill_chunks,
+                            &mut decode_seqs,
                             &mut preempted_seqs,
                             &mut total_swap_bytes,
                             &mut swap_stall_ms,
                         )?;
-                        if self.pool.is_resident(seqs[idx].req.id) {
+                        if grown {
                             prefill_chunks.push(PrefillChunkSpec {
                                 seq_id: seqs[idx].req.id,
                                 prefix_len,
@@ -732,7 +760,7 @@ impl SchedulerEngine {
                             &mut admitted_seqs,
                         )?;
 
-                        // 2. EDF / slack-ordered active decodes.
+                        // 2. EDF / slack-ordered active decodes (bounded by token_budget).
                         let mut active_decodes: Vec<usize> = active
                             .iter()
                             .copied()
@@ -743,27 +771,36 @@ impl SchedulerEngine {
                                 .itl_slack_ms(now_ms)
                                 .total_cmp(&seqs[b].itl_slack_ms(now_ms))
                         });
+                        let has_prefill = active.iter().any(|&i| seqs[i].remaining_prefill() > 0);
+                        let max_decodes_this_step =
+                            if has_prefill && active_decodes.len() >= self.config.token_budget {
+                                (self.config.token_budget / 2).max(1)
+                            } else {
+                                self.config.token_budget
+                            };
 
                         let mut decode_ctx_lens: Vec<usize> =
-                            Vec::with_capacity(active_decodes.len());
+                            Vec::with_capacity(active_decodes.len().min(max_decodes_this_step));
                         let mut min_decode_slack_ms = f64::INFINITY;
-                        for idx in active_decodes {
+                        for idx in active_decodes.into_iter().take(max_decodes_this_step) {
                             if !self.pool.is_resident(seqs[idx].req.id) {
                                 continue;
                             }
                             let target_len = seqs[idx].current_context_len() + 1;
-                            self.ensure_kv_for_step(
+                            let grown = self.ensure_kv_for_step(
                                 idx,
                                 target_len,
                                 &mut seqs,
                                 &mut active,
                                 &mut waiting,
                                 &mut swapped,
+                                &mut prefill_chunks,
+                                &mut decode_seqs,
                                 &mut preempted_seqs,
                                 &mut total_swap_bytes,
                                 &mut swap_stall_ms,
                             )?;
-                            if self.pool.is_resident(seqs[idx].req.id) {
+                            if grown {
                                 min_decode_slack_ms =
                                     min_decode_slack_ms.min(seqs[idx].itl_slack_ms(now_ms));
                                 decode_ctx_lens.push(seqs[idx].current_context_len());
@@ -771,7 +808,17 @@ impl SchedulerEngine {
                             }
                         }
 
-                        // 3. Dynamic roofline-bounded prefill chunk sizing protecting p95 ITL SLO.
+                        // Re-sync decode_ctx_lens with decode_seqs in case any earlier decode was rolled back.
+                        if decode_ctx_lens.len() != decode_seqs.len() {
+                            decode_ctx_lens = decode_seqs
+                                .iter()
+                                .filter_map(|&id| lookup_idx(id))
+                                .map(|i| seqs[i].current_context_len())
+                                .collect();
+                        }
+
+                        // 3. Dynamic roofline-bounded prefill chunk sizing protecting p95 ITL SLO,
+                        //    strictly honoring token_budget whether decodes are active or idle.
                         let mut active_prefills: Vec<usize> = active
                             .iter()
                             .copied()
@@ -808,15 +855,16 @@ impl SchedulerEngine {
                             && min_decode_slack_ms < (decode_only_ms + 4.0)
                             && min_decode_slack_ms < 0.45 * self.config.slo.itl_p95_ms;
 
-                        if !urgent_decode_guard && !active_prefills.is_empty() {
-                            let budget_cap = self
-                                .config
-                                .token_budget
-                                .saturating_sub(decode_seqs.len())
-                                .min(self.config.max_prefill_chunk);
+                        let budget_cap = self
+                            .config
+                            .token_budget
+                            .saturating_sub(decode_seqs.len())
+                            .min(self.config.max_prefill_chunk);
+
+                        if !urgent_decode_guard && !active_prefills.is_empty() && budget_cap > 0 {
                             let mut chunk_budget = if decode_ctx_lens.is_empty() {
-                                // No active decodes: allow full max_prefill_chunk (no decode to stall).
-                                self.config.max_prefill_chunk
+                                // No active decodes: still strictly honor token_budget and max_prefill_chunk.
+                                budget_cap
                             } else {
                                 let target_step_ms = (0.88 * self.config.slo.itl_p95_ms).min(
                                     min_decode_slack_ms.max(0.65 * self.config.slo.itl_p95_ms),
@@ -827,11 +875,11 @@ impl SchedulerEngine {
                                     seqs[lead].remaining_prefill(),
                                     &decode_ctx_lens,
                                     target_step_ms,
-                                    self.config.min_prefill_chunk,
-                                    budget_cap.max(self.config.min_prefill_chunk),
+                                    self.config.min_prefill_chunk.min(budget_cap).max(1),
+                                    budget_cap,
                                 )
                             };
-                            chunk_budget = chunk_budget.max(1);
+                            chunk_budget = chunk_budget.min(budget_cap);
 
                             for idx in active_prefills {
                                 if chunk_budget == 0 {
@@ -843,18 +891,20 @@ impl SchedulerEngine {
                                 let rem = seqs[idx].remaining_prefill();
                                 let chunk_len = rem.min(chunk_budget);
                                 let prefix_len = seqs[idx].current_context_len();
-                                self.ensure_kv_for_step(
+                                let grown = self.ensure_kv_for_step(
                                     idx,
                                     prefix_len + chunk_len,
                                     &mut seqs,
                                     &mut active,
                                     &mut waiting,
                                     &mut swapped,
+                                    &mut prefill_chunks,
+                                    &mut decode_seqs,
                                     &mut preempted_seqs,
                                     &mut total_swap_bytes,
                                     &mut swap_stall_ms,
                                 )?;
-                                if self.pool.is_resident(seqs[idx].req.id) {
+                                if grown {
                                     prefill_chunks.push(PrefillChunkSpec {
                                         seq_id: seqs[idx].req.id,
                                         prefix_len,
@@ -890,16 +940,23 @@ impl SchedulerEngine {
             now_ms += est.step_ms + swap_stall_ms;
             total_energy_joules += est.energy_joules;
 
-            // 5. Commit prefill chunk advances and decode token emissions.
+            // 5. Commit prefill chunk advances (including recompute history replay) and decode token emissions.
             let mut finished_indices: Vec<usize> = Vec::new();
             for chunk in &prefill_chunks {
                 if let Some(idx) = lookup_idx(chunk.seq_id) {
-                    seqs[idx].prefilled_uncached += chunk.chunk_len;
+                    let is_recompute_replay = seqs[idx].generated_tokens > 0;
+                    seqs[idx].advance_prefill_chunk(chunk.chunk_len);
                     if chunk.completes_prefill {
-                        // Completing prefill emits the first generated output token (TTFT).
-                        seqs[idx].record_generated_token(now_ms);
-                        if seqs[idx].state == SequenceState::Finished {
-                            finished_indices.push(idx);
+                        if is_recompute_replay {
+                            // Rebuilt prompt + consumed generated suffix and GDN state without
+                            // double-counting already emitted tokens; resume decoding next step.
+                            seqs[idx].state = SequenceState::Decoding;
+                        } else {
+                            // Completing initial prompt prefill emits output token 0 (TTFT).
+                            seqs[idx].record_generated_token(now_ms);
+                            if seqs[idx].state == SequenceState::Finished {
+                                finished_indices.push(idx);
+                            }
                         }
                     }
                 }
@@ -948,7 +1005,7 @@ impl SchedulerEngine {
             step_index += 1;
         }
 
-        // Cleanup any remaining allocations (e.g. if max_iterations safety cap tripped).
+        // Cleanup any remaining allocations.
         for idx in active.drain(..).chain(swapped.drain(..)) {
             self.pool.free_sequence(seqs[idx].req.id);
         }
@@ -978,10 +1035,11 @@ impl SchedulerEngine {
     /// Computes initial KV token reservation for admission of `seq`.
     fn initial_admission_tokens(&self, seq: &SequenceRuntime) -> usize {
         if self.config.kv_admission_control {
-            // Reserve full prompt (warm prefix + uncached prompt) + modest decode reserve
+            // Reserve full prompt + any generated suffix to replay + modest decode reserve
             // so admitted sequences do not immediately thrash KV blocks.
-            let decode_reserve = seq.req.output_tokens.min(32);
-            seq.req.prompt_tokens + decode_reserve
+            let remaining_outputs = seq.req.output_tokens.saturating_sub(seq.generated_tokens);
+            let decode_reserve = remaining_outputs.min(32);
+            seq.req.prompt_tokens + seq.generated_tokens + decode_reserve
         } else {
             // Unguarded admission (Negative Regime 2): only checks first chunk + warm prefix!
             let first_chunk = seq.remaining_prefill().min(self.config.token_budget).max(1);
@@ -1149,6 +1207,13 @@ impl SchedulerEngine {
 
     /// Ensures `target_idx` has enough KV blocks for `target_len`, preempting lower-priority
     /// active victims if needed.
+    ///
+    /// Already-planned sequences in the current iteration (`prefill_chunks` / `decode_seqs`) are
+    /// pinned ahead of unplanned victims; if an already-planned sequence must still be evicted to
+    /// guarantee forward progress, its planned entry is rolled back before its KV/GDN state is
+    /// freed so no step plan can ever reference a preempted sequence.
+    ///
+    /// Returns `Ok(true)` iff `target_idx` is resident with `target_len` tokens allocated.
     #[allow(clippy::too_many_arguments)]
     fn ensure_kv_for_step(
         &mut self,
@@ -1158,34 +1223,57 @@ impl SchedulerEngine {
         active: &mut Vec<usize>,
         waiting: &mut Vec<usize>,
         swapped: &mut Vec<usize>,
+        prefill_chunks: &mut Vec<PrefillChunkSpec>,
+        decode_seqs: &mut Vec<usize>,
         preempted_seqs: &mut Vec<usize>,
         total_swap_bytes: &mut u64,
         swap_stall_ms: &mut f64,
-    ) -> Result<(), SchedulerError> {
+    ) -> Result<bool, SchedulerError> {
         let target_id = seqs[target_idx].req.id;
         if !self.pool.is_resident(target_id) {
-            return Ok(());
+            return Ok(false);
         }
         while !self.pool.can_grow(target_id, target_len) {
-            // Choose victim: prefer most-recently-admitted prefilling sequence, else LIFO active.
+            let is_planned = |id: usize| {
+                prefill_chunks.iter().any(|c| c.seq_id == id) || decode_seqs.contains(&id)
+            };
+            // Prefer evicting unplanned sequences first (prefilling before decoding) so already-
+            // planned work in the current iteration stays pinned whenever possible.
             let victim_pos = active
                 .iter()
-                .rposition(|&i| i != target_idx && seqs[i].state == SequenceState::Prefilling)
+                .rposition(|&i| {
+                    i != target_idx
+                        && !is_planned(seqs[i].req.id)
+                        && seqs[i].state == SequenceState::Prefilling
+                })
+                .or_else(|| {
+                    active
+                        .iter()
+                        .rposition(|&i| i != target_idx && !is_planned(seqs[i].req.id))
+                })
+                .or_else(|| {
+                    active.iter().rposition(|&i| {
+                        i != target_idx && seqs[i].state == SequenceState::Prefilling
+                    })
+                })
                 .or_else(|| active.iter().rposition(|&i| i != target_idx));
             let Some(pos) = victim_pos else {
                 // No other sequence to evict; cannot grow further.
-                return Ok(());
+                return Ok(false);
             };
             let victim_idx = active.remove(pos);
             let victim_id = seqs[victim_idx].req.id;
+            // Roll back any already-planned work for victim_id before freeing its KV/GDN state.
+            prefill_chunks.retain(|c| c.seq_id != victim_id);
+            decode_seqs.retain(|&id| id != victim_id);
+
             seqs[victim_idx].preemption_count += 1;
             preempted_seqs.push(victim_id);
             match self.config.preemption_mode {
                 PreemptionMode::Recompute => {
                     let recomputed = self.pool.preempt_recompute(victim_id)?;
                     seqs[victim_idx].recomputed_tokens += recomputed;
-                    seqs[victim_idx].prefilled_uncached = 0;
-                    seqs[victim_idx].state = SequenceState::Preempted;
+                    seqs[victim_idx].reset_materialized_for_recompute();
                     waiting.insert(0, victim_idx);
                 }
                 PreemptionMode::SwapToHost => {
@@ -1198,7 +1286,7 @@ impl SchedulerEngine {
             }
         }
         self.pool.allocate_for_len(target_id, target_len)?;
-        Ok(())
+        Ok(true)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1358,6 +1446,7 @@ fn release_ready_requests<F>(
 ) where
     F: Fn(usize) -> Option<usize>,
 {
+    let mut newly_ready: Vec<usize> = Vec::new();
     for idx in 0..seqs.len() {
         if released[idx] {
             continue;
@@ -1372,10 +1461,19 @@ fn release_ready_requests<F>(
             if ready_t <= now_ms + 1e-9 {
                 seqs[idx].ready_ms = ready_t;
                 released[idx] = true;
-                waiting.push(idx);
+                newly_ready.push(idx);
             }
         }
     }
+    // Enqueue newly released requests chronologically by readiness timestamp (tie-breaking by req.id)
+    // so FCFS admission never inverts arrival order across multi-arrival forward steps.
+    newly_ready.sort_by(|&a, &b| {
+        seqs[a]
+            .ready_ms
+            .total_cmp(&seqs[b].ready_ms)
+            .then_with(|| seqs[a].req.id.cmp(&seqs[b].req.id))
+    });
+    waiting.extend(newly_ready);
 }
 
 fn next_unreleased_arrival_ms<F>(

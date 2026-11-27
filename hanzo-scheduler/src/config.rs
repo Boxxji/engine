@@ -44,8 +44,8 @@ pub enum SchedulingPolicy {
     /// Policy 3: Iteration-level continuous batching without chunking, prioritizing active
     /// decodes (starves waiting prefills -> severe TTFT spikes, then still stalls ITL on run).
     ContinuousBatchingDecodePriority,
-    /// Policy 4: Sarathi-Serve style chunked prefill with fixed token budget piggybacked onto
-    /// active decode steps, accounting for both compute FLOPs and HBM bandwidth.
+    /// Policy 4: Token-budget chunked prefill piggybacked onto active decode steps,
+    /// accounting for both compute FLOPs and HBM bandwidth.
     ChunkedPrefillTokenBudget,
     /// Policy 5 (Ours): Token-budget chunked prefill + EDF/slack-aware decode prioritisation +
     /// KV-pressure admission control + automatic `C == 1` single-user fast-path bypass.
@@ -217,7 +217,7 @@ impl SchedulerConfig {
     }
 
     /// Canonical [`SchedulerProfile::DatacenterThroughput`] configuration: high token budget
-    /// (`2048`) with Sarathi-style chunked prefill + decode piggybacking.
+    /// (`2048`) with token-budget chunked prefill + decode piggybacking.
     #[must_use]
     pub fn datacenter_throughput() -> Self {
         Self {

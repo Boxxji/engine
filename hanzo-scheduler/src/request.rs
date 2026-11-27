@@ -95,10 +95,12 @@ pub struct SequenceRuntime {
     pub ready_ms: f64,
     /// Current scheduling state.
     pub state: SequenceState,
-    /// Number of uncached prompt tokens prefilled so far (`0..=req.uncached_prompt_tokens()`).
+    /// Number of uncached prompt tokens currently materialized in GPU KV/GDN (`0..=req.uncached_prompt_tokens()`).
     pub prefilled_uncached: usize,
-    /// Number of output tokens emitted so far (`0..=req.output_tokens`).
+    /// Number of output tokens emitted to the caller so far (`0..=req.output_tokens`).
     pub generated_tokens: usize,
+    /// Number of previously emitted output tokens currently materialized in GPU KV/GDN (`0..=generated_tokens`).
+    pub materialized_generated: usize,
     /// Timestamp when the first output token was produced (ms).
     pub first_token_ms: Option<f64>,
     /// Timestamp when the most recent output token was produced (ms).
@@ -129,6 +131,7 @@ impl SequenceRuntime {
             state: SequenceState::Waiting,
             prefilled_uncached: 0,
             generated_tokens: 0,
+            materialized_generated: 0,
             first_token_ms: None,
             last_token_ms: None,
             completion_ms: None,
@@ -140,18 +143,46 @@ impl SequenceRuntime {
         }
     }
 
-    /// Remaining uncached prompt tokens yet to be prefilled.
+    /// Remaining uncached prompt tokens plus any recompute-evicted generated suffix tokens
+    /// that must be materialized before decoding can proceed.
     #[must_use]
     pub fn remaining_prefill(&self) -> usize {
         self.req
             .uncached_prompt_tokens()
             .saturating_sub(self.prefilled_uncached)
+            + self
+                .generated_tokens
+                .saturating_sub(self.materialized_generated)
     }
 
-    /// Total KV context length currently materialized on GPU (warm prefix + prefilled + generated).
+    /// Advances materialized prefill and generated-history replay counters by `chunk_len` tokens.
+    pub fn advance_prefill_chunk(&mut self, chunk_len: usize) {
+        let prompt_rem = self
+            .req
+            .uncached_prompt_tokens()
+            .saturating_sub(self.prefilled_uncached);
+        let prompt_take = chunk_len.min(prompt_rem);
+        self.prefilled_uncached += prompt_take;
+        let replay_take = chunk_len.saturating_sub(prompt_take);
+        let gen_rem = self
+            .generated_tokens
+            .saturating_sub(self.materialized_generated);
+        self.materialized_generated += replay_take.min(gen_rem);
+    }
+
+    /// Resets materialized GPU KV/GDN progress on a recompute preemption while preserving
+    /// `generated_tokens` already streamed to the caller so they are replayed without
+    /// double-counting output tokens.
+    pub fn reset_materialized_for_recompute(&mut self) {
+        self.prefilled_uncached = 0;
+        self.materialized_generated = 0;
+        self.state = SequenceState::Preempted;
+    }
+
+    /// Total KV context length currently materialized on GPU (warm prefix + materialized prompt + materialized generated).
     #[must_use]
     pub fn current_context_len(&self) -> usize {
-        self.req.warm_prefix_tokens + self.prefilled_uncached + self.generated_tokens
+        self.req.warm_prefix_tokens + self.prefilled_uncached + self.materialized_generated
     }
 
     /// Final context length upon completion (`prompt_tokens + output_tokens`).
@@ -202,6 +233,7 @@ impl SequenceRuntime {
         }
         self.last_token_ms = Some(now_ms);
         self.generated_tokens += 1;
+        self.materialized_generated = self.generated_tokens;
         if self.generated_tokens >= self.req.output_tokens {
             self.completion_ms = Some(now_ms);
             self.state = SequenceState::Finished;

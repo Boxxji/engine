@@ -661,3 +661,355 @@ fn test_18_full_suite_determinism_and_roofline_physics() {
         );
     }
 }
+
+/// Test 19 (Codex P1 #1): No step may simultaneously preempt a sequence and schedule it in prefill/decode.
+#[test]
+fn test_19_codex_p1_no_step_preempts_and_schedules_same_seq() {
+    let root = GroundedCorpus::find_repo_root();
+    let corpus = GroundedCorpus::load(&root).expect("load corpus");
+    let model = HybridModelSpec::hybrid_9b();
+    let hw = HardwareSpec::h100_sxm5_80gb();
+    let cost = StepCostModel::new(model, hw);
+    let workload = corpus.build_oversubscription_256_workload(1346, SloTargets::default());
+
+    let out = SchedulerEngine::new(SchedulerConfig::neg_unguarded_kv_oversubscription(), cost)
+        .unwrap()
+        .with_trace(true)
+        .run(workload)
+        .unwrap();
+
+    assert!(
+        out.metrics.total_preemptions > 0,
+        "oversubscription workload must exercise preemption"
+    );
+    for plan in &out.trace {
+        for &preempted_id in &plan.preempted_seqs {
+            assert!(
+                !plan.decode_seqs.contains(&preempted_id),
+                "step {} both preempted and decoded seq {}",
+                plan.step_index,
+                preempted_id
+            );
+            assert!(
+                !plan.prefill_chunks.iter().any(|c| c.seq_id == preempted_id),
+                "step {} both preempted and prefilled seq {}",
+                plan.step_index,
+                preempted_id
+            );
+        }
+    }
+    assert!(out.metrics.kv_pool_clean);
+}
+
+/// Test 20 (Codex P1 #2): Recomputed decode replays prompt + consumed generated suffix from prefix_len=0
+/// without double-counting already-emitted output tokens.
+#[test]
+fn test_20_codex_p1_recomputed_decode_replays_generated_history() {
+    let model = HybridModelSpec::hybrid_9b();
+    let hw = HardwareSpec::h100_sxm5_80gb();
+    let cost = StepCostModel::new(model.clone(), hw);
+
+    // 10 blocks * 16 tokens/block = 160 tokens total capacity; two 64-prompt + 32-output sequences
+    // need 2 * 6 = 12 blocks -> forces mid-decode recompute preemption of seq 1.
+    let pool = PagedKvPool::with_explicit_capacity(
+        16,
+        model.kv_bytes_per_block(16),
+        model.gdn_state_bytes_per_seq(),
+        10,
+        2,
+    )
+    .unwrap();
+
+    let mut cfg = SchedulerConfig::for_policy(SchedulingPolicy::ChunkedPrefillTokenBudget);
+    cfg.kv_admission_control = false;
+    cfg.preemption_mode = PreemptionMode::Recompute;
+    cfg.token_budget = 64;
+    cfg.max_num_seqs = 2;
+
+    let reqs = vec![
+        InferenceRequest {
+            id: 0,
+            class: RequestClass::ShortInteractive,
+            arrival_ms: 0.0,
+            prompt_tokens: 64,
+            warm_prefix_tokens: 0,
+            output_tokens: 32,
+            slo_ttft_ms: 400.0,
+            slo_itl_ms: 50.0,
+            session_id: None,
+            turn_index: 0,
+            depends_on: None,
+        },
+        InferenceRequest {
+            id: 1,
+            class: RequestClass::ShortInteractive,
+            arrival_ms: 0.0,
+            prompt_tokens: 64,
+            warm_prefix_tokens: 0,
+            output_tokens: 32,
+            slo_ttft_ms: 400.0,
+            slo_itl_ms: 50.0,
+            session_id: None,
+            turn_index: 0,
+            depends_on: None,
+        },
+    ];
+
+    let out = SchedulerEngine::with_pool(cfg, cost, pool)
+        .unwrap()
+        .with_trace(true)
+        .run(reqs)
+        .unwrap();
+
+    assert_eq!(out.metrics.completed_requests, 2);
+    assert!(out.metrics.total_preemptions > 0);
+    assert!(out.metrics.kv_pool_clean);
+    for seq in &out.sequences {
+        assert_eq!(seq.generated_tokens, 32);
+        assert_eq!(seq.materialized_generated, 32);
+    }
+
+    // Verify that after preemption, the victim's first resumed replay chunk starts at prefix_len == 0
+    // (never at prefix_len == generated_tokens) and replays more than the 64-token prompt.
+    let mut saw_preempt_step: Option<usize> = None;
+    let mut victim_id: Option<usize> = None;
+    for plan in &out.trace {
+        if saw_preempt_step.is_none() && !plan.preempted_seqs.is_empty() {
+            saw_preempt_step = Some(plan.step_index);
+            victim_id = Some(plan.preempted_seqs[0]);
+            break;
+        }
+    }
+    let p_step = saw_preempt_step.expect("must have at least one preemption");
+    let v_id = victim_id.unwrap();
+    let resumed_chunks: Vec<_> = out
+        .trace
+        .iter()
+        .filter(|p| p.step_index > p_step)
+        .flat_map(|p| p.prefill_chunks.iter())
+        .filter(|c| c.seq_id == v_id)
+        .collect();
+    assert!(!resumed_chunks.is_empty(), "preempted victim must replay");
+    assert_eq!(
+        resumed_chunks[0].prefix_len, 0,
+        "resumed replay after recompute must start at prefix_len=0"
+    );
+    let total_replayed: usize = resumed_chunks.iter().map(|c| c.chunk_len).sum();
+    assert!(
+        total_replayed > 64,
+        "replay must cover prompt (64) + consumed generated suffix, got {total_replayed}"
+    );
+}
+
+/// Test 21 (Codex P1 #3): Streamed step HBM bytes exclude the full input-embedding matrix
+/// while keeping the full matrix in resident VRAM capacity accounting.
+#[test]
+fn test_21_codex_p1_streamed_weights_separate_embedding_table() {
+    let model = HybridModelSpec::hybrid_9b();
+    let hw = HardwareSpec::h100_sxm5_80gb();
+    let cost = StepCostModel::new(model.clone(), hw.clone());
+
+    // Full resident embedding table is ~1.245 GB and remains counted in VRAM capacity.
+    let embed_table_bytes = model.embedding_table_bytes_bf16();
+    assert_eq!(embed_table_bytes, 151_936 * 4096 * 2);
+    assert_eq!(
+        model.weight_bytes_bf16(),
+        model.streamed_weight_bytes_bf16() + embed_table_bytes
+    );
+    assert_eq!(
+        hw.available_kv_and_gdn_bytes(&model),
+        hw.vram_bytes - (model.weight_bytes_bf16() + hw.workspace_bytes)
+    );
+
+    // Single-token decode reads streamed weights + 1 embed_tokens row (8 KiB), NOT the 1.24 GB table.
+    let est = cost.estimate_step(&[], &[1], true);
+    let expected_hbm = model.streamed_weight_bytes_bf16()
+        + model.embedding_row_bytes_bf16()
+        + model.kv_bytes_per_token_fp16() * 2
+        + model.gdn_state_bytes_per_seq() * 2;
+    assert_eq!(model.embedding_row_bytes_bf16(), 8_192);
+    assert_eq!(est.hbm_bytes, expected_hbm);
+    assert!(est.hbm_bytes < model.weight_bytes_bf16());
+}
+
+/// Test 22 (Codex P1 #4): Capped simulation with unfinished work returns Err instead of Ok(100% SLO).
+#[test]
+fn test_22_codex_p1_capped_simulation_rejects_unfinished_requests() {
+    let model = HybridModelSpec::hybrid_9b();
+    let hw = HardwareSpec::h100_sxm5_80gb();
+    let cost = StepCostModel::new(model.clone(), hw);
+    let pool = PagedKvPool::with_explicit_capacity(
+        16,
+        model.kv_bytes_per_block(16),
+        model.gdn_state_bytes_per_seq(),
+        20_000,
+        4,
+    )
+    .unwrap();
+
+    let reqs = vec![
+        InferenceRequest {
+            id: 0,
+            class: RequestClass::ShortInteractive,
+            arrival_ms: 0.0,
+            prompt_tokens: 16,
+            warm_prefix_tokens: 0,
+            output_tokens: 1,
+            slo_ttft_ms: 400.0,
+            slo_itl_ms: 50.0,
+            session_id: None,
+            turn_index: 0,
+            depends_on: None,
+        },
+        InferenceRequest {
+            id: 1,
+            class: RequestClass::ShortInteractive,
+            arrival_ms: 0.0,
+            prompt_tokens: 16,
+            warm_prefix_tokens: 0,
+            output_tokens: 200_005,
+            slo_ttft_ms: 400.0,
+            slo_itl_ms: 50.0,
+            session_id: None,
+            turn_index: 0,
+            depends_on: None,
+        },
+    ];
+
+    let err = SchedulerEngine::with_pool(SchedulerConfig::latency_aware_slo(), cost, pool)
+        .unwrap()
+        .run(reqs)
+        .unwrap_err();
+    match err {
+        SchedulerError::SimulationStepLimitExceeded {
+            completed_requests,
+            unfinished_requests,
+            ..
+        } => {
+            assert_eq!(completed_requests, 1);
+            assert_eq!(unfinished_requests, 1);
+        }
+        other => panic!("expected SimulationStepLimitExceeded, got {other:?}"),
+    }
+}
+
+/// Test 23 (Codex P2 #5): FCFS releases multi-arrival requests in chronological readiness order, not ID order.
+#[test]
+fn test_23_codex_p2_fcfs_releases_chronologically_by_ready_ms() {
+    let model = HybridModelSpec::hybrid_9b();
+    let hw = HardwareSpec::h100_sxm5_80gb();
+    let cost = StepCostModel::new(model, hw);
+
+    let mut cfg = SchedulerConfig::for_policy(SchedulingPolicy::ContinuousBatchingPrefillFirst);
+    cfg.max_num_seqs = 1;
+
+    let reqs = vec![
+        InferenceRequest {
+            id: 0,
+            class: RequestClass::LongRepoPrefill,
+            arrival_ms: 0.0,
+            prompt_tokens: 4_096,
+            warm_prefix_tokens: 0,
+            output_tokens: 4,
+            slo_ttft_ms: 6_000.0,
+            slo_itl_ms: 50.0,
+            session_id: None,
+            turn_index: 0,
+            depends_on: None,
+        },
+        InferenceRequest {
+            id: 1,
+            class: RequestClass::ShortInteractive,
+            arrival_ms: 100.0,
+            prompt_tokens: 64,
+            warm_prefix_tokens: 0,
+            output_tokens: 4,
+            slo_ttft_ms: 400.0,
+            slo_itl_ms: 50.0,
+            session_id: None,
+            turn_index: 0,
+            depends_on: None,
+        },
+        InferenceRequest {
+            id: 2,
+            class: RequestClass::ShortInteractive,
+            arrival_ms: 10.0,
+            prompt_tokens: 64,
+            warm_prefix_tokens: 0,
+            output_tokens: 4,
+            slo_ttft_ms: 400.0,
+            slo_itl_ms: 50.0,
+            session_id: None,
+            turn_index: 0,
+            depends_on: None,
+        },
+    ];
+
+    let out = SchedulerEngine::new(cfg, cost)
+        .unwrap()
+        .with_trace(true)
+        .run(reqs)
+        .unwrap();
+    let admission_order: Vec<usize> = out
+        .trace
+        .iter()
+        .flat_map(|p| p.admitted_seqs.iter().copied())
+        .collect();
+    assert_eq!(admission_order, vec![0, 2, 1]);
+}
+
+/// Test 24 (Codex P2 #6): LatencyAwareChunkedKvScheduler strictly honors token_budget even when no decodes are active.
+#[test]
+fn test_24_codex_p2_latency_aware_honors_token_budget_when_no_decodes_active() {
+    let model = HybridModelSpec::hybrid_9b();
+    let hw = HardwareSpec::h100_sxm5_80gb();
+    let cost = StepCostModel::new(model, hw);
+
+    let mut cfg = SchedulerConfig::latency_aware_slo();
+    cfg.enable_single_user_bypass = false;
+    cfg.token_budget = 16;
+
+    let reqs = vec![
+        InferenceRequest {
+            id: 0,
+            class: RequestClass::ShortInteractive,
+            arrival_ms: 0.0,
+            prompt_tokens: 128,
+            warm_prefix_tokens: 0,
+            output_tokens: 4,
+            slo_ttft_ms: 400.0,
+            slo_itl_ms: 50.0,
+            session_id: None,
+            turn_index: 0,
+            depends_on: None,
+        },
+        InferenceRequest {
+            id: 1,
+            class: RequestClass::ShortInteractive,
+            arrival_ms: 0.0,
+            prompt_tokens: 128,
+            warm_prefix_tokens: 0,
+            output_tokens: 4,
+            slo_ttft_ms: 400.0,
+            slo_itl_ms: 50.0,
+            session_id: None,
+            turn_index: 0,
+            depends_on: None,
+        },
+    ];
+
+    let out = SchedulerEngine::new(cfg, cost)
+        .unwrap()
+        .with_trace(true)
+        .run(reqs)
+        .unwrap();
+    assert_eq!(out.metrics.completed_requests, 2);
+    for plan in &out.trace {
+        assert!(
+            plan.total_step_tokens <= 16,
+            "step {} emitted {} tokens, exceeding token_budget=16",
+            plan.step_index,
+            plan.total_step_tokens
+        );
+    }
+}

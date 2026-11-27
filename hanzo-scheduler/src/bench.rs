@@ -129,13 +129,19 @@ pub fn evaluate_end_to_end_gate(
             ),
         };
     }
-    if !candidate.kv_pool_clean || candidate.oom_rejected_requests > 0 {
+    if !candidate.kv_pool_clean
+        || candidate.oom_rejected_requests > 0
+        || candidate.completed_requests + candidate.oom_rejected_requests < candidate.total_requests
+    {
         return AcceptanceVerdict {
             regime_label: candidate.regime_label.to_string(),
             accepted: false,
             reason: format!(
-                "KV pool integrity/OOM failure (clean={}, oom_rejected={})",
-                candidate.kv_pool_clean, candidate.oom_rejected_requests
+                "KV pool integrity/OOM/incomplete-run failure (clean={}, completed={}/{}, oom_rejected={})",
+                candidate.kv_pool_clean,
+                candidate.completed_requests,
+                candidate.total_requests,
+                candidate.oom_rejected_requests
             ),
         };
     }

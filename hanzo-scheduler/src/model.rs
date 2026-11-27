@@ -144,10 +144,42 @@ impl HybridModelSpec {
             + mlp_down
     }
 
-    /// Exact BF16 model weight storage in bytes (`2` bytes per parameter).
+    /// Exact input-embedding table parameter count (`vocab_size * d_model`).
+    #[must_use]
+    pub const fn embedding_table_params(&self) -> u64 {
+        (self.vocab_size as u64) * (self.d_model as u64)
+    }
+
+    /// Exact non-embedding linear/projection parameter count streamed on every forward step.
+    #[must_use]
+    pub const fn non_embedding_params(&self) -> u64 {
+        self.total_params() - self.embedding_table_params()
+    }
+
+    /// Exact BF16 resident model weight storage in bytes (`2` bytes per parameter, including
+    /// the full input-embedding table for VRAM-capacity accounting).
     #[must_use]
     pub const fn weight_bytes_bf16(&self) -> u64 {
         self.total_params() * 2
+    }
+
+    /// Exact BF16 input-embedding table storage in bytes (`vocab_size * d_model * 2`).
+    #[must_use]
+    pub const fn embedding_table_bytes_bf16(&self) -> u64 {
+        self.embedding_table_params() * 2
+    }
+
+    /// Exact BF16 streamed linear/GDN/LM-head weight traffic per forward iteration
+    /// (excludes the full input-embedding matrix, which is accessed via row gather).
+    #[must_use]
+    pub const fn streamed_weight_bytes_bf16(&self) -> u64 {
+        self.non_embedding_params() * 2
+    }
+
+    /// Exact BF16 HBM bytes read for one `embed_tokens` row lookup (`d_model * 2`).
+    #[must_use]
+    pub const fn embedding_row_bytes_bf16(&self) -> u64 {
+        (self.d_model as u64) * 2
     }
 
     /// Exact FP16 attention KV cache bytes per token across all attention layers (`K` and `V`, 2 bytes each).
@@ -336,8 +368,8 @@ impl StepCostModel {
             };
         }
 
-        // 1. Dense linear + GDN projection FLOPs (2 * active_params * tokens).
-        let linear_flops = 2.0 * (self.model.total_params() as f64) * (total_tokens as f64);
+        // 1. Dense linear + GDN projection FLOPs (2 * non-embedding active params * tokens).
+        let linear_flops = 2.0 * (self.model.non_embedding_params() as f64) * (total_tokens as f64);
 
         // 2. Causal attention FLOPs + KV HBM traffic.
         let attn_coeff = 4.0
@@ -369,8 +401,11 @@ impl StepCostModel {
         let active_seqs = (prefill_chunks.len() + decode_context_lens.len()) as u64;
         let gdn_rw_bytes = active_seqs * gdn_per_seq * 2;
 
-        // 4. Model weights are loaded once per fused iteration across all tokens in the batch.
-        let hbm_bytes = self.model.weight_bytes_bf16() + kv_bytes + gdn_rw_bytes;
+        // 4. Streamed linear/GDN/LM-head weights are loaded once per fused iteration;
+        //    input embeddings are gathered per token (one `embed_tokens` row per token).
+        let embed_lookup_bytes = self.model.embedding_row_bytes_bf16() * (total_tokens as u64);
+        let hbm_bytes =
+            self.model.streamed_weight_bytes_bf16() + embed_lookup_bytes + kv_bytes + gdn_rw_bytes;
         let total_flops = linear_flops + attn_flops;
 
         let compute_ms = (total_flops / self.hardware.effective_flops_per_sec()) * 1000.0;
