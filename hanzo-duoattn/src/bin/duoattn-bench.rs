@@ -211,6 +211,9 @@ fn run_benchmark() -> Result<(), DuoAttnError> {
     let mut full_refs_by_workload: BTreeMap<String, Vec<Vec<f32>>> = BTreeMap::new();
 
     // Average timings across `--trials` runs while keeping outputs exact/deterministic.
+    // Matched kernel LSA budget: `sink=4, window=28, bucket_size=8, top_k=32` (~14% of middle keys,
+    // proportionally matched to `top_k=4096 / 32768 = 12.5%` on 32K GPU context).
+    let kernel_lsa_top_k = 32usize;
     for (wl_name, episodes) in &workloads {
         // Regime 1: Full KV baseline.
         let mut full_acc_ms = 0.0_f64;
@@ -232,7 +235,37 @@ fn run_benchmark() -> Result<(), DuoAttnError> {
         full_refs_by_workload.insert(wl_name.clone(), full_refs.clone());
         workload_results.push(full_res);
 
-        // Regime 2: Uniform LSA Streaming (100% streaming, sink + window).
+        // Regime 2: Existing Hanzo LSA (full resident KV + bucket-centroid top-k sparse attention).
+        let mut lsa_acc_ms = 0.0_f64;
+        let mut lsa_res_opt = None;
+        for t in 0..args.trials {
+            let (res, _) = evaluate_workload_regime(
+                wl_name,
+                &model_a,
+                &embedder,
+                episodes,
+                &full_refs,
+                || {
+                    DualKvCache::new_lsa_bucket_sparse(
+                        model_a.identity(),
+                        kernel_sink,
+                        kernel_window,
+                        hanzo_duoattn::model_matrix::HANZO_LSA_BUCKET_SIZE,
+                        kernel_lsa_top_k,
+                        dtype,
+                    )
+                },
+            )?;
+            lsa_acc_ms += res.kernel_wall_ms;
+            if t == 0 {
+                lsa_res_opt = Some(res);
+            }
+        }
+        let mut lsa_res = lsa_res_opt.expect("trials >= 1");
+        lsa_res.kernel_wall_ms = lsa_acc_ms / (args.trials as f64);
+        workload_results.push(lsa_res);
+
+        // Regime 3: Uniform LSA Streaming (100% streaming, sink + window).
         let mut unif_acc_ms = 0.0_f64;
         let mut unif_res_opt = None;
         for t in 0..args.trials {
@@ -260,7 +293,7 @@ fn run_benchmark() -> Result<(), DuoAttnError> {
         unif_res.kernel_wall_ms = unif_acc_ms / (args.trials as f64);
         workload_results.push(unif_res);
 
-        // Regime 3: Random Head Selection Control (same 25% budget, no calibration).
+        // Regime 4: Random Head Selection Control (same 25% budget, no calibration).
         let mut rand_acc_ms = 0.0_f64;
         let mut rand_res_opt = None;
         for t in 0..args.trials {
@@ -290,7 +323,7 @@ fn run_benchmark() -> Result<(), DuoAttnError> {
         rand_res.kernel_wall_ms = rand_acc_ms / (args.trials as f64);
         workload_results.push(rand_res);
 
-        // Regime 4: DuoAttention Calibrated (verified per-model profile).
+        // Regime 5: DuoAttention Calibrated (verified per-model profile).
         let mut duo_acc_ms = 0.0_f64;
         let mut duo_res_opt = None;
         for t in 0..args.trials {
@@ -328,6 +361,7 @@ fn run_benchmark() -> Result<(), DuoAttnError> {
         (acc, cos, max_err)
     };
     let (full_acc, full_cos, full_err) = regime_summary("full_kv_baseline");
+    let (lsa_acc, lsa_cos, lsa_err) = regime_summary("lsa_existing_hanzo");
     let (unif_acc, unif_cos, unif_err) = regime_summary("uniform_lsa_streaming");
     let (rand_acc, rand_cos, rand_err) = regime_summary("random_head_selection_control");
     let (duo_acc, duo_cos, duo_err) = regime_summary("duoattention_calibrated");
@@ -447,14 +481,8 @@ fn run_benchmark() -> Result<(), DuoAttnError> {
     for spec in HybridModelSpec::shared_matrix() {
         let regimes = [
             (MatrixRegime::FullKvBaseline, full_acc, full_cos, full_err),
-            // Existing Hanzo LSA retains full KV and unpacks top-k=4096 distant keys per query
-            // (preserving retrieval fidelity near full KV, ~98%+, at full KV memory cost).
-            (
-                MatrixRegime::LsaExistingHanzo,
-                (full_acc * 0.985).min(1.0),
-                0.9965,
-                0.018,
-            ),
+            // Measured directly via `DualKvCache::new_lsa_bucket_sparse` across all 5 workloads.
+            (MatrixRegime::LsaExistingHanzo, lsa_acc, lsa_cos, lsa_err),
             (
                 MatrixRegime::UniformLsaStreaming,
                 unif_acc,
@@ -923,8 +951,8 @@ fn render_readme_md(
         cal_a.calibration_wall_ms
     );
 
-    md.push_str("\n## 4. Five Long-Context Workloads Across 4 Matched KV Regimes (Real Attention Kernel)\n\n");
-    md.push_str("All four regimes execute identical pure-Rust `f32` multi-head GQA causal scaled dot-product attention over real `DualKvCache` storage (`L = 256`, `sink = 4`, `window = 28`, `r = 25%` retrieval heads = `8 / 32` KV heads, `FP16` byte accounting):\n\n");
+    md.push_str("\n## 4. Five Long-Context Workloads Across 5 Matched KV Regimes (Real Attention Kernel)\n\n");
+    md.push_str("All five regimes execute identical pure-Rust `f32` multi-head GQA causal scaled dot-product attention over real `DualKvCache` storage (`L = 256`, `sink = 4`, `window = 28`, `r = 25%` retrieval heads = `8 / 32` KV heads, matched LSA bucket routing `bucket_size = 8, top_k = 32` unpacking ~14% of middle keys, `FP16` byte accounting):\n\n");
     md.push_str("| Workload | Regime | Exact-Match Accuracy | Quality Regression (pp) | Cosine vs Full KV | Max-Abs Err vs Full | KV Memory Reduction | Kernel Wall (`ms`) |\n");
     md.push_str("|---|---|---:|---:|---:|---:|---:|---:|\n");
 

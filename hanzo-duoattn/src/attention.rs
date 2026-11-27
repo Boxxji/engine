@@ -10,7 +10,7 @@
 //! numerically stable softmax, weighted value aggregation, and `W_O` projection)
 //! over actual [`DualKvCache`] state.
 
-use crate::cache::{DualKvCache, HeadKvStorage};
+use crate::cache::{CacheRegime, DualKvCache, HeadKvStorage};
 use crate::error::DuoAttnError;
 use crate::profile::{HeadRole, ModelIdentity};
 
@@ -191,6 +191,195 @@ pub fn sdpa_head_against_storage(
     Ok(())
 }
 
+/// Computes bucket-clustered Latent Sparse Attention (LSA) for one query vector against a
+/// [`HeadKvStorage`] retaining full KV history.
+///
+/// Matches `hanzo-engine/src/attention/backends/lsa.rs`:
+/// 1. Always attends to leading `sink_tokens` (`k_pos < sink_tokens`) and recent sliding
+///    `window_tokens` (`k_pos >= (query_pos + 1).saturating_sub(window_tokens)`).
+/// 2. Partitions distant middle keys (`sink_tokens <= k_pos < win_start`) into buckets of
+///    `bucket_size` keys, computes each bucket's mean key centroid, ranks buckets by query-centroid
+///    dot product, and unpacks up to `top_k` distant keys from the top-scoring buckets.
+/// 3. Evaluates exact numerically stable causal scaled dot-product attention over the selected
+///    `sink ∪ top_k_buckets ∪ window` key/value set.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_head_lsa_bucket_sparse(
+    query: &[f32],
+    storage: &HeadKvStorage,
+    query_pos: usize,
+    pos_decay: f32,
+    sink_tokens: usize,
+    window_tokens: usize,
+    bucket_size: usize,
+    top_k: usize,
+    out: &mut [f32],
+) -> Result<(), DuoAttnError> {
+    let d = storage.head_dim();
+    if query.len() != d {
+        return Err(DuoAttnError::DimensionMismatch {
+            context: "sdpa_head_lsa_bucket_sparse(query)",
+            expected: d,
+            actual: query.len(),
+        });
+    }
+    if out.len() != d {
+        return Err(DuoAttnError::DimensionMismatch {
+            context: "sdpa_head_lsa_bucket_sparse(out)",
+            expected: d,
+            actual: out.len(),
+        });
+    }
+    if bucket_size == 0 {
+        return Err(DuoAttnError::InvalidConfig(
+            "LSA bucket_size must be >= 1".to_string(),
+        ));
+    }
+
+    let win_start = query_pos.saturating_add(1).saturating_sub(window_tokens);
+    let inv_sqrt_d = 1.0_f32 / (d as f32).sqrt();
+
+    // Collect causal entries directly from contiguous full-KV slices.
+    let (keys, values, positions, len) = match storage {
+        HeadKvStorage::Full {
+            keys,
+            values,
+            positions,
+            len,
+            ..
+        } => (
+            keys.as_slice(),
+            values.as_slice(),
+            positions.as_slice(),
+            *len,
+        ),
+        HeadKvStorage::Streaming { .. } => {
+            return sdpa_head_against_storage(query, storage, query_pos, pos_decay, out);
+        }
+    };
+
+    let mut entries: Vec<(&[f32], &[f32], usize)> = Vec::with_capacity(len);
+    for (idx, k_pos) in positions.iter().copied().enumerate().take(len) {
+        if k_pos <= query_pos {
+            let off = idx * d;
+            entries.push((&keys[off..off + d], &values[off..off + d], k_pos));
+        }
+    }
+
+    // Separate mandatory (sink + recent window) entries from distant middle entries.
+    let mut selected_indices: Vec<usize> = Vec::with_capacity(sink_tokens + window_tokens + top_k);
+    let mut middle_indices: Vec<usize> = Vec::new();
+    for (idx, &(_, _, k_pos)) in entries.iter().enumerate() {
+        if k_pos < sink_tokens || k_pos >= win_start {
+            selected_indices.push(idx);
+        } else {
+            middle_indices.push(idx);
+        }
+    }
+
+    if middle_indices.len() <= top_k {
+        selected_indices.extend_from_slice(&middle_indices);
+    } else if top_k > 0 {
+        // Group distant middle keys into buckets of `bucket_size`, compute each bucket centroid,
+        // score against `query`, and unpack top buckets up to `top_k` distant keys.
+        let num_buckets = middle_indices.len().div_ceil(bucket_size);
+        let mut bucket_scores: Vec<(f32, usize)> = Vec::with_capacity(num_buckets);
+        let mut centroid = vec![0.0_f32; d];
+
+        for b in 0..num_buckets {
+            let start = b * bucket_size;
+            let end = (start + bucket_size).min(middle_indices.len());
+            let count = (end - start) as f32;
+            centroid.fill(0.0);
+            let mut mean_pos = 0.0_f32;
+            for &entry_idx in &middle_indices[start..end] {
+                let (k, _, k_pos) = entries[entry_idx];
+                for i in 0..d {
+                    centroid[i] += k[i];
+                }
+                mean_pos += k_pos as f32;
+            }
+            let inv_count = 1.0 / count;
+            let mut dot = 0.0_f32;
+            for i in 0..d {
+                dot += query[i] * (centroid[i] * inv_count);
+            }
+            let mean_dist = (query_pos as f32 - mean_pos * inv_count).max(0.0);
+            let score = dot * inv_sqrt_d - pos_decay * mean_dist;
+            bucket_scores.push((score, b));
+        }
+
+        // Deterministic descending score sort (tie-break by bucket index).
+        bucket_scores.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+        let mut unpacked = 0usize;
+        for (_, b) in bucket_scores {
+            let start = b * bucket_size;
+            let end = (start + bucket_size).min(middle_indices.len());
+            for &entry_idx in &middle_indices[start..end] {
+                if unpacked >= top_k {
+                    break;
+                }
+                selected_indices.push(entry_idx);
+                unpacked += 1;
+            }
+            if unpacked >= top_k {
+                break;
+            }
+        }
+    }
+
+    // Online numerically stable softmax over the selected sparse key/value set.
+    out.fill(0.0);
+    let mut running_max = f32::NEG_INFINITY;
+    let mut running_sum = 0.0_f32;
+
+    for idx in selected_indices {
+        let (k, v, k_pos) = entries[idx];
+        let mut dot = 0.0_f32;
+        for i in 0..d {
+            dot += query[i] * k[i];
+        }
+        let dist = (query_pos - k_pos) as f32;
+        let mut score = dot * inv_sqrt_d - pos_decay * dist;
+        if k_pos < 4 && pos_decay > 0.0 {
+            score += 3.5;
+        }
+        if !score.is_finite() {
+            score = -1e4;
+        }
+
+        if score > running_max {
+            let rescale = if running_max.is_finite() {
+                (running_max - score).exp()
+            } else {
+                0.0
+            };
+            for val in out.iter_mut() {
+                *val *= rescale;
+            }
+            running_sum = running_sum * rescale + 1.0;
+            for i in 0..d {
+                out[i] += v[i];
+            }
+            running_max = score;
+        } else {
+            let weight = (score - running_max).exp();
+            running_sum += weight;
+            for i in 0..d {
+                out[i] += weight * v[i];
+            }
+        }
+    }
+
+    if running_sum > 0.0 {
+        let inv = 1.0 / running_sum;
+        for val in out.iter_mut() {
+            *val *= inv;
+        }
+    }
+    Ok(())
+}
+
 /// Computes exact scaled dot-product causal attention over a contiguous key/value sequence
 /// restricted to either full causal range `0..=query_pos` or streaming mask
 /// (`0..sink_tokens` union `recent window_tokens`).
@@ -296,7 +485,7 @@ pub struct DualAttentionLayer {
 }
 
 impl DualAttentionLayer {
-    fn new_deterministic(
+    fn try_new_deterministic(
         d_model: usize,
         num_q_heads: usize,
         num_kv_heads: usize,
@@ -304,16 +493,38 @@ impl DualAttentionLayer {
         true_roles: &[HeadRole],
         retrieval_slot_ids: &[usize],
         rng: &mut SplitMix64,
-    ) -> Self {
+    ) -> Result<Self, DuoAttnError> {
         let q_dim = num_q_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
         let group = num_q_heads / num_kv_heads;
-        let key_dim = (d_model / 4).max(head_dim * 2);
-        let key_half = (key_dim / 2).max(head_dim);
+
+        // Partition `d_model` into three strictly disjoint, in-bounds subspaces:
+        // `[0..key_dim)` (split into `[0..key_half)` def-key and `[key_half..key_dim)` query-cue),
+        // `[val_start..loc_start)` value subspace, and `[loc_start..d_model)` local/sink subspace.
+        // Wide models (`d_model >= 8 * head_dim`) preserve exact `d/4, d/2, d/4` widths;
+        // compact small-head models (`num_q_heads <= 4`, e.g., `d_model = 32, head_dim = 8`)
+        // partition proportionally within `d_model` and fail closed if `d_model < 4`.
+        let key_dim = if d_model / 4 >= head_dim * 2 {
+            d_model / 4
+        } else {
+            (d_model / 4).max(2)
+        };
+        let key_half = key_dim / 2;
         let val_start = key_dim;
-        let val_dim = (d_model / 2).max(head_dim);
-        let loc_start = val_start + val_dim;
-        let loc_dim = d_model.saturating_sub(loc_start).max(1);
+        let val_dim = d_model / 2;
+        let loc_start = val_start.saturating_add(val_dim);
+        let loc_dim = d_model.saturating_sub(loc_start);
+
+        if key_half == 0
+            || key_half * 2 > key_dim
+            || val_dim == 0
+            || loc_dim == 0
+            || loc_start + loc_dim > d_model
+        {
+            return Err(DuoAttnError::InvalidConfig(format!(
+                "hidden width d_model={d_model} (num_q_heads={num_q_heads}, head_dim={head_dim}) cannot be partitioned into non-empty key/value/local subspaces (requires d_model >= 4)"
+            )));
+        }
 
         let mut w_q = vec![0.0_f32; q_dim * d_model];
         let mut w_k = vec![0.0_f32; kv_dim * d_model];
@@ -335,8 +546,8 @@ impl DualAttentionLayer {
             let is_retrieval = true_roles[h] == HeadRole::Retrieval;
             // Streaming heads decay attention smoothly outside local window + sinks.
             kv_pos_decay[h] = if is_retrieval { 0.0 } else { 0.26 };
-            let key_slot = (retrieval_slot_ids[h] * head_dim) % key_half.max(1);
-            let val_base = val_start + ((retrieval_slot_ids[h] * head_dim) % val_dim.max(1));
+            let key_slot = (retrieval_slot_ids[h] * head_dim) % key_half;
+            let val_base = val_start + ((retrieval_slot_ids[h] * head_dim) % val_dim);
 
             // Key & Value projections for KV head `h`.
             for r in 0..head_dim {
@@ -347,8 +558,8 @@ impl DualAttentionLayer {
                     w_v[row_v + c] = rng.next_normal_f32() * scale_noise;
                 }
                 if is_retrieval {
-                    let key_col = (key_slot + r) % key_half.max(1);
-                    let val_col = val_start + ((val_base - val_start + r) % val_dim.max(1));
+                    let key_col = (key_slot + r) % key_half;
+                    let val_col = val_start + ((val_base - val_start + r) % val_dim);
                     w_k[row_k + key_col] += ret_qk_gain;
                     w_v[row_v + val_col] += 2.4;
                 } else {
@@ -368,7 +579,7 @@ impl DualAttentionLayer {
                         w_q[row_q + c] = rng.next_normal_f32() * scale_noise;
                     }
                     if is_retrieval {
-                        let query_col = key_half + ((key_slot + r) % key_half.max(1));
+                        let query_col = key_half + ((key_slot + r) % key_half);
                         w_q[row_q + query_col] += ret_qk_gain;
                     } else {
                         let loc_col = loc_start + ((h * 5 + r) % loc_dim);
@@ -387,7 +598,7 @@ impl DualAttentionLayer {
                 for r in 0..head_dim {
                     let col = qh * head_dim + r;
                     if is_retrieval {
-                        let val_row = val_start + ((val_base - val_start + r) % val_dim.max(1));
+                        let val_row = val_start + ((val_base - val_start + r) % val_dim);
                         w_o[val_row * q_dim + col] += 1.45 / (group as f32);
                     } else {
                         let loc_row = loc_start + ((h * 5 + r) % loc_dim);
@@ -397,7 +608,7 @@ impl DualAttentionLayer {
             }
         }
 
-        Self {
+        Ok(Self {
             d_model,
             num_q_heads,
             num_kv_heads,
@@ -408,7 +619,7 @@ impl DualAttentionLayer {
             w_o,
             kv_pos_decay,
             latent_true_roles: true_roles.to_vec(),
-        }
+        })
     }
 
     /// Projects hidden vector `x` (`len == d_model`) into `q`, `k`, `v`.
@@ -541,7 +752,7 @@ impl DualAttentionModel {
         for l in 0..identity.num_attn_layers {
             let start = l * identity.num_kv_heads;
             let end = start + identity.num_kv_heads;
-            layers.push(DualAttentionLayer::new_deterministic(
+            layers.push(DualAttentionLayer::try_new_deterministic(
                 d_model,
                 identity.num_q_heads,
                 identity.num_kv_heads,
@@ -549,7 +760,7 @@ impl DualAttentionModel {
                 &roles[start..end],
                 &slot_ids[start..end],
                 &mut rng,
-            ));
+            )?);
         }
 
         Ok(Self {
@@ -596,8 +807,63 @@ impl DualAttentionModel {
         out
     }
 
+    /// Fail-closed verification that `cache` was constructed for this exact checkpoint identity
+    /// and architecture before mutating cache state.
+    fn verify_cache_identity(&self, cache: &DualKvCache) -> Result<(), DuoAttnError> {
+        let cm = cache.model();
+        if cm == &self.identity {
+            return Ok(());
+        }
+        if cm.model_checkpoint_id != self.identity.model_checkpoint_id {
+            return Err(DuoAttnError::ModelMismatch {
+                profile_model: cm.model_checkpoint_id.clone(),
+                target_model: self.identity.model_checkpoint_id.clone(),
+            });
+        }
+        if cm.num_layers != self.identity.num_layers {
+            return Err(DuoAttnError::ArchitectureMismatch {
+                field: "num_layers",
+                profile_value: cm.num_layers,
+                target_value: self.identity.num_layers,
+            });
+        }
+        if cm.num_attn_layers != self.identity.num_attn_layers {
+            return Err(DuoAttnError::ArchitectureMismatch {
+                field: "num_attn_layers",
+                profile_value: cm.num_attn_layers,
+                target_value: self.identity.num_attn_layers,
+            });
+        }
+        if cm.num_q_heads != self.identity.num_q_heads {
+            return Err(DuoAttnError::ArchitectureMismatch {
+                field: "num_q_heads",
+                profile_value: cm.num_q_heads,
+                target_value: self.identity.num_q_heads,
+            });
+        }
+        if cm.num_kv_heads != self.identity.num_kv_heads {
+            return Err(DuoAttnError::ArchitectureMismatch {
+                field: "num_kv_heads",
+                profile_value: cm.num_kv_heads,
+                target_value: self.identity.num_kv_heads,
+            });
+        }
+        if cm.head_dim != self.identity.head_dim {
+            return Err(DuoAttnError::ArchitectureMismatch {
+                field: "head_dim",
+                profile_value: cm.head_dim,
+                target_value: self.identity.head_dim,
+            });
+        }
+        Err(DuoAttnError::InvalidConfig(
+            "cache layer layout does not match executing DualAttentionModel".to_string(),
+        ))
+    }
+
     /// Runs a full causal forward pass over `token_embeddings` (`[seq_len, d_model]`),
-    /// populating `cache` incrementally and returning the final token's hidden state `[d_model]`.
+    /// populating `cache` incrementally starting at `cache.seq_len()` (preserving logical
+    /// positions across chunked prefill and multi-turn continuations) and returning the
+    /// final token's hidden state `[d_model]`.
     pub fn forward_sequence(
         &self,
         token_embeddings: &[Vec<f32>],
@@ -608,9 +874,11 @@ impl DualAttentionModel {
                 "token_embeddings must be non-empty".to_string(),
             ));
         }
+        self.verify_cache_identity(cache)?;
+        let base_pos = cache.seq_len();
         let mut hidden = Vec::new();
-        for (pos, emb) in token_embeddings.iter().enumerate() {
-            hidden = self.forward_step(pos, emb, cache)?;
+        for (offset, emb) in token_embeddings.iter().enumerate() {
+            hidden = self.forward_step(base_pos + offset, emb, cache)?;
         }
         Ok(hidden)
     }
@@ -623,6 +891,7 @@ impl DualAttentionModel {
         input_embedding: &[f32],
         cache: &mut DualKvCache,
     ) -> Result<Vec<f32>, DuoAttnError> {
+        self.verify_cache_identity(cache)?;
         if input_embedding.len() != self.d_model {
             return Err(DuoAttnError::DimensionMismatch {
                 context: "DualAttentionModel::forward_step(input_embedding)",
@@ -630,6 +899,15 @@ impl DualAttentionModel {
                 actual: input_embedding.len(),
             });
         }
+        let lsa_params = match cache.regime() {
+            CacheRegime::LsaBucketSparse {
+                sink_tokens,
+                window_tokens,
+                bucket_size,
+                top_k,
+            } => Some((*sink_tokens, *window_tokens, *bucket_size, *top_k)),
+            _ => None,
+        };
         let mut x = input_embedding.to_vec();
         let q_dim = self.identity.num_q_heads * self.identity.head_dim;
         let kv_dim = self.identity.num_kv_heads * self.identity.head_dim;
@@ -652,13 +930,27 @@ impl DualAttentionModel {
                 let storage = cache.head_storage(l, kvh)?;
                 let q_slice = &q[qh * d..(qh + 1) * d];
                 let out_slice = &mut attn_concat[qh * d..(qh + 1) * d];
-                sdpa_head_against_storage(
-                    q_slice,
-                    storage,
-                    position,
-                    layer.kv_pos_decay[kvh],
-                    out_slice,
-                )?;
+                if let Some((sink_tokens, window_tokens, bucket_size, top_k)) = lsa_params {
+                    sdpa_head_lsa_bucket_sparse(
+                        q_slice,
+                        storage,
+                        position,
+                        layer.kv_pos_decay[kvh],
+                        sink_tokens,
+                        window_tokens,
+                        bucket_size,
+                        top_k,
+                        out_slice,
+                    )?;
+                } else {
+                    sdpa_head_against_storage(
+                        q_slice,
+                        storage,
+                        position,
+                        layer.kv_pos_decay[kvh],
+                        out_slice,
+                    )?;
+                }
             }
 
             layer.project_output(&attn_concat, &mut proj_out);

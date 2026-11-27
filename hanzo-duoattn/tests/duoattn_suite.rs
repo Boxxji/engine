@@ -590,3 +590,113 @@ fn streaming_head_matches_full_kv_exactly_within_sink_plus_window() {
     assert!(fid.max_abs_error < 1e-6);
     assert!((fid.cosine_similarity - 1.0).abs() < 1e-6);
 }
+
+#[test]
+fn chunked_prefill_continuation_preserves_logical_positions_bit_exact() {
+    let model = build_test_model("hanzo-zen6-chunked-prefill@v1");
+    let corpus = RepoCorpus::synthetic_for_tests(1346);
+    let embedder = CorpusEmbedder::new(model.d_model(), 16, 1346);
+    let workloads = build_five_workloads(&corpus, &embedder, 256, 4, 28, 1346);
+    let niah_ep = &workloads
+        .iter()
+        .find(|(name, _)| name == "needle_in_a_haystack")
+        .expect("niah workload")
+        .1[2];
+
+    let mut single_cache = DualKvCache::new_full(model.identity(), KvDtype::F16).unwrap();
+    let out_single = model
+        .forward_sequence(&niah_ep.embeddings, &mut single_cache)
+        .unwrap();
+
+    // Split 256-token NIAH sequence into 240-token prefix + 16-token continuation.
+    let mut chunked_cache = DualKvCache::new_full(model.identity(), KvDtype::F16).unwrap();
+    let _ = model
+        .forward_sequence(&niah_ep.embeddings[..240], &mut chunked_cache)
+        .unwrap();
+    assert_eq!(chunked_cache.seq_len(), 240);
+    let out_chunked = model
+        .forward_sequence(&niah_ep.embeddings[240..], &mut chunked_cache)
+        .unwrap();
+    assert_eq!(chunked_cache.seq_len(), 256);
+
+    assert_eq!(out_single, out_chunked);
+    let query_input = &niah_ep.embeddings[niah_ep.embeddings.len() - 1];
+    let (pred_single, _) =
+        embedder.predict_from_recalled_delta(&out_single, query_input, niah_ep.target_candidate);
+    let (pred_chunked, _) =
+        embedder.predict_from_recalled_delta(&out_chunked, query_input, niah_ep.target_candidate);
+    assert_eq!(pred_single, niah_ep.target_candidate);
+    assert_eq!(pred_chunked, niah_ep.target_candidate);
+}
+
+#[test]
+fn cross_model_cache_is_rejected_fail_closed_before_mutation() {
+    let model_a = build_test_model("hanzo-zen6-exec-model-a@v1");
+    let model_b = build_test_model("hanzo-zen6-exec-model-b@v1");
+    let mut cache_b = DualKvCache::new_full(model_b.identity(), KvDtype::F16).unwrap();
+    let emb = vec![0.1_f32; model_a.d_model()];
+
+    let err_step = model_a
+        .forward_step(0, &emb, &mut cache_b)
+        .expect_err("cache bound to model B must be rejected by model A forward_step");
+    assert!(matches!(err_step, DuoAttnError::ModelMismatch { .. }));
+    assert_eq!(
+        cache_b.seq_len(),
+        0,
+        "rejected forward_step must not mutate cache"
+    );
+
+    let err_seq = model_a
+        .forward_sequence(&[emb], &mut cache_b)
+        .expect_err("cache bound to model B must be rejected by model A forward_sequence");
+    assert!(matches!(err_seq, DuoAttnError::ModelMismatch { .. }));
+    assert_eq!(
+        cache_b.seq_len(),
+        0,
+        "rejected forward_sequence must not mutate cache"
+    );
+}
+
+#[test]
+fn small_head_model_identity_constructs_and_runs_without_panicking() {
+    // Exact geometry flagged in review: d_model = 4 * 8 = 32.
+    let small_id = ModelIdentity::pure_attention("m", 1, 4, 2, 8).unwrap();
+    let model = DualAttentionModel::from_identity(small_id.clone(), 0.25)
+        .expect("valid small-head model must construct without panicking");
+    let mut cache = DualKvCache::new_full(&small_id, KvDtype::F16).unwrap();
+    let emb = vec![0.25_f32; model.d_model()];
+    let out = model.forward_step(0, &emb, &mut cache).unwrap();
+    assert_eq!(out.len(), 32);
+    assert!(out.iter().all(|v| v.is_finite()));
+
+    // Ultra-tiny d_model < 4 must return Err(InvalidConfig) cleanly instead of panicking.
+    let tiny_id = ModelIdentity::pure_attention("tiny", 1, 1, 1, 2).unwrap();
+    let err = DualAttentionModel::from_identity(tiny_id, 0.5)
+        .expect_err("d_model=2 cannot partition key/value/local subspaces");
+    assert!(matches!(err, DuoAttnError::InvalidConfig(_)));
+}
+
+#[test]
+fn lsa_bucket_sparse_regime_executes_real_kernel_and_accounts_centroid_overhead() {
+    let model = build_test_model("hanzo-zen6-lsa-measured@v1");
+    let corpus = RepoCorpus::synthetic_for_tests(1346);
+    let embedder = CorpusEmbedder::new(model.d_model(), 16, 1346);
+    let workloads = build_five_workloads(&corpus, &embedder, 256, 4, 28, 1346);
+    let (wl_name, episodes) = &workloads[2];
+
+    let (full_res, full_refs) =
+        evaluate_workload_regime(wl_name, &model, &embedder, episodes, &[], || {
+            DualKvCache::new_full(model.identity(), KvDtype::F16)
+        })
+        .unwrap();
+    let (lsa_res, _) =
+        evaluate_workload_regime(wl_name, &model, &embedder, episodes, &full_refs, || {
+            DualKvCache::new_lsa_bucket_sparse(model.identity(), 4, 28, 8, 32, KvDtype::F16)
+        })
+        .unwrap();
+
+    assert_eq!(lsa_res.regime, "lsa_existing_hanzo");
+    assert!(lsa_res.peak_resident_kv_bytes > full_res.peak_resident_kv_bytes);
+    assert!(lsa_res.kv_memory_reduction_x < 1.0);
+    assert!(lsa_res.cosine_vs_full.is_finite() && lsa_res.cosine_vs_full > 0.5);
+}

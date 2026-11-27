@@ -56,6 +56,18 @@ impl KvDtype {
 pub enum CacheRegime {
     /// 100% full KV history across all heads (`O(L)` memory and decode bandwidth).
     FullKvBaseline,
+    /// Existing `hanzo-engine` LSA bucket-clustered sparse attention (retains 100% full KV +
+    /// bucket centroids; attends to `sink + window + top_k` distant keys per query).
+    LsaBucketSparse {
+        /// Leading attention sink tokens always attended.
+        sink_tokens: usize,
+        /// Recent sliding-window tokens always attended.
+        window_tokens: usize,
+        /// Mean keys per bucket used to form centroid summaries.
+        bucket_size: usize,
+        /// Maximum distant keys unpacked from top-scoring buckets per query.
+        top_k: usize,
+    },
     /// 100% uniform streaming/sliding-window + sink across all heads (`O(1)` memory, collapses retrieval).
     UniformLsaStreaming {
         /// Leading attention sink tokens retained.
@@ -103,6 +115,7 @@ impl CacheRegime {
     pub const fn slug(&self) -> &'static str {
         match self {
             Self::FullKvBaseline => "full_kv_baseline",
+            Self::LsaBucketSparse { .. } => "lsa_existing_hanzo",
             Self::UniformLsaStreaming { .. } => "uniform_lsa_streaming",
             Self::RandomHeadSelection { .. } => "random_head_selection_control",
             Self::DuoAttentionCalibrated { .. } => "duoattention_calibrated",
@@ -473,6 +486,49 @@ impl DualKvCache {
         })
     }
 
+    /// Creates an `LsaBucketSparse` cache matching `hanzo-engine`'s LSA backend: retains 100% of
+    /// full KV history across all heads plus bucket centroid summaries, and routes decode queries
+    /// to `sink_tokens + window_tokens + top_k` distant keys from top-scoring key buckets.
+    pub fn new_lsa_bucket_sparse(
+        model: &ModelIdentity,
+        sink_tokens: usize,
+        window_tokens: usize,
+        bucket_size: usize,
+        top_k: usize,
+        dtype: KvDtype,
+    ) -> Result<Self, DuoAttnError> {
+        model.validate()?;
+        if sink_tokens == 0 || window_tokens == 0 || bucket_size == 0 || top_k == 0 {
+            return Err(DuoAttnError::InvalidConfig(
+                "LSA sink_tokens, window_tokens, bucket_size, and top_k must all be >= 1"
+                    .to_string(),
+            ));
+        }
+        let mut layers = Vec::with_capacity(model.num_attn_layers);
+        for _ in 0..model.num_attn_layers {
+            let mut heads = Vec::with_capacity(model.num_kv_heads);
+            for _ in 0..model.num_kv_heads {
+                heads.push(HeadKvStorage::new_full(model.head_dim));
+            }
+            layers.push(heads);
+        }
+        Ok(Self {
+            model: model.clone(),
+            regime: CacheRegime::LsaBucketSparse {
+                sink_tokens,
+                window_tokens,
+                bucket_size,
+                top_k,
+            },
+            dtype,
+            layers,
+            peak_resident_bytes: 0,
+            retrieval_heads: model.total_kv_heads(),
+            streaming_heads: 0,
+            streaming_budget: 0,
+        })
+    }
+
     /// Creates a `UniformLsaStreaming` cache where 100% of KV heads use `sink + window` only.
     pub fn new_uniform_streaming(
         model: &ModelIdentity,
@@ -834,14 +890,29 @@ impl DualKvCache {
             .sum()
     }
 
-    /// Total resident KV cache bytes under `self.dtype`.
+    /// Total resident KV cache bytes under `self.dtype` (plus bucket centroid metadata for LSA).
     #[must_use]
     pub fn resident_kv_bytes(&self) -> usize {
-        self.layers
+        let base: usize = self
+            .layers
             .iter()
             .flat_map(|l| l.iter())
             .map(|h| h.resident_bytes(self.dtype))
-            .sum()
+            .sum();
+        if let CacheRegime::LsaBucketSparse { bucket_size, .. } = self.regime {
+            let meta: usize = self
+                .layers
+                .iter()
+                .flat_map(|l| l.iter())
+                .map(|h| {
+                    let buckets = h.resident_tokens() / bucket_size;
+                    buckets * (self.model.head_dim * self.dtype.bytes_per_elem() + 8)
+                })
+                .sum();
+            base + meta
+        } else {
+            base
+        }
     }
 
     /// Peak resident KV bytes observed since creation or last [`Self::clear`].
