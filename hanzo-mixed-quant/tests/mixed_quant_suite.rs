@@ -602,16 +602,34 @@ fn test_15_negative_regime_3_mismatched_calibration_degrades_awq() {
 
 #[test]
 fn test_16_shared_matrix_accounting_and_receipt_determinism() {
-    // Verify shared 4B/9B/27B matrix equal-memory invariant across all three model scales
-    for spec in HybridModelSpec::canonical_matrix() {
+    // Verify shared 4B/9B/27B matrix KV-head alignment with hanzo-paged-attn (2, 4, 4)
+    // and honest unclamped footprint accounting (no silent clamping of infeasible budgets).
+    let expected_kv_heads = [2usize, 4, 4];
+    for (spec, &want_kv) in HybridModelSpec::canonical_matrix()
+        .iter()
+        .zip(expected_kv_heads.iter())
+    {
+        assert_eq!(
+            spec.num_kv_heads, want_kv,
+            "{} num_kv_heads must match shared HIP-1346 matrix ({want_kv})",
+            spec.name
+        );
         let p = spec.component_params();
         let u4_gib = p.model_size_gib(QuantRegime::UniformInt4, 128);
         let mixed_gib = p.model_size_gib(QuantRegime::MixedPrecisionAwqSpinQuant, 128);
-        assert!(
-            mixed_gib <= u4_gib + 1e-9,
-            "{}: mixed ({mixed_gib:.3} GiB) exceeded uniform INT4 ({u4_gib:.3} GiB)",
-            spec.name
-        );
+        if p.mixed_precision_fits_int4_budget(128) {
+            assert!(
+                mixed_gib <= u4_gib + 1e-9,
+                "{}: feasible mixed ({mixed_gib:.3} GiB) exceeded uniform INT4 ({u4_gib:.3} GiB)",
+                spec.name
+            );
+        } else {
+            assert!(
+                mixed_gib > u4_gib,
+                "{}: infeasible critical-layer policy must report true unclamped size > uniform INT4 ({mixed_gib:.3} vs {u4_gib:.3})",
+                spec.name
+            );
+        }
     }
 
     // Two independent runs with identical seed produce bit-identical deterministic receipt SHA-256
@@ -620,4 +638,64 @@ fn test_16_shared_matrix_accounting_and_receipt_determinism() {
     assert_eq!(b1.receipt_sha256, b2.receipt_sha256);
     assert_eq!(b1.corpus_sha256, b2.corpus_sha256);
     assert_eq!(b1.shared_matrix.len(), 3 * 9);
+}
+
+#[test]
+fn test_17_protected_salient_channels_excluded_from_lowbit_int4asym_residual() {
+    // Exact Codex reproducer: weights [0, -1, 1], input [1000, 0, 0], channel 0 protected.
+    // Int4Asym grid over [-1, 1] has non-zero zero-point residual at weight 0, so masking
+    // protected coordinates out of the packed low-bit dot product is mandatory.
+    let weights = vec![0.0_f32, -1.0, 1.0];
+    let activations = vec![1000.0_f32, 0.0, 0.0, 950.0, 0.1, -0.1];
+    let cfg = AwqConfig {
+        format: QuantFormat::Int4Asym,
+        group_size: 4,
+        grid_steps: 4,
+        salient_ratio: 0.10, // ceil(3 * 0.10) = 1 -> selects channel 0
+        protect_salient_bf16: true,
+    };
+    let res = calibrate_awq(&weights, 1, 3, &activations, 2, &cfg).unwrap();
+    assert_eq!(res.salient_channels, vec![0]);
+
+    let mut out = vec![0.0_f32; 1];
+    res.linear
+        .forward_vec(&[1000.0, 0.0, 0.0], &mut out)
+        .unwrap();
+    assert!(
+        out[0].abs() < 1e-6,
+        "protected channel 0 with weight 0.0 must yield 0.0 (no Int4Asym zero-point leak), got {}",
+        out[0]
+    );
+}
+
+#[test]
+fn test_18_rotation_payload_bytes_accounted_in_quantized_linear_storage_bytes() {
+    let rows = 16usize;
+    let cols = 16usize;
+    let weights = vec![0.25_f32; rows * cols];
+
+    let plain =
+        QuantizedLinear::quantize_plain(&weights, rows, cols, QuantFormat::Int4Asym, 16).unwrap();
+    let base_bytes = plain.storage_bytes();
+
+    // Seeded randomized Hadamard accounts for its 16-byte descriptor (not 0 and not uncounted Vec<f32>).
+    let mut with_seeded = plain.clone();
+    with_seeded.input_rotation =
+        Some(RotationTransform::randomized_hadamard(cols, cols, 1346).unwrap());
+    assert_eq!(with_seeded.storage_bytes(), base_bytes + 16);
+
+    // Explicit sign-vector Hadamard accounts for `dim * 4` bytes.
+    let mut with_explicit = plain.clone();
+    with_explicit.input_rotation = Some(RotationTransform::WalshHadamard {
+        dim: cols,
+        block_size: cols,
+        signs: vec![1.0; cols],
+    });
+    assert_eq!(with_explicit.storage_bytes(), base_bytes + cols * 4);
+
+    // Dense LearnedOrthogonal accounts for `dim * dim * 4` bytes.
+    let mut with_learned = plain;
+    let orth = OrthogonalMatrix::identity(cols);
+    with_learned.input_rotation = Some(RotationTransform::LearnedOrthogonal(orth));
+    assert_eq!(with_learned.storage_bytes(), base_bytes + cols * cols * 4);
 }

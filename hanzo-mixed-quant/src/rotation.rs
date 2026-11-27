@@ -14,13 +14,24 @@ use crate::formats::{matmul_batch_f32, PackedWeights, QuantFormat};
 /// Orthogonal rotation operator applied to input activations (`x -> x R`) and absorbed into weights (`W -> W R`).
 #[derive(Debug, Clone)]
 pub enum RotationTransform {
-    /// Exact normalized Walsh-Hadamard transform (full power-of-2 or block-diagonal of size `block_size`).
+    /// Seed-regenerated normalized Walsh-Hadamard transform (`D * H_b`): stores only a compact
+    /// `u64` seed (or `None` for unit signs) and regenerates Rademacher `±1` signs on the fly
+    /// with zero per-layer sign vector allocation.
+    SeededWalshHadamard {
+        /// Total vector dimension.
+        dim: usize,
+        /// Power-of-two block size dividing `dim`.
+        block_size: usize,
+        /// Optional SplitMix64 seed for deterministic Rademacher `±1` signs (`None` = all `+1`).
+        seed: Option<u64>,
+    },
+    /// Explicit-sign normalized Walsh-Hadamard transform storing a materialized `signs` vector.
     WalshHadamard {
         /// Total vector dimension.
         dim: usize,
         /// Power-of-two block size dividing `dim`.
         block_size: usize,
-        /// Deterministic Rademacher sign flip `(+1 / -1)` per coordinate for randomized Hadamard incoherence.
+        /// Explicit Rademacher sign flip `(+1 / -1)` per coordinate.
         signs: Vec<f32>,
     },
     /// Learned orthogonal matrix $R \in O(d)$ (e.g. Cayley-parameterized) stored row-major `[dim, dim]`.
@@ -30,7 +41,7 @@ pub enum RotationTransform {
 }
 
 impl RotationTransform {
-    /// Constructs an exact normalized Walsh-Hadamard transform with unit signs (`+1`).
+    /// Constructs an exact normalized Walsh-Hadamard transform with unit signs (`+1`, zero sign storage).
     pub fn hadamard(dim: usize) -> Result<Self, MixedQuantError> {
         if dim == 0 || !dim.is_power_of_two() {
             return Err(MixedQuantError::InvalidRotationDim {
@@ -38,14 +49,15 @@ impl RotationTransform {
                 reason: "full Walsh-Hadamard transform requires a positive power-of-two dimension",
             });
         }
-        Ok(Self::WalshHadamard {
+        Ok(Self::SeededWalshHadamard {
             dim,
             block_size: dim,
-            signs: vec![1.0; dim],
+            seed: None,
         })
     }
 
-    /// Constructs a deterministic randomized Walsh-Hadamard transform (`D * H_b`) using a splitmix64 seed.
+    /// Constructs a deterministic randomized Walsh-Hadamard transform (`D * H_b`) backed by an
+    /// 8-byte SplitMix64 `seed` regenerated on the fly (no per-projection `Vec<f32>` payload).
     pub fn randomized_hadamard(
         dim: usize,
         block_size: usize,
@@ -61,28 +73,31 @@ impl RotationTransform {
                 reason: "block_size must be a power of two dividing dim",
             });
         }
-        let mut s = seed ^ 0x9e37_79b9_7f4a_7c15;
-        let mut signs = Vec::with_capacity(dim);
-        for _ in 0..dim {
-            s = s.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            let mut z = s;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            z ^= z >> 31;
-            signs.push(if (z & 1) == 0 { 1.0 } else { -1.0 });
-        }
-        Ok(Self::WalshHadamard {
+        Ok(Self::SeededWalshHadamard {
             dim,
             block_size,
-            signs,
+            seed: Some(seed),
         })
+    }
+
+    /// Exact serialized/resident payload bytes owned by this rotation transform.
+    #[must_use]
+    pub fn storage_bytes(&self) -> usize {
+        match self {
+            Self::SeededWalshHadamard { seed: None, .. } => 0,
+            // 8-byte SplitMix64 seed + 8-byte block_size descriptor
+            Self::SeededWalshHadamard { seed: Some(_), .. } => 16,
+            Self::WalshHadamard { signs, .. } => signs.len() * 4,
+            Self::LearnedOrthogonal(m) => m.data.len() * 4,
+            Self::BlockOrthogonal { block, .. } => block.data.len() * 4,
+        }
     }
 
     /// Vector dimension supported by this rotation.
     #[must_use]
     pub fn dim(&self) -> usize {
         match self {
-            Self::WalshHadamard { dim, .. } => *dim,
+            Self::SeededWalshHadamard { dim, .. } | Self::WalshHadamard { dim, .. } => *dim,
             Self::LearnedOrthogonal(m) => m.dim,
             Self::BlockOrthogonal { dim, .. } => *dim,
         }
@@ -99,6 +114,27 @@ impl RotationTransform {
             });
         }
         match self {
+            Self::SeededWalshHadamard {
+                block_size, seed, ..
+            } => {
+                if let Some(seed_val) = seed {
+                    let mut s = *seed_val ^ 0x9e37_79b9_7f4a_7c15;
+                    for vi in v.iter_mut() {
+                        s = s.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                        let mut z = s;
+                        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                        z ^= z >> 31;
+                        if (z & 1) != 0 {
+                            *vi = -*vi;
+                        }
+                    }
+                }
+                for chunk in v.chunks_exact_mut(*block_size) {
+                    fwht_normalized_in_place(chunk)?;
+                }
+                Ok(())
+            }
             Self::WalshHadamard {
                 block_size, signs, ..
             } => {

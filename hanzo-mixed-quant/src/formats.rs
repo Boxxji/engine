@@ -900,7 +900,7 @@ impl QuantizedLinear {
     }
 
     /// Exact total storage bytes including packed weights, AWQ scales, protected BF16 channels,
-    /// and QAD calibration scales.
+    /// QAD calibration scales, and owned input-rotation payloads.
     #[must_use]
     pub fn storage_bytes(&self) -> usize {
         let mut total = self.weights.storage_bytes();
@@ -910,11 +910,12 @@ impl QuantizedLinear {
         if let Some(ref p) = self.protected_channels {
             total += p.storage_bytes();
         }
+        if let Some(ref rot) = self.input_rotation {
+            total += rot.storage_bytes();
+        }
         if let Some(ref q) = self.qad_row_scales {
             total += q.len() * 4;
         }
-        // Note: SpinQuant Walsh-Hadamard is parameter-free; learned Cayley R is shared across layers
-        // (amortized), though per-layer unmerged dense R storage is tracked when explicit.
         total
     }
 
@@ -927,38 +928,47 @@ impl QuantizedLinear {
 
     /// Runs the full quantized forward matvec `y = W_hat * x` (with SpinQuant rotation, AWQ
     /// channel scaling, protected BF16 channel accumulation, and QAD row calibration).
+    ///
+    /// Protected salient coordinates are masked to zero before the packed low-bit matvec so
+    /// asymmetric affine quantization grids (`Int4Asym`) cannot add zero-point residual error
+    /// on top of the exact BF16 protected contribution.
     pub fn forward_vec(&self, x: &[f32], out: &mut [f32]) -> Result<(), MixedQuantError> {
         let (rows, cols) = self.shape();
         validate_matvec(rows, cols, x, out)?;
 
+        let mut x_rot_buf: Option<Vec<f32>> = None;
+        if let Some(ref rot) = self.input_rotation {
+            let mut buf = x.to_vec();
+            rot.apply_in_place(&mut buf)?;
+            x_rot_buf = Some(buf);
+        }
+        let x_base: &[f32] = x_rot_buf.as_deref().unwrap_or(x);
+
         let mut scratch: Vec<f32>;
-        let x_effective: &[f32] = if self.input_rotation.is_some() || self.awq_inv_scales.is_some()
+        let x_lowbit: &[f32] = if self.awq_inv_scales.is_some() || self.protected_channels.is_some()
         {
-            scratch = x.to_vec();
-            if let Some(ref rot) = self.input_rotation {
-                rot.apply_in_place(&mut scratch)?;
-            }
+            scratch = x_base.to_vec();
             if let Some(ref inv_s) = self.awq_inv_scales {
                 for (xi, &inv) in scratch.iter_mut().zip(inv_s.iter()) {
                     *xi *= inv;
                 }
             }
+            if let Some(ref prot) = self.protected_channels {
+                for &c in &prot.channel_indices {
+                    if c < scratch.len() {
+                        scratch[c] = 0.0;
+                    }
+                }
+            }
             &scratch
         } else {
-            x
+            x_base
         };
 
-        self.weights.matvec(x_effective, out)?;
+        self.weights.matvec(x_lowbit, out)?;
 
         if let Some(ref prot) = self.protected_channels {
-            // Protected channels store unscaled raw BF16 weights on the rotated-or-raw input
-            if let Some(ref rot) = self.input_rotation {
-                let mut x_rot = x.to_vec();
-                rot.apply_in_place(&mut x_rot)?;
-                prot.accumulate_matvec(&x_rot, out);
-            } else {
-                prot.accumulate_matvec(x, out);
-            }
+            prot.accumulate_matvec(x_base, out);
         }
 
         if let Some(ref row_s) = self.qad_row_scales {

@@ -293,6 +293,9 @@ pub fn calibrate_awq_with_rotation(
             for c in 0..cols {
                 x_scaled[c] = x_row[c] * inv_scales[c];
             }
+            for &c in &salient_channels {
+                x_scaled[c] = 0.0;
+            }
             cand_packed.matvec(&x_scaled, &mut out_buf)?;
             let ref_row = &ref_out[t * rows..(t + 1) * rows];
             let prot_row = &prot_contrib[t * rows..(t + 1) * rows];

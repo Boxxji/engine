@@ -875,9 +875,11 @@ impl Fp32HybridModel {
                 // 2. Profile every component across all 4 formats + 2:4 pruning sensitivity
                 let profiles = self.profile_components(trace)?;
 
-                // Reserve exact AWQ inv_scales metadata budget for sub-8-bit projections (QAD row scales
-                // are folded zero-overhead into existing per-group scales!) so realized bytes strictly
-                // satisfy `model.storage_bytes() <= uniform_int4.storage_bytes()`.
+                // Reserve AWQ inv_scales + seeded Hadamard rotation descriptor metadata
+                // (16 bytes/rotated projection, <=256 B total, comfortably inside the
+                // `blocks * (d + ff) * 4` reserve while QAD row scales fold zero-overhead
+                // into existing per-group scales) so realized bytes strictly satisfy
+                // `model.storage_bytes() <= uniform_int4.storage_bytes()`.
                 let metadata_reserve = self.blocks.len() * (d + ff) * 4;
                 let plan_budget = target_budget.saturating_sub(metadata_reserve);
                 let plan = plan_mixed_precision(&profiles, plan_budget, true)?;

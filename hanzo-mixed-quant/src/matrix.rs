@@ -45,7 +45,7 @@ impl HybridModelSpec {
                 d_model: 2560,
                 d_ff: 6912,
                 vocab_size: 151_936,
-                num_kv_heads: 4,
+                num_kv_heads: 2,
                 head_dim: 128,
                 num_experts: 8,
                 gdn_state_mib: 27.0,
@@ -57,7 +57,7 @@ impl HybridModelSpec {
                 d_model: 4096,
                 d_ff: 11_008,
                 vocab_size: 151_936,
-                num_kv_heads: 8,
+                num_kv_heads: 4,
                 head_dim: 128,
                 num_experts: 8,
                 gdn_state_mib: 45.0,
@@ -69,7 +69,7 @@ impl HybridModelSpec {
                 d_model: 5120,
                 d_ff: 17_408,
                 vocab_size: 151_936,
-                num_kv_heads: 8,
+                num_kv_heads: 4,
                 head_dim: 256,
                 num_experts: 8,
                 gdn_state_mib: 192.0,
@@ -149,14 +149,34 @@ impl ModelParamBreakdown {
             + self.mlp_down
     }
 
+    /// Returns `true` when the prescribed critical-layer precision policy (`Embedding`/`LmHead`/`GDN`
+    /// at `INT8`, `RouterGate` at `BF16`, `Attn` at `INT4`) plus an all-ternary MLP fits within the
+    /// `UniformInt4` byte footprint.
+    ///
+    /// On smaller models with large vocabularies (`4B`/`9B` with `151,936`-token embeddings), full
+    /// `INT8` embedding + GDN protection genuinely exceeds `UniformInt4`, and [`Self::model_size_gib`]
+    /// reports the true unclamped footprint rather than hiding the overrun.
+    #[must_use]
+    pub fn mixed_precision_fits_int4_budget(&self, group_size: usize) -> bool {
+        let bits = |fmt: QuantFormat| fmt.effective_bits_production(group_size);
+        let uniform_int4_bits = self.total() as f64 * bits(QuantFormat::Int4Asym);
+        let critical_bits = (self.embedding + self.lm_head) as f64 * bits(QuantFormat::Int8)
+            + self.router_gate as f64 * bits(QuantFormat::Bf16)
+            + self.gdn_recurrent as f64 * bits(QuantFormat::Int8)
+            + (self.attn_qkv + self.attn_out) as f64 * bits(QuantFormat::Int4Asym);
+        let mlp_min_bits = (self.mlp_gate_up + self.mlp_down) as f64 * bits(QuantFormat::Ternary);
+        critical_bits + mlp_min_bits <= uniform_int4_bits + 1e-6
+    }
+
     /// Exact total model size in GiB for a given `QuantRegime` (`group_size = 128`).
     ///
     /// For `MixedPrecisionAwqSpinQuant`, assigns:
-    /// - `Embedding`, `LmHead`, `RouterGate`: `BF16` / `INT8` (exact equal-memory allocation)
+    /// - `Embedding`, `LmHead`: `INT8`; `RouterGate`: `BF16`
     /// - `GdnRecurrent`: `INT8` (protects multiplicative recurrent state)
     /// - `AttnQkv`, `AttnOut`: `INT4` (AWQ + SpinQuant)
-    /// - `MlpGateUp`, `MlpDown`: `Ternary` / `INT4` split calibrated so total bytes
-    ///   strictly satisfy `<= UniformInt4` bytes!
+    /// - `MlpGateUp`, `MlpDown`: `Ternary` / `INT4` split targeting `UniformInt4` bytes;
+    ///   when even an all-ternary MLP plus critical layers exceeds `UniformInt4` (e.g. `4B`/`9B`
+    ///   due to `151,936`-vocab embeddings), the **actual unclamped** allocation size is returned.
     #[must_use]
     pub fn model_size_gib(&self, regime: QuantRegime, group_size: usize) -> f64 {
         let bits = |fmt: QuantFormat| fmt.effective_bits_production(group_size);
@@ -175,10 +195,10 @@ impl ModelParamBreakdown {
             }
             QuantRegime::UniformTernary => self.total() as f64 * bits(QuantFormat::Ternary),
             QuantRegime::MixedPrecisionAwqSpinQuant => {
-                // Equal-memory target: match UniformInt4 exact byte footprint!
-                // Keep Embedding/LmHead/RouterGate at INT8/BF16, GdnRecurrent at INT8,
-                // AttnQkv/AttnOut at INT4+AWQ+SpinQuant, and compress bulk MLPs to Ternary/INT4
-                // to stay strictly <= UniformInt4 bytes.
+                // Target UniformInt4 equal-memory budget without ever clamping infeasible footprints:
+                // keep Embedding/LmHead/GdnRecurrent at INT8, RouterGate at BF16, Attn at INT4,
+                // and compress MLPs down to Ternary. If critical_bits + mlp_min_bits > uniform_int4_bits,
+                // report the exact actual size honestly.
                 let uniform_int4_bits = self.total() as f64 * bits(QuantFormat::Int4Asym);
                 let critical_bits = (self.embedding + self.lm_head) as f64
                     * bits(QuantFormat::Int8)
@@ -187,11 +207,10 @@ impl ModelParamBreakdown {
                     + (self.attn_qkv + self.attn_out) as f64 * bits(QuantFormat::Int4Asym);
                 let mlp_params = (self.mlp_gate_up + self.mlp_down) as f64;
                 let mlp_min_bits = mlp_params * bits(QuantFormat::Ternary);
-                let remaining_for_mlp = (uniform_int4_bits - critical_bits).max(mlp_min_bits);
-                // Fraction of MLP kept in INT4 vs Ternary without exceeding uniform_int4_bits
                 let mlp_max_bits = mlp_params * bits(QuantFormat::Int4Asym);
+                let remaining_for_mlp = (uniform_int4_bits - critical_bits).max(mlp_min_bits);
                 let mlp_used = remaining_for_mlp.min(mlp_max_bits);
-                (critical_bits + mlp_used).min(uniform_int4_bits)
+                critical_bits + mlp_used
             }
         };
         (total_bits / 8.0) / (1024.0 * 1024.0 * 1024.0)
